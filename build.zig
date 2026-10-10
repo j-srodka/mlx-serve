@@ -394,7 +394,8 @@ fn addPreviewTest(b: *std.Build, target: std.Build.ResolvedTarget) void {
 ///   - libjinja built for the host by the same staging script (the committed
 ///     libjinja.a holds Mach-O objects).
 fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
-    verifyMlxStageLinux(b);
+    const engines = b.option(bool, "embedded-engines", "Link ds4 + llama.cpp (CUDA)") orelse true;
+    verifyMlxStageLinux(b, engines);
 
     const version = b.option([]const u8, "version", "Version string") orelse readAppVersion(b) orelse "0.0.0-dev";
     const mlx_c_version = b.option([]const u8, "mlx-c-version", "Pinned mlx-c version") orelse readMlxcPin(b) orelse "unknown";
@@ -407,7 +408,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     build_options.addOption([]const u8, "llama_tag", readLlamaTag(b) orelse "unknown");
     build_options.addOption([]const u8, "git_sha", "");
     build_options.addOption(bool, "ios", false);
-    build_options.addOption(bool, "embedded_engines", true);
+    build_options.addOption(bool, "embedded_engines", engines);
     build_options.addOption(bool, "mlx_stream", false);
     // The corpus replay and benchmark tests run tens of seconds in Debug (#639), so
     // `zig build test` skips them and `zig build test -Dslow-tests` runs them.
@@ -472,8 +473,10 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
 
         // mlx (Vulkan fork) + mlx-c, staged in lib/mlx — same link shape as macOS.
         addMlxLib(b, mod);
-        addDs4LinuxLib(b, mod);
-        addLlamaLib(b, mod);
+        if (engines) {
+            addDs4LinuxLib(b, mod);
+            addLlamaLib(b, mod);
+        }
         // ELF has no @loader_path: the Mach-O rpaths emitted above are inert here,
         // so the loader never finds libmlxc.so. Mirror them in $ORIGIN form.
         for ([_][]const u8{ "mlx/lib", "llama/lib", "ds4-linux" }) |dir| {
@@ -513,7 +516,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
 
 /// Linux counterpart of verifyMlxStage: fail loudly when scripts/
 /// build-mlx-linux.sh has not staged the Linux mlx/mlx-c pair.
-fn verifyMlxStageLinux(b: *std.Build) void {
+fn verifyMlxStageLinux(b: *std.Build, engines: bool) void {
     const stage_ok = blk: {
         buildRootHandle(b).access(b.graph.io, "lib/mlx/lib/libmlxc.so", .{}) catch break :blk false;
         buildRootHandle(b).access(b.graph.io, "lib/mlx/lib/libmlx.so", .{}) catch break :blk false;
@@ -540,7 +543,7 @@ fn verifyMlxStageLinux(b: *std.Build) void {
         std.process.exit(1);
     };
     // The embedded engines (ds4 on CUDA, llama.cpp's CUDA release).
-    for ([_][2][]const u8{
+    if (engines) for ([_][2][]const u8{
         .{ "lib/ds4-linux/libds4.so", "git submodule update --init lib/ds4 && ./scripts/build-ds4-linux.sh" },
         .{ "lib/llama/lib/libllama.so", "./scripts/fetch-llama.sh" },
     }) |stage| {
@@ -548,7 +551,7 @@ fn verifyMlxStageLinux(b: *std.Build) void {
             std.debug.print("\n[mlx-serve] {s} is not staged. Run:\n  {s}\n\n", .{ stage[0], stage[1] });
             std.process.exit(1);
         };
-    }
+    };
 }
 
 /// `zig build vz-agent` → `zig-out/guest/vz-agent` (static aarch64 Linux ELF),
