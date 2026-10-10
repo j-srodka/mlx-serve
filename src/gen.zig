@@ -30,6 +30,8 @@ const ltx = @import("ltx_video.zig");
 const diffvae_fwd = @import("ltx_diffvae_forward.zig");
 const ltx_audio = @import("ltx_audio.zig");
 const minimax_h3 = @import("minimax_h3.zig");
+const h3_refmod = @import("h3_refmod.zig");
+const vae_mod = @import("minimax_h3_vae.zig");
 const hy3d = @import("hunyuan3d.zig");
 const hy3d_paint = @import("hunyuan3d_paint.zig");
 const glb_mod = @import("glb.zig");
@@ -129,6 +131,7 @@ pub const GenRoute = enum {
     speech,
     music,
     video,
+    h3_refmods,
     mesh,
     decisions,
 
@@ -136,7 +139,7 @@ pub const GenRoute = enum {
         return switch (self) {
             .image => .image,
             .speech, .music => .audio,
-            .video => .video,
+            .video, .h3_refmods => .video,
             .mesh => .mesh,
             .decisions => .decision,
         };
@@ -288,13 +291,9 @@ pub fn detectModality(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
     const mt = peekModelType(io, allocator, model_dir) orelse return null;
     defer allocator.free(mt);
     const modality = modalityFromType(mt) orelse return null;
-    if (requiredMarkerFor(mt)) |marker| {
-        const p = std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, marker }, 0) catch return null;
-        defer allocator.free(p);
-        if (!fileExists(io, p)) {
-            log.warn("[gen] {s} at {s} is missing {s}; not treating it as a media model\n", .{ mt, model_dir, marker });
-            return null;
-        }
+    if (!discovery.mediaPackReady(io, model_dir, mt)) {
+        log.warn("[gen] {s} at {s} is an incomplete media pack; not treating it as a media model\n", .{ mt, model_dir });
+        return null;
     }
     return modality;
 }
@@ -309,10 +308,7 @@ pub fn incompleteMediaDir(io: std.Io, allocator: std.mem.Allocator, model_dir: [
     const mt = peekModelType(io, allocator, model_dir) orelse return false;
     defer allocator.free(mt);
     if (modalityFromType(mt) == null) return false;
-    const marker = requiredMarkerFor(mt) orelse return false;
-    const p = std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, marker }, 0) catch return false;
-    defer allocator.free(p);
-    return !fileExists(io, p);
+    return !discovery.mediaPackReady(io, model_dir, mt);
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1431,7 +1427,7 @@ pub const LtxVideoEngine = struct {
         // Initial transformer: prefer DISTILLED (the correct one-stage default —
         // the dev model without CFG produces visibly worse output); fall back to
         // dev for bundles downloaded before transformer-distilled shipped.
-        const initial: TransformerVariant = if (self.hasVariant(io, .distilled)) .distilled else .dev;
+        const initial: TransformerVariant = if (self.hasVariant(io, .distilled)) .distilled else if (self.hasVariant(io, .dev)) .dev else return error.IncompleteMediaPack;
         self.transformer = try loadTransformerVariant(allocator, model_dir, initial, cpu_s);
         self.transformer_variant = initial;
         errdefer self.transformer.deinit();
@@ -1608,6 +1604,89 @@ fn loadVaeEncoder(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
 /// normalization; the resize is bilinear, not LANCZOS — close enough for the
 /// first-frame anchor and not parity-tested). Returns null on decode failure.
 fn decodeImageToBCFHW(allocator: std.mem.Allocator, encoded: []const u8, target_h: u32, target_w: u32, s: mlx.mlx_stream) ?mlx.mlx_array {
+    return decodeImageGrid(allocator, encoded, target_h, target_w, false, s);
+}
+
+/// Center-crop to the target aspect, then scale. Same `[-1, 1]` BCFHW layout
+/// as `decodeImageToBCFHW` (that one stretches).
+fn decodeImageCoverToBCFHW(allocator: std.mem.Allocator, encoded: []const u8, target_h: u32, target_w: u32, s: mlx.mlx_stream) ?mlx.mlx_array {
+    return decodeImageGrid(allocator, encoded, target_h, target_w, true, s);
+}
+
+fn stackBcfhw(frames: []const mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    if (frames.len == 1) {
+        var c = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&c, frames[0]));
+        return c;
+    }
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    for (frames) |f| _ = mlx.mlx_vector_array_append_value(vec, f);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 2, s));
+    return out;
+}
+
+/// Refusal text for a guide frame that is not a PNG or JPEG. Index 0 with a
+/// `first_frame_image` replacement names that field; every other miss names
+/// the array index.
+fn guideDecodeMessage(buf: []u8, index: usize, replaced: bool) []const u8 {
+    if (index == 0 and replaced)
+        return "'first_frame_image' could not replace ref_video_frames[0]: expected a PNG/JPEG image";
+    return std.fmt.bufPrint(buf, "'ref_video_frames'[{d}] is not a PNG/JPEG image", .{index}) catch
+        "'ref_video_frames' frame is not a PNG/JPEG image";
+}
+
+/// Cover-decode each blob (`replace0` stands in for index 0) and stack on
+/// axis 2 → `[1,3,K,H,W]`. Null when a frame will not decode; `failed` is
+/// that frame's index.
+fn decodeGuideStack(allocator: std.mem.Allocator, blobs: []const []const u8, replace0: ?[]const u8, h: u32, w: u32, failed: *usize, s: mlx.mlx_stream) ?mlx.mlx_array {
+    var parts: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (parts.items) |p| _ = mlx.mlx_array_free(p);
+        parts.deinit(allocator);
+    }
+    for (blobs, 0..) |blob, i| {
+        const bytes = if (i == 0) (replace0 orelse blob) else blob;
+        const arr = decodeImageCoverToBCFHW(allocator, bytes, h, w, s) orelse {
+            failed.* = i;
+            return null;
+        };
+        parts.append(allocator, arr) catch {
+            _ = mlx.mlx_array_free(arr);
+            failed.* = i;
+            return null;
+        };
+    }
+    if (parts.items.len == 0) return null;
+    const stacked = stackBcfhw(parts.items, s) catch return null;
+    _ = mlx.mlx_array_eval(stacked);
+    return stacked;
+}
+
+const CoverWindow = struct { x_off: f32, y_off: f32, win_w: f32, win_h: f32 };
+
+/// Source window with the target's aspect, centered. Wider sources lose the
+/// sides; taller sources lose the top and bottom.
+fn coverWindow(sw: u32, sh: u32, tw: u32, th: u32) CoverWindow {
+    const src_ar = @as(f32, @floatFromInt(sw)) / @as(f32, @floatFromInt(sh));
+    const tgt_ar = @as(f32, @floatFromInt(tw)) / @as(f32, @floatFromInt(th));
+    var win_w: f32 = @floatFromInt(sw);
+    var win_h: f32 = @floatFromInt(sh);
+    if (src_ar > tgt_ar) {
+        win_w = win_h * tgt_ar;
+    } else {
+        win_h = win_w / tgt_ar;
+    }
+    return .{
+        .x_off = (@as(f32, @floatFromInt(sw)) - win_w) * 0.5,
+        .y_off = (@as(f32, @floatFromInt(sh)) - win_h) * 0.5,
+        .win_w = win_w,
+        .win_h = win_h,
+    };
+}
+
+fn decodeImageGrid(allocator: std.mem.Allocator, encoded: []const u8, target_h: u32, target_w: u32, cover: bool, s: mlx.mlx_stream) ?mlx.mlx_array {
     var w: c_int = 0;
     var h: c_int = 0;
     var ch: c_int = 0;
@@ -1631,16 +1710,22 @@ fn decodeImageToBCFHW(allocator: std.mem.Allocator, encoded: []const u8, target_
         }
     }.f;
 
+    const win = if (cover) coverWindow(@intCast(sw), @intCast(sh), @intCast(tw), @intCast(th)) else CoverWindow{
+        .x_off = 0,
+        .y_off = 0,
+        .win_w = @floatFromInt(sw),
+        .win_h = @floatFromInt(sh),
+    };
     var oy: usize = 0;
     while (oy < th) : (oy += 1) {
-        const fy = (@as(f32, @floatFromInt(oy)) + 0.5) * @as(f32, @floatFromInt(sh)) / @as(f32, @floatFromInt(th)) - 0.5;
+        const fy = win.y_off + (@as(f32, @floatFromInt(oy)) + 0.5) * win.win_h / @as(f32, @floatFromInt(th)) - 0.5;
         const fy0 = @floor(fy);
         const wy = fy - fy0;
         const y0 = clampIdx(@intFromFloat(fy0), sh);
         const y1 = clampIdx(@as(isize, @intFromFloat(fy0)) + 1, sh);
         var ox: usize = 0;
         while (ox < tw) : (ox += 1) {
-            const fx = (@as(f32, @floatFromInt(ox)) + 0.5) * @as(f32, @floatFromInt(sw)) / @as(f32, @floatFromInt(tw)) - 0.5;
+            const fx = win.x_off + (@as(f32, @floatFromInt(ox)) + 0.5) * win.win_w / @as(f32, @floatFromInt(tw)) - 0.5;
             const fx0 = @floor(fx);
             const wx = fx - fx0;
             const x0 = clampIdx(@intFromFloat(fx0), sw);
@@ -3297,6 +3382,263 @@ fn stereoInterleavedToArray(allocator: std.mem.Allocator, pcm: []const f32) !mlx
 /// generation then succeeds while ignoring what the user asked it to follow.
 ///
 /// `err_buf` backs the messages that name an index; the rest are literals.
+
+/// Parse `ref_mod_paths` into pre-encoded RefMod latents (no PNG decode).
+fn parseH3RefMods(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    out: *std.ArrayList(minimax_h3.RefMedia),
+    err_buf: []u8,
+) !?[]const u8 {
+    var paths: std.ArrayList([]u8) = .empty;
+    defer {
+        for (paths.items) |p| allocator.free(p);
+        paths.deinit(allocator);
+    }
+    if (iterJsonStringArray(body, "ref_mod_paths")) |it0| {
+        var it = it0;
+        while (it.next()) |raw| {
+            const p = jsonUnescape(allocator, raw) catch
+                return std.fmt.bufPrint(err_buf, "'ref_mod_paths'[{d}] is not a valid JSON string", .{paths.items.len}) catch
+                    "a 'ref_mod_paths' entry is not a valid JSON string";
+            try paths.append(allocator, p);
+        }
+        if (it.bad) return "'ref_mod_paths' must be a JSON array of absolute .safetensors paths";
+    }
+    if (paths.items.len == 0) return null;
+    if (paths.items.len > minimax_h3.MAX_REF_TOTAL)
+        return std.fmt.bufPrint(err_buf, "too many 'ref_mod_paths' (max {d})", .{minimax_h3.MAX_REF_TOTAL}) catch
+            "too many 'ref_mod_paths'";
+
+    const s = mlx.gpuStream();
+    var n_img: u32 = 0;
+    var n_vid: u32 = 0;
+    var n_aud: u32 = 0;
+    for (paths.items, 0..) |path, i| {
+        h3_refmod.validateAbsoluteSafetensorsPath(io, path) catch
+            return std.fmt.bufPrint(err_buf, "'ref_mod_paths'[{d}] must be an absolute path to a .safetensors file", .{i}) catch
+                "'ref_mod_paths' entries must be absolute .safetensors paths";
+        if (!std.mem.endsWith(u8, path, ".safetensors"))
+            return std.fmt.bufPrint(err_buf, "'ref_mod_paths'[{d}] must end with .safetensors", .{i}) catch
+                "each 'ref_mod_paths' entry must be a .safetensors file";
+
+        var loaded = h3_refmod.load(allocator, io, path, s) catch
+            return std.fmt.bufPrint(err_buf, "could not load 'ref_mod_paths'[{d}] (missing latent tensor or refmod_meta)", .{i}) catch
+                "could not load a ref mod file";
+        const ordinal: u32 = switch (loaded.meta.kind) {
+            .image => blk: {
+                n_img += 1;
+                break :blk n_img;
+            },
+            .video => blk: {
+                n_vid += 1;
+                break :blk n_vid;
+            },
+            .audio => blk: {
+                n_aud += 1;
+                if (n_aud > minimax_h3.MAX_REF_AUDIOS)
+                    return std.fmt.bufPrint(err_buf, "too many audio ref mods (max {d})", .{minimax_h3.MAX_REF_AUDIOS}) catch
+                        "too many audio ref mods";
+                break :blk n_aud;
+            },
+        };
+        const r = loaded.meta.toResolvedRef(ordinal, i);
+        try out.append(allocator, .{ .ref = r, .latent = loaded.takeLatent() });
+    }
+    return null;
+}
+
+/// POST /v1/video/refmods — VAE-encode ref_images into a RefMod safetensors file.
+pub fn handleVideoH3Refmods(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *H3VideoEngine) !void {
+    if (!engine.supports_refs)
+        return sendError(conn, 400, "this MiniMax-H3 pack does not support references (it declares no 'ref2va' task) — load a REF2VA checkpoint");
+
+    const out_raw = extractJsonString(body, "out_path") orelse return sendError(conn, 400, "missing 'out_path'");
+    const out_path = try jsonUnescape(allocator, out_raw);
+    defer allocator.free(out_path);
+    if (out_path.len == 0) return sendError(conn, 400, "empty 'out_path'");
+    h3_refmod.validateSafetensorsOutPath(io, out_path) catch
+        return sendError(conn, 400, "'out_path' must be an absolute path ending in .safetensors, inside an existing directory");
+
+    const width: u32 = @intCast(extractJsonInt(body, "width") orelse 864);
+    const height: u32 = @intCast(extractJsonInt(body, "height") orelse 480);
+    const mode: minimax_h3.RefImageSizing = blk: {
+        const raw = extractJsonString(body, "ref_image_size") orelse break :blk .match;
+        if (std.mem.eql(u8, raw, "match")) break :blk .match;
+        if (std.mem.eql(u8, raw, "max")) break :blk .max;
+        return sendError(conn, 400, "'ref_image_size' must be \"match\" or \"max\"");
+    };
+
+    var images: std.ArrayList([]u8) = .empty;
+    defer {
+        for (images.items) |b| allocator.free(b);
+        images.deinit(allocator);
+    }
+    if (iterJsonStringArray(body, "ref_images")) |it0| {
+        var it = it0;
+        while (it.next()) |b64| {
+            const bytes = jsonB64Alloc(allocator, b64) catch
+                return sendError(conn, 400, "a 'ref_images' entry is not valid base64");
+            try images.append(allocator, bytes);
+        }
+        if (it.bad) return sendError(conn, 400, "'ref_images' must be an array of base64 PNG/JPEG strings");
+    }
+
+    var video_frames: std.ArrayList([]u8) = .empty;
+    defer {
+        for (video_frames.items) |b| allocator.free(b);
+        video_frames.deinit(allocator);
+    }
+    var n_videos: usize = 0;
+    if (iterJsonObjectArray(body, "ref_videos")) |it0| {
+        var it = it0;
+        while (it.next()) |obj| {
+            n_videos += 1;
+            if (n_videos > 1)
+                return sendError(conn, 400, "extract takes exactly one 'ref_videos' entry");
+            var fit = iterJsonStringArray(obj, "frames") orelse
+                return sendError(conn, 400, "'ref_videos'[0] needs a 'frames' array of base64 PNG/JPEG strings");
+            while (fit.next()) |b64| {
+                const bytes = jsonB64Alloc(allocator, b64) catch
+                    return sendError(conn, 400, "a 'ref_videos'[0] frame is not valid base64");
+                try video_frames.append(allocator, bytes);
+            }
+            if (fit.bad) return sendError(conn, 400, "'ref_videos'[0].frames must be an array of base64 PNG/JPEG strings");
+        }
+        if (it.bad) return sendError(conn, 400, "'ref_videos' must be an array of {\"frames\":[…]} objects");
+    }
+
+    var voice_pcm: ?[]f32 = null;
+    defer if (voice_pcm) |p| allocator.free(p);
+    if (iterJsonStringArray(body, "ref_audios")) |it0| {
+        var it = it0;
+        var n_voice: usize = 0;
+        while (it.next()) |b64| {
+            n_voice += 1;
+            if (n_voice > 1)
+                return sendError(conn, 400, "voice extract takes exactly one 'ref_audios' entry");
+            voice_pcm = refWavTo32kStereo(allocator, b64) catch
+                return sendError(conn, 400, "'ref_audios'[0] must be a PCM16/PCM24/float32 WAV");
+        }
+        if (it.bad) return sendError(conn, 400, "'ref_audios' must be an array of base64 WAV strings");
+    }
+
+    if (voice_pcm != null) {
+        if (images.items.len > 0 or video_frames.items.len > 0)
+            return sendError(conn, 400, "voice extract XOR visual ref_images/ref_videos (do not mix)");
+        const voice_max_s: f64 = extractJsonFloat(body, "voice_max_seconds") orelse 8.0;
+        if (voice_max_s <= 0.0)
+            return sendError(conn, 400, "'voice_max_seconds' must be positive");
+        const max_pairs: usize = @intFromFloat(@max(0, voice_max_s) * @as(f64, @floatFromInt(minimax_h3.audio_mod.SAMPLE_RATE)));
+        const max_len = @min(voice_pcm.?.len, max_pairs * 2);
+        if (max_len < minimax_h3.audio_mod.HOP_LENGTH * 2)
+            return sendError(conn, 400, "voice clip too short after trim (need at least ~0.05s)");
+        const pcm = voice_pcm.?[0..max_len];
+
+        const paths = try engine.paths(allocator);
+        defer {
+            allocator.free(paths.text_encoder);
+            allocator.free(paths.dit);
+            allocator.free(paths.vae);
+            if (paths.audio_vae) |p| allocator.free(p);
+            if (paths.turbo_lora) |p| allocator.free(p);
+        }
+        const apath = paths.audio_vae orelse
+            return sendError(conn, 503, "this MiniMax-H3 pack has no audio VAE weights");
+        const s = mlx.gpuStream();
+        var aw = try model_mod.loadWeightsSingleFile(allocator, apath);
+        defer aw.deinit();
+        const wf = try stereoInterleavedToArray(allocator, pcm);
+        defer _ = mlx.mlx_array_free(wf);
+        const z = try minimax_h3.audio_mod.encode(allocator, &aw, wf, s);
+        defer _ = mlx.mlx_array_free(z);
+        const meta = try h3_refmod.metaFromAudioLatent(z);
+        try h3_refmod.save(allocator, out_path, meta, z);
+        const rows = meta.latent_t * 2;
+        const json = try std.fmt.allocPrint(allocator, "{{\"path\":\"{s}\",\"kind\":\"audio\",\"audio_latent_t\":{d},\"cond_audio_rows\":{d}}}", .{
+            out_path,
+            meta.latent_t,
+            rows,
+        });
+        defer allocator.free(json);
+        return sendBytesJson(conn, allocator, json);
+    }
+
+    if (images.items.len > 0 and video_frames.items.len > 0)
+        return sendError(conn, 400, "extract stills XOR one ref_videos clip (do not mix)");
+    if (images.items.len == 0 and video_frames.items.len == 0)
+        return sendError(conn, 400, "missing 'ref_images', 'ref_videos', or 'ref_audios'");
+
+    const paths = try engine.paths(allocator);
+    defer {
+        allocator.free(paths.text_encoder);
+        allocator.free(paths.dit);
+        allocator.free(paths.vae);
+        if (paths.audio_vae) |p| allocator.free(p);
+        if (paths.turbo_lora) |p| allocator.free(p);
+    }
+
+    const s = mlx.gpuStream();
+    var vw = try model_mod.loadWeightsSingleFile(allocator, paths.vae);
+    defer vw.deinit();
+    var enc = try vae_mod.Encoder.load(allocator, &vw, s);
+    defer enc.deinit();
+
+    if (video_frames.items.len > 0) {
+        const sz0 = imageNativeSize(video_frames.items[0]) orelse
+            return sendError(conn, 400, "could not decode 'ref_videos'[0].frames[0] (PNG/JPEG expected)");
+        const canvas = minimax_h3.refVideoCanvas(sz0.w, sz0.h);
+        const supplied: u32 = @intCast(video_frames.items.len);
+        const aligned = minimax_h3.alignRefFrameCount(supplied);
+        if (aligned == 0)
+            return sendError(conn, 400, "ref_videos clip too short (need at least 5 frames after ladder snap)");
+        const px = (try decodeRefVideoFrames(allocator, video_frames.items[0..aligned], canvas.h, canvas.w, 1, 2)) orelse
+            return sendError(conn, 400, "could not decode a 'ref_videos' frame (PNG/JPEG expected)");
+        defer _ = mlx.mlx_array_free(px);
+        const lat = try enc.encodeVideo(px, allocator, s);
+        defer _ = mlx.mlx_array_free(lat);
+        var meta = try h3_refmod.metaFromLatentShape(canvas.w, canvas.h, lat);
+        meta.source_frames = aligned;
+        try h3_refmod.save(allocator, out_path, meta, lat);
+        const tokens = meta.condVisualTokens();
+        const json = try std.fmt.allocPrint(allocator, "{{\"path\":\"{s}\",\"cond_visual_tokens\":{d},\"latent_t\":{d}}}", .{ out_path, tokens, meta.latent_t });
+        defer allocator.free(json);
+        return sendBytesJson(conn, allocator, json);
+    }
+
+    const sz0 = imageNativeSize(images.items[0]) orelse
+        return sendError(conn, 400, "could not decode 'ref_images'[0] (PNG/JPEG expected)");
+    const canvas = minimax_h3.refImageCanvas(sz0.w, sz0.h, width, height, mode);
+
+    var latents: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (latents.items) |a| _ = mlx.mlx_array_free(a);
+        latents.deinit(allocator);
+    }
+    for (images.items, 0..) |bytes, i| {
+        var err_msg: [96]u8 = undefined;
+        const px = decodeImageToBCFHW(allocator, bytes, canvas.h, canvas.w, s) orelse {
+            const m = std.fmt.bufPrint(&err_msg, "could not decode 'ref_images'[{d}] (PNG/JPEG expected)", .{i}) catch
+                "could not decode a ref image (PNG/JPEG expected)";
+            return sendError(conn, 400, m);
+        };
+        defer _ = mlx.mlx_array_free(px);
+        const lat = try enc.encodeVideo(px, allocator, s);
+        try latents.append(allocator, lat);
+    }
+
+    const stacked = try h3_refmod.stackLatentsAlongT(allocator, latents.items, s);
+    defer _ = mlx.mlx_array_free(stacked);
+    const meta = try h3_refmod.metaFromLatentShape(canvas.w, canvas.h, stacked);
+    try h3_refmod.save(allocator, out_path, meta, stacked);
+
+    const tokens = meta.condVisualTokens();
+    const json = try std.fmt.allocPrint(allocator, "{{\"path\":\"{s}\",\"cond_visual_tokens\":{d},\"latent_t\":{d}}}", .{ out_path, tokens, meta.latent_t });
+    defer allocator.free(json);
+    return sendBytesJson(conn, allocator, json);
+}
+
 fn parseH3Refs(
     allocator: std.mem.Allocator,
     body: []const u8,
@@ -3511,6 +3853,8 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     const prompt = try jsonUnescape(allocator, prompt_raw);
     defer allocator.free(prompt);
     if (prompt.len == 0) return sendError(conn, 400, "empty 'prompt'");
+    if (std.mem.indexOf(u8, body, "\"ref_video_frames\"") != null)
+        return sendError(conn, 400, "'ref_video_frames' is only supported for LTX video models");
 
     // `cfg_scale` / `stg_scale` / `pipeline` are NOT rejected: the app sends
     // them unconditionally for every video backend, so 400-ing on their
@@ -3574,14 +3918,68 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     if (chain_windows > 1 and engine.supports_refs)
         return sendError(conn, 400, "chained windows ride FL2VA keyframe conditioning — the REF2VA pack cannot serve them; load an FL2VA checkpoint");
 
+    const latent_prefix_frames: u32 = @intCast(extractJsonInt(body, "latent_prefix_frames") orelse 0);
+    const latent_suffix_frames: u32 = @intCast(extractJsonInt(body, "latent_suffix_frames") orelse 0);
+    const latent_out_raw = extractJsonString(body, "latent_out");
+    const latent_prefix_path_raw = extractJsonString(body, "latent_prefix_path");
+    const latent_suffix_path_raw = extractJsonString(body, "latent_suffix_path");
+    const has_latent_out = latent_out_raw != null and latent_out_raw.?.len > 0;
+    const has_latent_prefix_path = latent_prefix_path_raw != null and latent_prefix_path_raw.?.len > 0;
+    const has_latent_suffix_path = latent_suffix_path_raw != null and latent_suffix_path_raw.?.len > 0;
+
     // Snap to the model's own ladder and SAY SO: silently generating a
     // different length than asked is how a client's audio mux drifts.
     const shape = minimax_h3.temporalShape(requested_frames);
-    if (videoRgbTransportReason(minimax_h3.chainDeliveredFrames(chain_windows, shape.frame_count), width, height)) |reason|
+    if (minimax_h3.latentPrefixRequestError(latent_prefix_frames, chain_windows, shape.frame_count, engine.supports_refs, has_latent_prefix_path)) |msg|
+        return sendError(conn, 400, msg);
+    if (minimax_h3.latentSuffixRequestError(latent_suffix_frames, chain_windows, shape.frame_count, engine.supports_refs, has_latent_suffix_path)) |msg|
+        return sendError(conn, 400, msg);
+    if (minimax_h3.latentPinWindowError(latent_prefix_frames, latent_suffix_frames, shape.frame_count)) |msg|
+        return sendError(conn, 400, msg);
+    if (has_latent_prefix_path and latent_prefix_frames == 0)
+        return sendError(conn, 400, "latent_prefix_path requires latent_prefix_frames");
+    if (has_latent_prefix_path and chain_windows != 1)
+        return sendError(conn, 400, "latent_prefix_path requires chain_windows == 1");
+    if (has_latent_suffix_path and latent_suffix_frames == 0)
+        return sendError(conn, 400, "latent_suffix_path requires latent_suffix_frames");
+    if (has_latent_suffix_path and chain_windows != 1)
+        return sendError(conn, 400, "latent_suffix_path requires chain_windows == 1");
+    if (has_latent_out and engine.supports_refs)
+        return sendError(conn, 400, "latent_out is FL2VA only — load an FL2VA checkpoint");
+    if (has_latent_out and shape.frame_count == 1)
+        return sendError(conn, 400, "num_frames 1 is a still and cannot use latent_out");
+    if (has_latent_prefix_path and engine.supports_refs)
+        return sendError(conn, 400, "latent_prefix_path is FL2VA only — load an FL2VA checkpoint");
+    if (has_latent_prefix_path and shape.frame_count == 1)
+        return sendError(conn, 400, "num_frames 1 is a still and cannot use latent_prefix_path");
+    if (has_latent_suffix_path and engine.supports_refs)
+        return sendError(conn, 400, "latent_suffix_path is FL2VA only — load an FL2VA checkpoint");
+    if (has_latent_suffix_path and shape.frame_count == 1)
+        return sendError(conn, 400, "num_frames 1 is a still and cannot use latent_suffix_path");
+    if (shape.frame_count == 1 and chain_windows != 1)
+        return sendError(conn, 400, "num_frames 1 is a still and cannot chain windows");
+    if (shape.frame_count == 1) {
+        inline for (.{ "first_frame_image", "last_frame_image" }) |key| {
+            if (extractJsonString(body, key)) |raw| {
+                if (raw.len > 0)
+                    return sendError(conn, 400, "num_frames 1 is a still and cannot take a first or last frame; attach a ref image");
+            }
+        }
+    }
+    const chain_overlap: u32 = if (latent_prefix_frames > 0) latent_prefix_frames else 0;
+    if (videoRgbTransportReason(minimax_h3.chainDeliveredFrames(chain_windows, shape.frame_count, chain_overlap), width, height)) |reason|
         return sendError(conn, 400, reason);
     const want_stream = sse.bodyWantsTrue(body, "stream");
     const preview_req = sse.parsePreview(body);
-    log.info("[video] minimax-h3 {d}x{d} {d}f/window (requested {d}, snapped to the 17k+5 ladder) steps={d} turbo={} loras={d} chain={d} stream={} preview={}\n", .{ width, height, shape.frame_count, requested_frames, steps, turbo, lora_n, chain_windows, want_stream, preview_req.enabled });
+    if (shape.frame_count == 1) {
+        log.info("[video] minimax-h3 {d}x{d} still (1 latent frame) steps={d} turbo={} loras={d} stream={} preview={}\n", .{ width, height, steps, turbo, lora_n, want_stream, preview_req.enabled });
+    } else {
+        if (latent_prefix_frames > 0) {
+            log.info("[video] minimax-h3 {d}x{d} {d}f/window (requested {d}, snapped to the 17k+5 ladder) steps={d} turbo={} loras={d} chain={d} latent_prefix_frames={d} stream={} preview={}\n", .{ width, height, shape.frame_count, requested_frames, steps, turbo, lora_n, chain_windows, latent_prefix_frames, want_stream, preview_req.enabled });
+        } else {
+            log.info("[video] minimax-h3 {d}x{d} {d}f/window (requested {d}, snapped to the 17k+5 ladder) steps={d} turbo={} loras={d} chain={d} stream={} preview={}\n", .{ width, height, shape.frame_count, requested_frames, steps, turbo, lora_n, chain_windows, want_stream, preview_req.enabled });
+        }
+    }
 
     // fl2va keyframes. NOT graceful (the a2vid rule: the user asked for THIS
     // frame): an undecodable image is a named 400, never a silent t2va. The
@@ -3648,15 +4046,67 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         for (refs.items) |*m| m.deinit();
         refs.deinit(allocator);
     }
-    const has_ref_fields = std.mem.indexOf(u8, body, "\"ref_images\"") != null or
-        std.mem.indexOf(u8, body, "\"ref_videos\"") != null or
-        std.mem.indexOf(u8, body, "\"ref_audios\"") != null;
-    if (has_ref_fields and !engine.supports_refs)
+    const has_ref_images = std.mem.indexOf(u8, body, "\"ref_images\"") != null;
+    const has_ref_videos = std.mem.indexOf(u8, body, "\"ref_videos\"") != null;
+    const has_ref_audios = std.mem.indexOf(u8, body, "\"ref_audios\"") != null;
+    const has_live_refs = has_ref_images or has_ref_videos or has_ref_audios;
+    const has_ref_mod_fields = std.mem.indexOf(u8, body, "\"ref_mod_paths\"") != null;
+    // Packs + live video/audio is the character+scene / dual-voice mix.
+    // Live stills + packs stay banned: both are identity, and stills keep Qwen.
+    if (has_ref_mod_fields and has_ref_images)
+        return sendError(conn, 400, "do not mix 'ref_mod_paths' with ref_images");
+    if ((has_live_refs or has_ref_mod_fields) and !engine.supports_refs)
         return sendError(conn, 400, "this MiniMax-H3 pack does not support references (it declares no 'ref2va' task) — load a REF2VA checkpoint");
-    if (has_ref_fields) {
+    // Identity packs first, then live scene/voice (Qwen labels belong to live refs).
+    if (has_ref_mod_fields) {
+        var err_buf: [256]u8 = undefined;
+        if (try parseH3RefMods(io, allocator, body, &refs, &err_buf)) |msg|
+            return sendError(conn, 400, msg);
+    }
+    if (has_live_refs) {
         var err_buf: [256]u8 = undefined;
         if (try parseH3Refs(allocator, body, width, height, shape.frame_count, &refs, &err_buf)) |msg|
             return sendError(conn, 400, msg);
+    }
+    if (refs.items.len > minimax_h3.MAX_REF_TOTAL)
+        return sendError(conn, 400, "too many references: at most 12 files across live refs and ref_mod_paths combined");
+    if (latent_prefix_frames > 0 and (has_live_refs or has_ref_mod_fields or refs.items.len > 0))
+        return sendError(conn, 400, "latent_prefix_frames cannot be used with references or ref_mod_paths");
+    if (latent_suffix_frames > 0 and (has_live_refs or has_ref_mod_fields or refs.items.len > 0))
+        return sendError(conn, 400, "latent_suffix_frames cannot be used with references or ref_mod_paths");
+    if ((has_latent_out or has_latent_prefix_path or has_latent_suffix_path) and (has_live_refs or has_ref_mod_fields or refs.items.len > 0 or n_kf > 0))
+        return sendError(conn, 400, "latent sidecar fields cannot be used with references, ref_mod_paths, or keyframes");
+    if (has_latent_out) {
+        const raw = latent_out_raw.?;
+        const path = try jsonUnescape(allocator, raw);
+        defer allocator.free(path);
+        if (!std.fs.path.isAbsolute(path))
+            return sendError(conn, 400, "'latent_out' must be an absolute path");
+        const parent = std.fs.path.dirname(path) orelse return sendError(conn, 400, "'latent_out' must be an absolute path");
+        std.Io.Dir.accessAbsolute(io, parent, .{}) catch
+            return sendError(conn, 400, "'latent_out' parent directory does not exist");
+    }
+    if (has_latent_prefix_path) {
+        const raw = latent_prefix_path_raw.?;
+        const path = try jsonUnescape(allocator, raw);
+        defer allocator.free(path);
+        if (!std.fs.path.isAbsolute(path))
+            return sendError(conn, 400, "'latent_prefix_path' must be an absolute path");
+        const pf = std.Io.Dir.openFileAbsolute(io, path, .{}) catch
+            return sendError(conn, 400, "'latent_prefix_path' file not found or not readable");
+        pf.close(io);
+    }
+    if (has_latent_suffix_path) {
+        const raw = latent_suffix_path_raw.?;
+        const path = try jsonUnescape(allocator, raw);
+        defer allocator.free(path);
+        if (!std.fs.path.isAbsolute(path))
+            return sendError(conn, 400, "'latent_suffix_path' must be an absolute path");
+        const pf = std.Io.Dir.openFileAbsolute(io, path, .{}) catch
+            return sendError(conn, 400, "'latent_suffix_path' file not found or not readable");
+        pf.close(io);
+    }
+    if (refs.items.len > 0) {
         for (refs.items) |m| {
             log.info("[video] minimax-h3 reference {s} #{d}: {d}x{d} {d}f, latent {d}x{d}x{d}, audio_t {d}\n", .{
                 @tagName(m.ref.kind), m.ref.ordinal,  m.ref.canvas.w, m.ref.canvas.h,
@@ -3685,6 +4135,55 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         if (paths.turbo_lora) |p| allocator.free(p);
     }
 
+    var prefix_video: ?mlx.mlx_array = null;
+    var prefix_audio: ?mlx.mlx_array = null;
+    var suffix_video: ?mlx.mlx_array = null;
+    var suffix_audio: ?mlx.mlx_array = null;
+    defer {
+        if (prefix_video) |v| _ = mlx.mlx_array_free(v);
+        if (prefix_audio) |a| _ = mlx.mlx_array_free(a);
+        if (suffix_video) |v| _ = mlx.mlx_array_free(v);
+        if (suffix_audio) |a| _ = mlx.mlx_array_free(a);
+    }
+    var latent_out_z: ?[:0]u8 = null;
+    defer if (latent_out_z) |p| allocator.free(p);
+    if (has_latent_prefix_path) {
+        const raw = latent_prefix_path_raw.?;
+        const path = try jsonUnescape(allocator, raw);
+        defer allocator.free(path);
+        const pathz = try allocator.dupeSentinel(u8, path, 0);
+        defer allocator.free(pathz);
+        const loaded = minimax_h3.loadLatentSidecar(allocator, pathz, mlx.gpuStream()) catch |e| switch (e) {
+            error.BadLatentSidecarPack => return sendError(conn, 400, "'latent_prefix_path' sidecar must declare pack fl2va"),
+            error.MissingVideoLatent => return sendError(conn, 400, "'latent_prefix_path' sidecar missing video_latent"),
+            error.MissingAudioLatent => return sendError(conn, 400, "'latent_prefix_path' sidecar missing audio_latent"),
+            else => return sendError(conn, 400, "'latent_prefix_path' could not be loaded"),
+        };
+        prefix_video = loaded.video;
+        prefix_audio = loaded.audio;
+    }
+    if (has_latent_suffix_path) {
+        const raw = latent_suffix_path_raw.?;
+        const path = try jsonUnescape(allocator, raw);
+        defer allocator.free(path);
+        const pathz = try allocator.dupeSentinel(u8, path, 0);
+        defer allocator.free(pathz);
+        const loaded = minimax_h3.loadLatentSidecar(allocator, pathz, mlx.gpuStream()) catch |e| switch (e) {
+            error.BadLatentSidecarPack => return sendError(conn, 400, "'latent_suffix_path' sidecar must declare pack fl2va"),
+            error.MissingVideoLatent => return sendError(conn, 400, "'latent_suffix_path' sidecar missing video_latent"),
+            error.MissingAudioLatent => return sendError(conn, 400, "'latent_suffix_path' sidecar missing audio_latent"),
+            else => return sendError(conn, 400, "'latent_suffix_path' could not be loaded"),
+        };
+        suffix_video = loaded.video;
+        suffix_audio = loaded.audio;
+    }
+    if (has_latent_out) {
+        const raw = latent_out_raw.?;
+        const path = try jsonUnescape(allocator, raw);
+        defer allocator.free(path);
+        latent_out_z = try allocator.dupeSentinel(u8, path, 0);
+    }
+
     var res = minimax_h3.generate(allocator, io, paths, .{
         .prompt = prompt,
         .width = width,
@@ -3697,6 +4196,12 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         .lora_paths = lora_paths[0..lora_n],
         .lora_scales = lora_scales[0..lora_n],
         .chain_windows = chain_windows,
+        .latent_prefix_frames = latent_prefix_frames,
+        .chain_prefix_video_latent = prefix_video,
+        .chain_prefix_audio_latent = prefix_audio,
+        .latent_suffix_frames = latent_suffix_frames,
+        .chain_suffix_video_latent = suffix_video,
+        .chain_suffix_audio_latent = suffix_audio,
         .keyframes = keyframes_buf[0..n_kf],
         .refs = refs.items,
     }, prog, mlx.gpuStream()) catch |e| {
@@ -3714,6 +4219,8 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
             error.BadLoraPath => "'lora_paths' must be absolute paths to .safetensors files",
             error.TooManyLoras => "too many LoRA adapters (max 8, and turbo takes one of the slots)",
             error.TurboLoraIncomplete => "turbo_lora.safetensors is incomplete — re-download minimax_h3_turbo_4step_ckpt500.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora",
+            error.StillNoChain => "num_frames 1 is a still and cannot chain windows",
+            error.StillNoKeyframe => "num_frames 1 is a still and cannot take a first or last frame; attach a ref image",
             else => null,
         };
         if (named) |msg| {
@@ -3728,6 +4235,13 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         return sendError(conn, 500, "MiniMax-H3 generation failed");
     };
     defer res.deinit();
+
+    if (latent_out_z) |out_path| {
+        const vl = res.video_latent orelse return sendError(conn, 500, "MiniMax-H3 generation failed");
+        const al = res.audio_latent;
+        minimax_h3.saveLatentSidecar(out_path, vl, al, mlx.gpuStream()) catch
+            return sendError(conn, 500, "MiniMax-H3 failed to write latent_out");
+    }
 
     try sendH3Video(allocator, conn, &res, want_stream);
 }
@@ -3862,6 +4376,9 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
         _ = mlx.mlx_array_free(c);
     };
     var enc_ptr: ?*const ltx.Component = null;
+    // A guide owns frame 0. `first_frame_image` replaces that pixel and does
+    // not also pin the canvas (the i2v path below).
+    if (std.mem.indexOf(u8, body, "\"ref_video_frames\"") == null) {
     if (extractJsonString(body, "first_frame_image")) |raw_img| {
         if (engine.vae_encoder) |*ve| {
             const b64 = try jsonUnescape(allocator, raw_img); // handles \/ from Swift JSONSerialization
@@ -3889,6 +4406,7 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
         } else {
             log.warn("[video] vae_encoder not loaded — ignoring first_frame_image (text-to-video)\n", .{});
         }
+    }
     }
 
     // Last-frame anchor (#260): `last_frame_image` pins the LAST latent frame
@@ -3924,6 +4442,73 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
         }
     }
 
+    var guide_full: ?mlx.mlx_array = null;
+    defer if (guide_full) |g| {
+        _ = mlx.mlx_array_free(g);
+    };
+    var guide_half: ?mlx.mlx_array = null;
+    defer if (guide_half) |g| {
+        _ = mlx.mlx_array_free(g);
+    };
+    if (std.mem.indexOf(u8, body, "\"ref_video_frames\"") != null) {
+        var it = iterJsonStringArray(body, "ref_video_frames") orelse
+            return sendError(conn, 400, "'ref_video_frames' must be an array of base64 PNG/JPEG strings");
+        var blobs: std.ArrayList([]u8) = .empty;
+        defer {
+            for (blobs.items) |b| allocator.free(b);
+            blobs.deinit(allocator);
+        }
+        while (it.next()) |raw| {
+            if (blobs.items.len >= ltx.guide_frame_cap)
+                return sendError(conn, 400, "'ref_video_frames' exceeds 121 frames");
+            const b64 = try jsonUnescape(allocator, raw);
+            defer allocator.free(b64);
+            const bytes = base64DecodeAlloc(allocator, b64) catch {
+                var msg_buf: [96]u8 = undefined;
+                const msg = std.fmt.bufPrint(&msg_buf, "'ref_video_frames'[{d}] is not valid base64", .{blobs.items.len}) catch
+                    "'ref_video_frames' frame is not valid base64";
+                return sendError(conn, 400, msg);
+            };
+            try blobs.append(allocator, bytes);
+        }
+        if (it.bad) return sendError(conn, 400, "'ref_video_frames' must be an array of base64 PNG/JPEG strings");
+        if (blobs.items.len == 0) return sendError(conn, 400, "'ref_video_frames' is empty");
+        const keep: usize = ltx.snapGuideFrameCount(@intCast(blobs.items.len));
+        if (keep == 0) return sendError(conn, 400, "'ref_video_frames' is empty");
+
+        const ve = if (engine.vae_encoder) |*e| e else
+            return sendError(conn, 400, "ref_video_frames needs vae_encoder.safetensors — download it into the model dir");
+        enc_ptr = ve;
+
+        var replaced: ?[]u8 = null;
+        defer if (replaced) |r| allocator.free(r);
+        if (extractJsonString(body, "first_frame_image")) |raw_img| {
+            const b64 = try jsonUnescape(allocator, raw_img);
+            defer allocator.free(b64);
+            if (b64.len > 0) {
+                replaced = base64DecodeAlloc(allocator, b64) catch
+                    return sendError(conn, 400, "'first_frame_image' could not replace ref_video_frames[0]: invalid base64");
+            }
+        }
+
+        const enc_h = (height / 32) * 32;
+        const enc_w = (width / 32) * 32;
+        var bad_frame: usize = 0;
+        guide_full = decodeGuideStack(allocator, blobs.items[0..keep], replaced, enc_h, enc_w, &bad_frame, engine.s) orelse {
+            var msg_buf: [128]u8 = undefined;
+            return sendError(conn, 400, guideDecodeMessage(&msg_buf, bad_frame, replaced != null));
+        };
+        if (pipeline != .one_stage) {
+            const half_h = ((height / 2) / 32) * 32;
+            const half_w = ((width / 2) / 32) * 32;
+            guide_half = decodeGuideStack(allocator, blobs.items[0..keep], replaced, half_h, half_w, &bad_frame, engine.s) orelse {
+                var msg_buf: [128]u8 = undefined;
+                return sendError(conn, 400, guideDecodeMessage(&msg_buf, bad_frame, replaced != null));
+            };
+        }
+        log.info("[video] ref video guide: {d} frames\n", .{keep});
+    }
+
     // `decoder`: which VAE turns the final latent into pixels. Default is the
     // conv `vae_decoder` we have always shipped; `diffusion` is LTX's own
     // DiffVAE, which their published clips are decoded with and which only the
@@ -3950,7 +4535,7 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
             // Run the schedule the loaded variant was trained for; the request
             // never forces a swap here (dev-only bundles keep working).
             const distilled = engine.transformer_variant == .distilled;
-            break :blk ltx.generateVideoFrames(io, allocator, engine.ltx_cfg, &engine.transformer, &engine.connector, vae_choice, enc_ptr, cond_img, last_img, engine.gemma_dir, pos_ids, neg_ids, LTX_PAD_ID, num_frames, height, width, frame_rate, steps, distilled, seed, guiders.vp, guiders.ap, prog, engine.s);
+            break :blk ltx.generateVideoFrames(io, allocator, engine.ltx_cfg, &engine.transformer, &engine.connector, vae_choice, enc_ptr, cond_img, last_img, guide_full, engine.gemma_dir, pos_ids, neg_ids, LTX_PAD_ID, num_frames, height, width, frame_rate, steps, distilled, seed, guiders.vp, guiders.ap, prog, engine.s);
         },
         .two_stage, .two_stage_hq => blk: {
             engine.ensureTransformer(.dev) catch |err| break :blk err;
@@ -3963,7 +4548,9 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
                 .swap_ctx = @ptrCast(&swapper),
                 .swap = Stage2Swap.swap,
             };
-            break :blk ltx.generateVideoFramesTwoStage(io, allocator, engine.ltx_cfg, &engine.transformer, &engine.connector, vae_choice, &engine.vae_encoder.?, cond_img_half, cond_img, last_img_half, last_img, audio_cond, engine.gemma_dir, pos_ids, neg_ids, LTX_PAD_ID, num_frames, height, width, frame_rate, opts, seed, guiders.vp, guiders.ap, prog, engine.s);
+            const half_xfer = guide_half;
+            guide_half = null;
+            break :blk ltx.generateVideoFramesTwoStage(io, allocator, engine.ltx_cfg, &engine.transformer, &engine.connector, vae_choice, &engine.vae_encoder.?, cond_img_half, cond_img, last_img_half, last_img, half_xfer, guide_full, audio_cond, engine.gemma_dir, pos_ids, neg_ids, LTX_PAD_ID, num_frames, height, width, frame_rate, opts, seed, guiders.vp, guiders.ap, prog, engine.s);
         },
     } catch |err| {
         if (err == error.Cancelled) {
@@ -4964,6 +5551,27 @@ fn jsonUnescape(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
 // ── Tests ─────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "guideDecodeMessage names the frame, and the replacement field at index 0" {
+    var buf: [128]u8 = undefined;
+    try testing.expectEqualStrings("'ref_video_frames'[0] is not a PNG/JPEG image", guideDecodeMessage(&buf, 0, false));
+    try testing.expectEqualStrings("'ref_video_frames'[3] is not a PNG/JPEG image", guideDecodeMessage(&buf, 3, true));
+    try testing.expectEqualStrings("'first_frame_image' could not replace ref_video_frames[0]: expected a PNG/JPEG image", guideDecodeMessage(&buf, 0, true));
+}
+
+test "coverWindow center-crops the long axis" {
+    const wide = coverWindow(200, 100, 50, 50);
+    try testing.expectApproxEqAbs(@as(f32, 100), wide.win_w, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 100), wide.win_h, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 50), wide.x_off, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 0), wide.y_off, 0.01);
+    const tall = coverWindow(100, 200, 50, 50);
+    try testing.expectApproxEqAbs(@as(f32, 100), tall.win_w, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 50), tall.y_off, 0.01);
+    const match = coverWindow(320, 180, 320, 180);
+    try testing.expectApproxEqAbs(@as(f32, 320), match.win_w, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 0), match.x_off, 0.01);
+}
 
 test "modalityFromType classifies the media archs + markers (incl. krea + hunyuan3d)" {
     try testing.expectEqual(Modality.image, modalityFromType("flux2-klein-4b").?);
@@ -6208,7 +6816,7 @@ test "instrumental is parsed off the body only when spelled true" {
 
 test "videoRgbTransportReason: chained windows are billed into the response cap (#283)" {
     // 141f/window x 5 windows at 1056x864 = 701 frames = 1.9 GB raw: refused by name.
-    try std.testing.expect(videoRgbTransportReason(minimax_h3.chainDeliveredFrames(5, 141), 1056, 864) != null);
+    try std.testing.expect(videoRgbTransportReason(minimax_h3.chainDeliveredFrames(5, 141, 0), 1056, 864) != null);
     // One window of the same shape fits.
     try std.testing.expect(videoRgbTransportReason(141, 1056, 864) == null);
 }

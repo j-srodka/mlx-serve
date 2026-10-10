@@ -755,6 +755,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/responses/compact",
     "/v1/unload-model",
     "/v1/video/generations",
+    "/v1/video/refmods",
 };
 
 /// Is `path` an endpoint this server serves at all (any method)?
@@ -2225,7 +2226,13 @@ fn handleConnection(
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
         log.debug("GET  /health -> 200\n", .{});
-        try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
+        const h3 = @import("minimax_h3.zig");
+        var health_buf: [96]u8 = undefined;
+        const health_body = if (h3.latent_suffix_supported)
+            std.fmt.bufPrint(&health_buf, "{{\"status\":\"ok\",\"latent_suffix\":true}}", .{}) catch "{\"status\":\"ok\"}"
+        else
+            "{\"status\":\"ok\"}";
+        try sendResponse(stream, "200 OK", "application/json", health_body);
         return;
     }
     // The console. It belongs here, above resolution, for the same reason
@@ -2628,6 +2635,10 @@ fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleGen(allocator, stream, body, lm, .video);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/video/refmods")) {
+        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+        const body = request[header_end + 4 .. total_read];
+        try handleGen(allocator, stream, body, lm, .h3_refmods);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/3d/generations")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
@@ -7061,6 +7072,10 @@ fn genJobRun(ctx: *anyopaque) void {
         .speech => if (job.lm.audio_engine) |e| media_mod.handleAudio(job.allocator, job.conn, job.body, e) else error.WrongModality,
         .music => if (job.lm.audio_engine) |e| media_mod.handleMusic(job.allocator, job.conn, job.body, e) else error.WrongModality,
         .video => if (job.lm.video_engine) |e| media_mod.handleVideo(job.conn.io, job.allocator, job.conn, job.body, e) else error.WrongModality,
+        .h3_refmods => if (job.lm.video_engine) |e| switch (e.backend) {
+            .h3 => |h| media_mod.handleVideoH3Refmods(job.conn.io, job.allocator, job.conn, job.body, h),
+            .ltx => error.WrongModality,
+        } else error.WrongModality,
         .mesh => if (job.lm.mesh_engine) |e| media_mod.handleMesh(job.allocator, job.conn, job.body, e) else error.WrongModality,
         .decisions => {
             genJobRunMany(&.{ctx});
@@ -7100,6 +7115,15 @@ fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: 
         .video => lm.video_engine != null,
         .mesh => lm.mesh_engine != null,
         .decision => lm.decision_engine != null,
+    } and switch (route) {
+        // The H3 extract route has no LTX counterpart. Without this gate the job
+        // returns WrongModality after the modality check and genJobRun only logs
+        // it, leaving a parked connection the client never gets an answer on.
+        .h3_refmods => if (lm.video_engine) |e| switch (e.backend) {
+            .h3 => true,
+            .ltx => false,
+        } else false,
+        else => true,
     };
     if (!ok) {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Target model does not support this modality. Load the matching image/audio/video/3D/decision model and target it by id.", 400);
