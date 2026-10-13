@@ -4177,9 +4177,13 @@ fn generateOne(
                 } else blk: {
                     const wav = m.waveform orelse return error.RefMissingAudio;
                     const encoded = try audio_mod.encode(allocator, &aw, wav, s);
-                    defer _ = mlx.mlx_array_free(encoded);
-                    if (@as(u32, @intCast(mlx.getShape(encoded)[3])) != m.ref.audio_t)
+                    // A defer in this block runs at `break`, before the caller
+                    // reads the handle. Free only the mismatch path; the
+                    // `lat_owned` defer below owns the success path.
+                    if (@as(u32, @intCast(mlx.getShape(encoded)[3])) != m.ref.audio_t) {
+                        _ = mlx.mlx_array_free(encoded);
                         return error.RefAudioLengthMismatch;
+                    }
                     break :blk encoded;
                 };
                 const lat_owned = m.latent == null;
@@ -4976,33 +4980,36 @@ pub fn audioLatentTHiExclusiveForKeepEnd(keep_end: u32) u32 {
 }
 
 /// Named refusal for HTTP 400 (`null` = ok). Refs are checked separately.
+/// `supports_fl2va` = the pack's config declares the `fl2va` task (a hybrid
+/// fl2va+ref2va pack passes; a REF2VA-only pack is refused by name).
 pub fn latentPrefixRequestError(
     latent_prefix_frames: u32,
     chain_windows: u32,
     window_frames: u32,
-    supports_refs: bool,
+    supports_fl2va: bool,
     has_latent_prefix_path: bool,
 ) ?[]const u8 {
     if (latent_prefix_frames == 0) return null;
     if (chain_windows <= 1 and !has_latent_prefix_path) return "latent_prefix_frames requires chain_windows > 1";
-    if (supports_refs) return "latent_prefix_frames is FL2VA only — load an FL2VA checkpoint";
+    if (!supports_fl2va) return "latent_prefix_frames is FL2VA only — load an FL2VA checkpoint";
     if (window_frames == 1) return "num_frames 1 is a still and cannot use latent_prefix_frames";
     if (!isLegalLatentPrefixFrames(latent_prefix_frames)) return "latent_prefix_frames must be one of 5, 22, 39, 56";
     if (latent_prefix_frames >= window_frames) return "latent_prefix_frames must be less than num_frames per window";
     return null;
 }
 
+/// `supports_fl2va` as in `latentPrefixRequestError`.
 pub fn latentSuffixRequestError(
     latent_suffix_frames: u32,
     chain_windows: u32,
     window_frames: u32,
-    supports_refs: bool,
+    supports_fl2va: bool,
     has_latent_suffix_path: bool,
 ) ?[]const u8 {
     if (latent_suffix_frames == 0) return null;
     if (chain_windows != 1) return "latent_suffix_frames requires chain_windows == 1";
     if (!has_latent_suffix_path) return "latent_suffix_frames requires latent_suffix_path";
-    if (supports_refs) return "latent_suffix_frames is FL2VA only — load an FL2VA checkpoint";
+    if (!supports_fl2va) return "latent_suffix_frames is FL2VA only — load an FL2VA checkpoint";
     if (window_frames == 1) return "num_frames 1 is a still and cannot use latent_suffix_frames";
     if (!isLegalLatentSuffixFrames(latent_suffix_frames)) return "latent_suffix_frames must be one of 5, 22, 39, 56";
     if (latent_suffix_frames >= window_frames) return "latent_suffix_frames must be less than num_frames per window";
@@ -7490,13 +7497,17 @@ test "minimax h3: chain math — delivered frames, overlap width, cross-fade sea
     try testing.expectEqual(@as(usize, 22 * 1333), chainOverlapPcmSamples(22));
     try testing.expect(!isLegalLatentPrefixFrames(0));
     try testing.expect(isLegalLatentPrefixFrames(22));
-    try testing.expect(latentPrefixRequestError(22, 1, 56, false, false) != null);
-    try testing.expect(latentPrefixRequestError(56, 2, 56, false, false) != null);
-    try testing.expect(latentPrefixRequestError(22, 2, 56, true, false) != null);
-    try testing.expect(latentPrefixRequestError(22, 2, 56, false, false) == null);
-    try testing.expect(latentPrefixRequestError(22, 1, 56, false, true) == null);
-    try testing.expect(latentSuffixRequestError(22, 1, 56, false, true) == null);
-    try testing.expect(latentSuffixRequestError(22, 2, 56, false, true) != null);
+    // 4th arg is `supports_fl2va` (the pack declares the fl2va task).
+    try testing.expect(latentPrefixRequestError(22, 1, 56, true, false) != null);
+    try testing.expect(latentPrefixRequestError(56, 2, 56, true, false) != null);
+    try testing.expect(latentPrefixRequestError(22, 2, 56, false, false) != null);
+    try testing.expect(latentPrefixRequestError(22, 2, 56, true, false) == null);
+    try testing.expect(latentPrefixRequestError(22, 1, 56, true, true) == null);
+    try testing.expect(latentSuffixRequestError(22, 1, 56, true, true) == null);
+    try testing.expect(latentSuffixRequestError(22, 2, 56, true, true) != null);
+    // A REF2VA-only pack refuses both pin kinds.
+    try testing.expect(latentPrefixRequestError(22, 2, 56, false, true) != null);
+    try testing.expect(latentSuffixRequestError(22, 1, 56, false, true) != null);
     try testing.expect(latentPinWindowError(22, 22, 73) == null);
     try testing.expect(latentPinWindowError(56, 56, 73) != null);
     // One video frame of audio at 32 kHz / 24 fps.

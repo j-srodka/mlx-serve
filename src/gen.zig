@@ -1296,8 +1296,8 @@ pub const VideoEngine = struct {
     }
 };
 
-/// `h3ConfigDeclaresRef2va` over a model dir's own `config.json`.
-fn h3DirDeclaresRef2va(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+/// `h3ConfigHasTask` over a model dir's own `config.json`.
+fn h3DirHasTask(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, task: []const u8) bool {
     if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return false;
     const path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return false;
     defer allocator.free(path);
@@ -1307,24 +1307,40 @@ fn h3DirDeclaresRef2va(io: std.Io, allocator: std.mem.Allocator, model_dir: []co
     var rs = file.reader(io, &rb);
     const content = rs.interface.allocRemaining(allocator, .limited(1024 * 1024)) catch return false;
     defer allocator.free(content);
-    return h3ConfigDeclaresRef2va(allocator, content);
+    return h3ConfigHasTask(allocator, content, task);
 }
 
-/// True when a MiniMax-H3 `config.json` declares the `ref2va` task. The two
+fn h3DirDeclaresRef2va(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    return h3DirHasTask(io, allocator, model_dir, "ref2va");
+}
+
+fn h3DirDeclaresFl2va(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    return h3DirHasTask(io, allocator, model_dir, "fl2va");
+}
+
+/// True when a MiniMax-H3 `config.json` task list contains `task`. The two
 /// partitions share the text encoder, both VAEs and every geometry number, so
 /// nothing about the files themselves tells them apart — only the converter's
-/// declared task list does, and an FL2VA pack handed references would generate
-/// while silently ignoring them.
-fn h3ConfigDeclaresRef2va(allocator: std.mem.Allocator, config_json: []const u8) bool {
+/// declared task list does. A hybrid pack (fl2va + ref2va, e.g. the local
+/// b20-49 adaln merge) declares BOTH and serves both feature sets.
+fn h3ConfigHasTask(allocator: std.mem.Allocator, config_json: []const u8, task: []const u8) bool {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, config_json, .{}) catch return false;
     defer parsed.deinit();
     if (parsed.value != .object) return false;
     const tasks = parsed.value.object.get("tasks") orelse return false;
     if (tasks != .array) return false;
     for (tasks.array.items) |t| {
-        if (t == .string and std.mem.eql(u8, t.string, "ref2va")) return true;
+        if (t == .string and std.mem.eql(u8, t.string, task)) return true;
     }
     return false;
+}
+
+fn h3ConfigDeclaresRef2va(allocator: std.mem.Allocator, config_json: []const u8) bool {
+    return h3ConfigHasTask(allocator, config_json, "ref2va");
+}
+
+fn h3ConfigDeclaresFl2va(allocator: std.mem.Allocator, config_json: []const u8) bool {
+    return h3ConfigHasTask(allocator, config_json, "fl2va");
 }
 
 /// MiniMax-H3 video+audio. Holds only paths: `minimax_h3.generate` stages the
@@ -1334,8 +1350,12 @@ pub const H3VideoEngine = struct {
     allocator: std.mem.Allocator,
     model_dir: []u8,
     /// Whether this pack is the REF2VA partition (read from its config's task
-    /// list at load — the file layout is identical either way).
+    /// list at load — the file layout is identical either way): references.
     supports_refs: bool = false,
+    /// FL2VA partition (config declares `fl2va`): keyframe conditioning,
+    /// latent pins, `latent_out`, chain windows. A hybrid pack sets BOTH —
+    /// its DiT is FL2VA-quality, so it serves both feature sets.
+    supports_fl2va: bool = false,
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*H3VideoEngine {
         const self = try allocator.create(H3VideoEngine);
@@ -1344,6 +1364,7 @@ pub const H3VideoEngine = struct {
             .allocator = allocator,
             .model_dir = try allocator.dupe(u8, model_dir),
             .supports_refs = h3DirDeclaresRef2va(io, allocator, model_dir),
+            .supports_fl2va = h3DirDeclaresFl2va(io, allocator, model_dir),
         };
         return self;
     }
@@ -3915,7 +3936,7 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     const chain_windows: u32 = @intCast(extractJsonInt(body, "chain_windows") orelse 1);
     if (chain_windows < 1 or chain_windows > 6)
         return sendError(conn, 400, "chain_windows must be 1-6");
-    if (chain_windows > 1 and engine.supports_refs)
+    if (chain_windows > 1 and !engine.supports_fl2va)
         return sendError(conn, 400, "chained windows ride FL2VA keyframe conditioning — the REF2VA pack cannot serve them; load an FL2VA checkpoint");
 
     const latent_prefix_frames: u32 = @intCast(extractJsonInt(body, "latent_prefix_frames") orelse 0);
@@ -3930,9 +3951,9 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     // Snap to the model's own ladder and SAY SO: silently generating a
     // different length than asked is how a client's audio mux drifts.
     const shape = minimax_h3.temporalShape(requested_frames);
-    if (minimax_h3.latentPrefixRequestError(latent_prefix_frames, chain_windows, shape.frame_count, engine.supports_refs, has_latent_prefix_path)) |msg|
+    if (minimax_h3.latentPrefixRequestError(latent_prefix_frames, chain_windows, shape.frame_count, engine.supports_fl2va, has_latent_prefix_path)) |msg|
         return sendError(conn, 400, msg);
-    if (minimax_h3.latentSuffixRequestError(latent_suffix_frames, chain_windows, shape.frame_count, engine.supports_refs, has_latent_suffix_path)) |msg|
+    if (minimax_h3.latentSuffixRequestError(latent_suffix_frames, chain_windows, shape.frame_count, engine.supports_fl2va, has_latent_suffix_path)) |msg|
         return sendError(conn, 400, msg);
     if (minimax_h3.latentPinWindowError(latent_prefix_frames, latent_suffix_frames, shape.frame_count)) |msg|
         return sendError(conn, 400, msg);
@@ -3944,15 +3965,15 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         return sendError(conn, 400, "latent_suffix_path requires latent_suffix_frames");
     if (has_latent_suffix_path and chain_windows != 1)
         return sendError(conn, 400, "latent_suffix_path requires chain_windows == 1");
-    if (has_latent_out and engine.supports_refs)
+    if (has_latent_out and !engine.supports_fl2va)
         return sendError(conn, 400, "latent_out is FL2VA only — load an FL2VA checkpoint");
     if (has_latent_out and shape.frame_count == 1)
         return sendError(conn, 400, "num_frames 1 is a still and cannot use latent_out");
-    if (has_latent_prefix_path and engine.supports_refs)
+    if (has_latent_prefix_path and !engine.supports_fl2va)
         return sendError(conn, 400, "latent_prefix_path is FL2VA only — load an FL2VA checkpoint");
     if (has_latent_prefix_path and shape.frame_count == 1)
         return sendError(conn, 400, "num_frames 1 is a still and cannot use latent_prefix_path");
-    if (has_latent_suffix_path and engine.supports_refs)
+    if (has_latent_suffix_path and !engine.supports_fl2va)
         return sendError(conn, 400, "latent_suffix_path is FL2VA only — load an FL2VA checkpoint");
     if (has_latent_suffix_path and shape.frame_count == 1)
         return sendError(conn, 400, "num_frames 1 is a still and cannot use latent_suffix_path");
@@ -6372,6 +6393,21 @@ test "h3ConfigDeclaresRef2va reads the pack's own task list" {
     // A substring match on the whole file would pass on the README-ish text a
     // config can legally carry; only the task LIST counts.
     try testing.expect(!h3ConfigDeclaresRef2va(a, "{\"note\":\"ref2va\",\"tasks\":[\"t2va\",\"fl2va\"]}"));
+}
+
+test "h3Config task flags — fl2va partition, ref2va partition, hybrid" {
+    const a = testing.allocator;
+    // Pure FL2VA: FL2VA features yes, references refused.
+    try testing.expect(h3ConfigDeclaresFl2va(a, "{\"model_type\":\"minimax_h3\",\"tasks\":[\"t2va\",\"fl2va\"]}"));
+    try testing.expect(!h3ConfigDeclaresRef2va(a, "{\"model_type\":\"minimax_h3\",\"tasks\":[\"t2va\",\"fl2va\"]}"));
+    // Pure REF2VA: references yes, FL2VA features refused.
+    try testing.expect(!h3ConfigDeclaresFl2va(a, "{\"model_type\":\"minimax_h3\",\"tasks\":[\"t2va\",\"ref2va\"]}"));
+    try testing.expect(h3ConfigDeclaresRef2va(a, "{\"model_type\":\"minimax_h3\",\"tasks\":[\"t2va\",\"ref2va\"]}"));
+    // Hybrid (local adaln merge: FL2VA DiT + REF2VA later-block adaln) declares
+    // both and serves both — this is the pack H3 Timeline runs on.
+    const hybrid = "{\"model_type\":\"minimax_h3\",\"partition\":\"hybrid_b20_49\",\"tasks\":[\"t2va\",\"fl2va\",\"ref2va\"]}";
+    try testing.expect(h3ConfigDeclaresFl2va(a, hybrid));
+    try testing.expect(h3ConfigDeclaresRef2va(a, hybrid));
 }
 
 test "iterJsonObjectArray walks ref_videos entries" {
