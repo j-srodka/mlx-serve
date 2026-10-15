@@ -144,6 +144,16 @@ class ServerManager: ObservableObject {
         running && launchedModelPath.isEmpty && !chatResident && !selectedModelPath.isEmpty
     }
 
+    /// Ids of models the server currently serves AND that answer chat turns:
+    /// loaded + carrying a raw "chat" capability. Media (video/image/audio)
+    /// and embeddings slots are excluded even when loaded, and unloaded
+    /// registry stubs are excluded — callers use this to pick a default
+    /// chat target instead of 503-hunting across the mixed media registry.
+    /// Pure + static so the registry layout stays unit-pinned.
+    nonisolated static func residentChatModelIds(from models: [ModelInfo]) -> [String] {
+        models.filter { $0.loaded && $0.capabilities.contains("chat") }.map(\.name)
+    }
+
     /// Called by chat surfaces (chat window / quick launcher via
     /// ChatTurnEngine, the avatar) before a turn: when the running server was
     /// started headless for media generation, hot-load the user's selected
