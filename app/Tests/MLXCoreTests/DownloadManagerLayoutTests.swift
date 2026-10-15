@@ -76,6 +76,9 @@ final class DownloadManagerLayoutTests: XCTestCase {
         // with "deepseek-v4-flash", so unfiltered it classifies as a
         // servable chat quant via ggufModelType.
         XCTAssertTrue(DownloadManager.isGgufSidecar("DeepSeek-V4-Flash-DSpark-support.gguf"))
+        // llama.cpp's head-only MTP export (`convert --mtp`), e.g. unsloth's MTP/ folder.
+        XCTAssertTrue(DownloadManager.isGgufSidecar("mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"))
+        XCTAssertTrue(DownloadManager.isGgufSidecar("MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf"))
         // Real chat quants stay servable — including names that merely
         // contain the letters without the delimited token.
         XCTAssertFalse(DownloadManager.isGgufSidecar("DeepSeek-V4-Flash-IQ2XXS-chat-v2.gguf"))
@@ -140,6 +143,24 @@ final class DownloadManagerLayoutTests: XCTestCase {
         XCTAssertFalse(paths.contains("pytorch_model-00001-of-00002.bin"), "torch shadow weights must not be pulled")
         XCTAssertFalse(paths.contains("consolidated.pth"))
         XCTAssertFalse(paths.contains("flax_model.msgpack"))
+    }
+
+    /// DeepSeek-V4.1's repack keeps its Engram tables in `engram/` and its token map as a `.u32`;
+    /// same rule as `cli.shouldDownload`.
+    func testSelectNeededFilesIncludesDsv41EngramAndTokenMap() {
+        let entries: [[String: Any]] = [
+            ["path": "config.json", "type": "file", "size": 4_000],
+            ["path": "experts.bin", "type": "file", "size": 204_535_234_560],
+            ["path": "engram-token-map.u32", "type": "file", "size": 517_120],
+            ["path": "engram/engram-manifest.json", "type": "file", "size": 2_000],
+            ["path": "engram/engram-L1.bin", "type": "file", "size": 101_377_628_352],
+            ["path": "engram/engram-residents.safetensors", "type": "file", "size": 90_000_000],
+            ["path": "receipts/convert.json", "type": "file", "size": 1_000],
+            ["path": "encoding/encoding.py", "type": "file", "size": 40_000],
+        ]
+        let paths = Set(DownloadManager.selectNeededFiles(from: entries).map { $0.0 })
+        XCTAssertEqual(paths, ["config.json", "experts.bin", "engram-token-map.u32", "engram/engram-manifest.json",
+                               "engram/engram-L1.bin", "engram/engram-residents.safetensors"])
     }
 
     /// oMLX OptiQ repos ship the MTP head as `optiq/mtp.safetensors` (a sibling
@@ -294,6 +315,17 @@ final class DownloadManagerLayoutTests: XCTestCase {
                 sizeFormatted: "32 GB", modelType: mt, source: .custom, kind: .base
             )
             XCTAssertTrue(m.isSupportedArchitecture, "\"\(mt)\" must be in supportedModelTypes")
+        }
+    }
+
+    func testLfm2MoeAndKolibriAreChatPickable() {
+        // LFM2.5-8B-A1B / 24B-A2B ship "lfm2_moe", Kolibri-1 "kolibri1"; the server serves both.
+        for mt in ["lfm2_moe", "kolibri1"] {
+            let m = LocalModel(
+                id: "test:\(mt)", name: mt, path: "/tmp/\(mt)",
+                sizeFormatted: "1 GB", modelType: mt, source: .custom, kind: .base
+            )
+            XCTAssertTrue(m.isChatPickable, "\"\(mt)\" must be in supportedModelTypes")
         }
     }
 

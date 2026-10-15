@@ -41,6 +41,14 @@ const stb = @import("stb");
 
 /// The reference's recommended sampling: 40 steps, no guidance.
 pub const DEFAULT_STEPS: u32 = 40;
+
+/// A checkpoint's own `sample_sigmas` grid (Turbo) decides the step count over
+/// the request's, as in diffusers' QwenImage21Pipeline.
+pub fn resolveSteps(grid: ?[]const f32, steps: u32) u32 {
+    if (grid) |g| return @intCast(g.len);
+    return if (steps == 0) DEFAULT_STEPS else steps;
+}
+
 const VAE_DOWNSAMPLE: u32 = 16;
 /// Text encoding stays bf16; the DiT defaults to bf16 and the VAE stays f32.
 const COMPUTE: mlx.mlx_dtype = .bfloat16;
@@ -360,6 +368,32 @@ pub fn computeSigmas(a: std.mem.Allocator, steps: u32, image_seq_len: u32) ![]f3
     return out;
 }
 
+/// Sigmas [steps+1] for one request: the checkpoint's grid verbatim plus the
+/// terminal 0 (its scheduler config is shift 1, no dynamic shifting), else
+/// the dynamic-shift schedule.
+pub fn scheduleSigmas(a: std.mem.Allocator, grid: ?[]const f32, steps: u32, image_seq_len: u32) ![]f32 {
+    const g = grid orelse return computeSigmas(a, steps, image_seq_len);
+    const out = try a.alloc(f32, g.len + 1);
+    @memcpy(out[0..g.len], g);
+    out[g.len] = 0;
+    return out;
+}
+
+/// `model_index.json` `sample_sigmas` (owned), or null when the file or key is absent.
+pub fn parseSampleSigmas(io: std.Io, a: std.mem.Allocator, model_dir: []const u8) !?[]f32 {
+    const path = try std.fmt.allocPrint(a, "{s}/model_index.json", .{model_dir});
+    defer a.free(path);
+    var parsed = readJson(io, a, path) catch |err| return if (err == error.QwenImageConfigMissing) null else err;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const v = parsed.value.object.get("sample_sigmas") orelse return null;
+    if (v != .array or v.array.items.len == 0) return error.QwenImageBadConfig;
+    const out = try a.alloc(f32, v.array.items.len);
+    errdefer a.free(out);
+    for (v.array.items, out) |e, *o| o.* = jsonF32(e) orelse return error.QwenImageBadConfig;
+    return out;
+}
+
 // ── DiT ──
 
 /// Per-request constants of the joint [text | image] sequence.
@@ -435,9 +469,8 @@ pub const Geometry = struct {
     }
 };
 
-/// Text is causal and always modulated at t=0, so its per-layer K/V is
-/// invariant across denoising steps. This cache belongs to ONE conditioning
-/// branch of ONE request; positive and negative CFG branches never share it.
+/// The t=0 prefix cannot attend to the target, so its per-layer K/V is
+/// invariant across steps. One cache belongs to one request and CFG branch.
 const PrefixKV = struct {
     k: A,
     v: A,
@@ -471,6 +504,10 @@ const PrefixCache = struct {
         return .{ .allocator = a, .layers = layers, .image_geo = try geo.imageOnly(s) };
     }
 
+    fn initEdit(a: std.mem.Allocator, n_layers: usize, geo: *const EditGeometry, s: S) !PrefixCache {
+        return init(a, n_layers, &geo.ropeGeometry(), s);
+    }
+
     fn deinit(self: *PrefixCache) void {
         for (self.layers) |*kv| if (kv.*) |*pair| pair.deinit();
         self.allocator.free(self.layers);
@@ -493,7 +530,7 @@ const PrefixCache = struct {
     }
 };
 
-fn prefixCacheEnabled(value: ?[*:0]const u8) bool {
+pub fn prefixCacheEnabled(value: ?[*:0]const u8) bool {
     return if (value) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
 }
 
@@ -528,6 +565,11 @@ pub const EditGeometry = struct {
     txt_row: A, // [L] i32
     lat_row: A, // [L] i32
     img_cond: A, // [1, L, 1] bool
+
+    /// Borrowed tables; only imageOnly's slices are owned by the cache.
+    fn ropeGeometry(self: *const EditGeometry) Geometry {
+        return .{ .text_len = self.target_start, .cos = self.cos, .sin = self.sin, .mod_row = self.mod_row };
+    }
 
     /// `n` is the VLM sequence length; `mask` is the pre-expansion joint mask
     /// (1 at a VLM image slot or an appended target slot, else 0); `shapes`
@@ -1133,7 +1175,7 @@ pub const Dit = struct {
     }
 
     /// Project → per-head RMS norm → RoPE → [1, heads, L, hd], edit tables.
-    fn editHeadsOf(self: *const Dit, lin: *const MfLinear, norm: ?A, x: A, geo: *const EditGeometry) !A {
+    fn editHeadsOf(self: *const Dit, lin: *const MfLinear, norm: ?A, x: A, geo: *const Geometry) !A {
         const s = self.s;
         const sh = mlx.getShape(x);
         const y = try lin.forward(x, null, s);
@@ -1149,17 +1191,27 @@ pub const Dit = struct {
         return transpose(yr, &perm, s);
     }
 
-    fn editAttention(self: *const Dit, b: *const Block, x: A, geo: *const EditGeometry) !A {
+    fn editAttention(self: *const Dit, b: *const Block, x: A, geo: *const EditGeometry, rope: *const Geometry, slot: ?*?PrefixKV, cached: bool) !A {
         const s = self.s;
         const sh = mlx.getShape(x);
-        const q = try self.editHeadsOf(&b.q, b.norm_q, x, geo);
+        const q = try self.editHeadsOf(&b.q, b.norm_q, x, rope);
         defer free(q);
-        const k = try self.editHeadsOf(&b.k, b.norm_k, x, geo);
+        const k = try self.editHeadsOf(&b.k, b.norm_k, x, rope);
         defer free(k);
-        const v = try self.editHeadsOf(&b.v, null, x, geo);
+        const v = try self.editHeadsOf(&b.v, null, x, rope);
         defer free(v);
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.cfg.head_dim)));
-        const attn = try segmentSdpaWalk(q, k, v, geo, scale, s, self.allocator);
+        const attn = if (cached) blk: {
+            const pair = slot.?.*.?;
+            const keys = try concat(&.{ pair.k, k }, 2, s);
+            defer free(keys);
+            const values = try concat(&.{ pair.v, v }, 2, s);
+            defer free(values);
+            break :blk try sdpa(q, keys, values, scale, "", s);
+        } else blk: {
+            if (slot) |kv| kv.* = try PrefixKV.capture(k, v, geo.target_start, s);
+            break :blk try segmentSdpaWalk(q, k, v, geo, scale, s, self.allocator);
+        };
         defer free(attn);
         const back = try transpose(attn, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer free(back);
@@ -1168,13 +1220,13 @@ pub const Dit = struct {
         return b.o.forward(flat, null, s);
     }
 
-    fn editBlockForward(self: *const Dit, b: *const Block, x: A, mod: *const StepMod, geo: *const EditGeometry) !A {
+    fn editBlockForward(self: *const Dit, b: *const Block, x: A, mod: *const StepMod, geo: *const EditGeometry, rope: *const Geometry, slot: ?*?PrefixKV, cached: bool) !A {
         const s = self.s;
         const n1 = try layerNorm(x, self.cfg.eps, s);
         defer free(n1);
         const a_in = try mulA(n1, mod.scale1, s);
         defer free(a_in);
-        const attn = try self.editAttention(b, a_in, geo);
+        const attn = try self.editAttention(b, a_in, geo, rope, slot, cached);
         defer free(attn);
         const ga = try mulA(attn, mod.gate1, s);
         defer free(ga);
@@ -1206,50 +1258,62 @@ pub const Dit = struct {
     /// appended) lives in `geo` — `mask` is what `geo` was built from.
     /// Returns the target rows [1, target_tokens, out_ch].
     pub fn forwardEdit(self: *Dit, latents: A, hidden: A, mask: []const i32, t: f32, geo: *const EditGeometry) !A {
+        return self.forwardEditCached(latents, hidden, mask, t, geo, null);
+    }
+
+    /// First call receives [refs | target]; once ready, only target latents
+    /// enter the DiT. The original block-causal prefix and RoPE stay fixed.
+    fn forwardEditCached(self: *Dit, latents: A, hidden: A, mask: []const i32, t: f32, geo: *const EditGeometry, cache: ?*PrefixCache) !A {
         _ = mask;
         const s = self.s;
+        const cached = if (cache) |c| c.ready else false;
+        const full_rope = geo.ropeGeometry();
+        const rope = if (cached) &cache.?.image_geo else &full_rope;
         const temb = try self.timeEmbed(t);
         defer free(temb);
         const temb_act = try silu(temb, s);
         defer free(temb_act);
-        var mod = try self.editStepMod(temb_act, geo.mod_row);
+        var mod = try self.editStepMod(temb_act, rope.mod_row);
         defer mod.deinit();
 
         const H: c_int = @intCast(self.cfg.hidden());
-        const th = try self.textIn(hidden);
-        defer free(th);
-        var zeros = mlx.mlx_array_new();
-        defer free(zeros);
-        const zsh = [_]c_int{ 1, @divExact(geo.target_tokens, 4), H };
-        try mlx.check(mlx.mlx_zeros(&zeros, &zsh, zsh.len, self.dtype, s));
-        const joint_txt = try concat(&.{ th, zeros }, 1, s);
-        defer free(joint_txt);
-        var txt_rows = mlx.mlx_array_new();
-        defer free(txt_rows);
-        try mlx.check(mlx.mlx_take_axis(&txt_rows, joint_txt, geo.txt_row, 1, s));
-        const lat = try self.img_in.forward(latents, null, s);
-        defer free(lat);
-        var lat_rows = mlx.mlx_array_new();
-        defer free(lat_rows);
-        try mlx.check(mlx.mlx_take_axis(&lat_rows, lat, geo.lat_row, 1, s));
-        var x = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_where(&x, geo.img_cond, lat_rows, txt_rows, s));
-        errdefer free(x);
-        for (self.blocks) |*b| {
-            const nx = try self.editBlockForward(b, x, &mod, geo);
+        var x = if (cached) try self.img_in.forward(latents, null, s) else blk: {
+            const th = try self.textIn(hidden);
+            defer free(th);
+            var zeros = mlx.mlx_array_new();
+            defer free(zeros);
+            const zsh = [_]c_int{ 1, @divExact(geo.target_tokens, 4), H };
+            try mlx.check(mlx.mlx_zeros(&zeros, &zsh, zsh.len, self.dtype, s));
+            const joint_txt = try concat(&.{ th, zeros }, 1, s);
+            defer free(joint_txt);
+            var txt_rows = mlx.mlx_array_new();
+            defer free(txt_rows);
+            try mlx.check(mlx.mlx_take_axis(&txt_rows, joint_txt, geo.txt_row, 1, s));
+            const lat = try self.img_in.forward(latents, null, s);
+            defer free(lat);
+            var lat_rows = mlx.mlx_array_new();
+            defer free(lat_rows);
+            try mlx.check(mlx.mlx_take_axis(&lat_rows, lat, geo.lat_row, 1, s));
+            var joint = mlx.mlx_array_new();
+            errdefer free(joint);
+            try mlx.check(mlx.mlx_where(&joint, geo.img_cond, lat_rows, txt_rows, s));
+            break :blk joint;
+        };
+        defer free(x);
+        for (self.blocks, 0..) |*b, i| {
+            const slot = if (cache) |c| &c.layers[i] else null;
+            const nx = try self.editBlockForward(b, x, &mod, geo, rope, slot, cached);
             free(x);
             x = nx;
         }
-        defer free(x);
-
-        // norm_out + proj_out on the full joint sequence, per-token scale row.
+        // Prefix rows use t=0; target-only steps retain their original t row.
         const n = try layerNorm(x, self.cfg.eps, s);
         defer free(n);
         const sc2 = try self.norm_out.forward(temb_act, null, s);
         defer free(sc2);
         var sel = mlx.mlx_array_new();
         defer free(sel);
-        try mlx.check(mlx.mlx_take_axis(&sel, sc2, geo.mod_row, 0, s));
+        try mlx.check(mlx.mlx_take_axis(&sel, sc2, rope.mod_row, 0, s));
         const selr = try reshape(sel, &[_]c_int{ 1, -1, H }, s);
         defer free(selr);
         const opsc = try addScalar(selr, 1.0, s);
@@ -1258,7 +1322,10 @@ pub const Dit = struct {
         defer free(scaled);
         const out = try self.proj_out.forward(scaled, null, s);
         defer free(out);
-        return sliceAxis(out, 1, geo.target_start, @intCast(mlx.getShape(out)[1]), s);
+        const result = try sliceAxis(out, 1, if (cached) 0 else geo.target_start, mlx.getShape(out)[1], s);
+        errdefer free(result);
+        if (cache) |c| if (!cached) try c.materialize(result);
+        return result;
     }
 };
 
@@ -1944,10 +2011,14 @@ fn defaultDqGemmFloor(first: ?*const MfLinear, explicit_env: bool) ?usize {
 pub const EditOpts = struct {
     guidance_scale: f32 = 1.0,
     negative_prompt: []const u8 = "",
+    /// Selected by request memory admission; direct callers default to uncached.
+    prefix_cache: bool = false,
     /// Reference conditioning resolution — diffusers' per-call
     /// `output_resolution` knob. Lower = fewer joint tokens per ref (speed)
     /// at conditioning-fidelity cost; 1024 is the trained regime.
     ref_resolution: u32 = EDIT_REF_RESOLUTION,
+    /// Keep the VAE's native alpha channel in the output (RGBA edit, e.g. background removal).
+    transparent: bool = false,
 };
 
 /// diffusers calculate_dimensions: source aspect at output_resolution², round() each side.
@@ -2007,6 +2078,8 @@ pub const Engine = struct {
     /// The pack's text_encoder/ carries the Qwen3-VL tower (edit capability),
     /// probed at load by `towerPresentIn`; the tower weights load on demand.
     has_tower: bool = false,
+    /// `model_index.json` `sample_sigmas` (Turbo's distilled grid), owned.
+    sample_sigmas: ?[]f32 = null,
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, staged: bool) !*Engine {
         const dit_cfg = try DitConfig.parse(io, allocator, model_dir);
@@ -2027,6 +2100,8 @@ pub const Engine = struct {
         };
         errdefer allocator.free(self.model_dir);
         self.has_tower = towerPresentIn(io, allocator, self.model_dir);
+        self.sample_sigmas = try parseSampleSigmas(io, allocator, model_dir);
+        errdefer if (self.sample_sigmas) |g| allocator.free(g);
         self.vae_cfg = try VaeConfig.parse(io, allocator, model_dir);
         errdefer self.vae_cfg.deinit(allocator);
 
@@ -2045,9 +2120,10 @@ pub const Engine = struct {
         if (!staged) self.te = try TextEncoder.load(io, allocator, self.s, model_dir, COMPUTE);
         logMemory("load");
 
-        log.info("[image] Qwen-Image-2.1 ready (DiT {d}×{d} {s}, fused_rope={}, VAE {d}ch /{d}, text encoder {s})\n", .{
+        log.info("[image] Qwen-Image-2.1 ready (DiT {d}×{d} {s}, fused_rope={}, VAE {d}ch /{d}, text encoder {s}, {d} steps{s})\n", .{
             self.dit_cfg.layers, self.dit_cfg.hidden(), @tagName(self.dit.dtype),                         self.dit.fused_rope,
             self.vae_cfg.z_dim,  VAE_DOWNSAMPLE,        if (staged) "staged per request" else "resident",
+            self.stepsFor(0),    if (self.sample_sigmas != null) " from sample_sigmas" else "",
         });
         return self;
     }
@@ -2059,8 +2135,13 @@ pub const Engine = struct {
         self.dit.deinit();
         self.tok.deinit();
         self.vae_cfg.deinit(self.allocator);
+        if (self.sample_sigmas) |g| self.allocator.free(g);
         self.allocator.free(self.model_dir);
         self.allocator.destroy(self);
+    }
+
+    pub fn stepsFor(self: *const Engine, steps: u32) u32 {
+        return resolveSteps(self.sample_sigmas, steps);
     }
 
     /// Prompt → conditioning [1, n, context] (evaluated; caller frees).
@@ -2137,7 +2218,7 @@ pub const Engine = struct {
     /// Returns the image [1,3,H,W] f32 in [0,1] (owned; caller frees).
     pub fn generateImage(self: *Engine, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, opts: GenOpts, progress: ?sse.Progress) !A {
         const s = self.s;
-        const n_steps: u32 = if (steps == 0) DEFAULT_STEPS else steps;
+        const n_steps = self.stepsFor(steps);
         const lat_h: usize = height / VAE_DOWNSAMPLE;
         const lat_w: usize = width / VAE_DOWNSAMPLE;
         const n_img: c_int = @intCast(lat_h * lat_w);
@@ -2158,7 +2239,7 @@ pub const Engine = struct {
         var neg_geo: ?Geometry = if (cond.neg) |n| try Geometry.init(allocator, self.dit_cfg, @intCast(mlx.getShape(n)[1]), lat_h, lat_w) else null;
         defer if (neg_geo) |*g| g.deinit();
 
-        const sigmas = try computeSigmas(allocator, n_steps, @intCast(n_img));
+        const sigmas = try scheduleSigmas(allocator, self.sample_sigmas, n_steps, @intCast(n_img));
         defer allocator.free(sigmas);
         const start: u32 = if (opts.init_image != null) @min(opts.start_step, n_steps - 1) else 0;
 
@@ -2188,7 +2269,7 @@ pub const Engine = struct {
             var neg_cache: ?PrefixCache = if (use_prefix_cache and neg_geo != null) try PrefixCache.init(allocator, self.dit.blocks.len, &neg_geo.?, s) else null;
             defer if (neg_cache) |*c| c.deinit();
             for (start..n_steps) |i| {
-                if (progress) |p| if (p.cancelled()) return error.Cancelled;
+                if (progress) |p| if (p.boundary()) return error.Cancelled;
                 var v = try self.dit.forwardCached(img, cond.pos, sigmas[i], &geo, if (pos_cache) |*c| c else null);
                 defer free(v);
                 if (cond.neg) |neg| {
@@ -2267,7 +2348,7 @@ pub const Engine = struct {
         if (image_bytes.len == 0) return error.NoReferenceImages;
         const a = allocator;
         const s = self.s;
-        const n_steps: u32 = if (steps == 0) DEFAULT_STEPS else steps;
+        const n_steps = self.stepsFor(steps);
         const lat_h: usize = out_h / VAE_DOWNSAMPLE;
         const lat_w: usize = out_w / VAE_DOWNSAMPLE;
         const target_tokens: usize = lat_h * lat_w;
@@ -2407,37 +2488,50 @@ pub const Engine = struct {
 
         // 5. The mu/shift input counts TARGET tokens only (the reference
         //    pipeline feeds the target latents' length, never the joint's).
-        const sigmas = try computeSigmas(a, n_steps, @intCast(target_tokens));
+        const sigmas = try scheduleSigmas(a, self.sample_sigmas, n_steps, @intCast(target_tokens));
         defer a.free(sigmas);
 
         // 6. Euler denoise: the packed stream is [refs (constant clean) |
         //    target]; only the target rows step.
-        for (0..n_steps) |i| {
-            if (progress) |p| if (p.cancelled()) return error.Cancelled;
-            const model_input = try concat(&.{ ref_latents, target }, 1, s);
-            defer free(model_input);
-            var v = try self.dit.forwardEdit(model_input, cond.hidden, mask_pos, sigmas[i], &geo);
-            defer free(v);
-            if (neg_cond) |*nc| {
-                // uncond + scale·(cond − uncond)
-                const vn = try self.dit.forwardEdit(model_input, nc.hidden, mask_neg.?, sigmas[i], &neg_geo.?);
-                defer free(vn);
-                const diff = try subA(v, vn, s);
-                defer free(diff);
-                const scaled = try mulScalar(diff, opts.guidance_scale, s);
-                defer free(scaled);
-                const blended = try addA(vn, scaled, s);
-                free(v);
-                v = blended;
+        {
+            const use_cache = n_steps > 1 and opts.prefix_cache;
+            var cache: ?PrefixCache = if (use_cache) try PrefixCache.initEdit(a, self.dit.blocks.len, &geo, s) else null;
+            defer if (cache) |*c| c.deinit();
+            var neg_cache: ?PrefixCache = if (use_cache and neg_geo != null) try PrefixCache.initEdit(a, self.dit.blocks.len, &neg_geo.?, s) else null;
+            defer if (neg_cache) |*c| c.deinit();
+            log.info("[qwen-image] edit prefix cache enabled={} target={d} prefix={d} negative_prefix={d}\n", .{
+                use_cache, geo.target_tokens, geo.target_start, if (neg_geo) |ng| ng.target_start else @as(c_int, 0),
+            });
+            for (0..n_steps) |i| {
+                if (progress) |p| if (p.boundary()) return error.Cancelled;
+                const model_input = if (use_cache and cache.?.ready) try contig(target, s) else try concat(&.{ ref_latents, target }, 1, s);
+                defer free(model_input);
+                var v = try self.dit.forwardEditCached(model_input, cond.hidden, mask_pos, sigmas[i], &geo, if (cache) |*c| c else null);
+                defer free(v);
+                if (neg_cond) |*nc| {
+                    // uncond + scale·(cond − uncond)
+                    const vn = try self.dit.forwardEditCached(model_input, nc.hidden, mask_neg.?, sigmas[i], &neg_geo.?, if (neg_cache) |*c| c else null);
+                    defer free(vn);
+                    const diff = try subA(v, vn, s);
+                    defer free(diff);
+                    const scaled = try mulScalar(diff, opts.guidance_scale, s);
+                    defer free(scaled);
+                    const blended = try addA(vn, scaled, s);
+                    free(v);
+                    v = blended;
+                }
+                const dv = try mulScalar(v, sigmas[i + 1] - sigmas[i], s);
+                defer free(dv);
+                const next = try addA(target, dv, s);
+                free(target);
+                target = next;
+                try mlx.check(mlx.mlx_array_eval(target));
+                if (i == 0 and use_cache) log.info("[qwen-image] edit prefix cached: {d} layers, {d} branch(es); remaining steps target-only\n", .{
+                    self.dit.blocks.len, @as(u32, if (neg_cache != null) 2 else 1),
+                });
+                if (progress) |p| p.emit("Generating", @intCast(i + 1), n_steps);
             }
-            const dv = try mulScalar(v, sigmas[i + 1] - sigmas[i], s);
-            defer free(dv);
-            const next = try addA(target, dv, s);
-            free(target);
-            target = next;
-            try mlx.check(mlx.mlx_array_eval(target));
-            if (progress) |p| p.emit("Generating", @intCast(i + 1), n_steps);
-        }
+        } // Release every branch's K/V before the VAE decode working set.
 
         // 7. Decode the target rows only — same unpack + banded path as t2i.
         logMemory("denoise");
@@ -2446,7 +2540,7 @@ pub const Engine = struct {
         defer free(grid);
         const latent = try transpose(grid, &[_]c_int{ 0, 3, 1, 2 }, s);
         defer free(latent);
-        const decoded = try self.vae.decode(latent);
+        const decoded = if (opts.transparent) try self.vae.decodeRgba(latent) else try self.vae.decode(latent);
         defer free(decoded);
         try mlx.check(mlx.mlx_array_eval(decoded));
         logMemory("vae decode");
@@ -2537,6 +2631,48 @@ test "QwenImage sigmas match the reference schedule" {
     const one = try computeSigmas(testing.allocator, 1, 640);
     defer testing.allocator.free(one);
     try testing.expectEqualSlices(f32, &.{ 1.0, 0.0 }, one);
+}
+
+const TURBO_SIGMAS = [_]f32{ 1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568 };
+
+test "QwenImage a checkpoint's sample_sigmas grid sets the steps and the schedule" {
+    try testing.expectEqual(@as(u32, 8), resolveSteps(&TURBO_SIGMAS, 0));
+    try testing.expectEqual(@as(u32, 8), resolveSteps(&TURBO_SIGMAS, 40));
+    try testing.expectEqual(DEFAULT_STEPS, resolveSteps(null, 0));
+    try testing.expectEqual(@as(u32, 12), resolveSteps(null, 12));
+
+    const got = try scheduleSigmas(testing.allocator, &TURBO_SIGMAS, 8, 4096);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(f32, &TURBO_SIGMAS ++ [_]f32{0.0}, got);
+    const dynamic = try scheduleSigmas(testing.allocator, null, 8, 640);
+    defer testing.allocator.free(dynamic);
+    const want = try computeSigmas(testing.allocator, 8, 640);
+    defer testing.allocator.free(want);
+    try testing.expectEqualSlices(f32, want, dynamic);
+}
+
+test "QwenImage parseSampleSigmas reads model_index.json" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+
+    // No model_index.json, or one without the key: the dynamic schedule.
+    try testing.expectEqual(@as(?[]f32, null), try parseSampleSigmas(io, a, root));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model_index.json", .data = "{\"_class_name\":\"QwenImage21Pipeline\"}" });
+    try testing.expectEqual(@as(?[]f32, null), try parseSampleSigmas(io, a, root));
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "model_index.json", .data = "{\"_class_name\":\"QwenImage21Pipeline\",\"sample_sigmas\":[1.0,0.978453,0.95418,0.926626,0.89508,0.845148,0.704534,0.414568]}" });
+    const grid = (try parseSampleSigmas(io, a, root)).?;
+    defer a.free(grid);
+    try testing.expectEqualSlices(f32, &TURBO_SIGMAS, grid);
+
+    for ([_][]const u8{ "{\"sample_sigmas\":[]}", "{\"sample_sigmas\":[1.0,\"x\"]}", "{\"sample_sigmas\":0.5}" }) |bad| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "model_index.json", .data = bad });
+        try testing.expectError(error.QwenImageBadConfig, parseSampleSigmas(io, a, root));
+    }
 }
 
 test "QwenImage convs strip only past the unfold budget" {
@@ -2907,6 +3043,76 @@ test "QwenImage prefix cache matches full forwards across timesteps and conditio
                 for (cache.layers) |kv| {
                     try testing.expectEqual(text_len, mlx.getShape(kv.?.k)[2]);
                     try testing.expectEqual(text_len, mlx.getShape(kv.?.v)[2]);
+                }
+            }
+        }
+    }
+}
+
+test "QwenImage edit prefix cache matches block-causal forwards across steps and reference layouts" {
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    for ([_]mlx.mlx_dtype{ .float32, .bfloat16, .float16 }) |dtype| {
+        var dit = try TinyPrefixModel.init(dtype, s);
+        defer dit.deinit();
+        for ([_]usize{ 1, 2, 10 }) |refs| {
+            // Unequal prompt lengths exercise independently owned CFG caches.
+            for ([_]usize{ 1, 5 }) |text_len| {
+                var shapes: std.ArrayList([3]u32) = .empty;
+                defer shapes.deinit(a);
+                var mask: std.ArrayList(i32) = .empty;
+                defer mask.deinit(a);
+                try mask.appendNTimes(a, 0, text_len);
+                var ref_tokens: c_int = 0;
+                for (0..refs) |r| {
+                    const w: u32 = if (r % 2 == 0) 2 else 4;
+                    try shapes.append(a, .{ 1, 2, w });
+                    try mask.appendNTimes(a, 1, w / 2);
+                    ref_tokens += @intCast(2 * w);
+                    // Cover both adjacent image blocks and intervening text.
+                    if (text_len == 5) try mask.append(a, 0);
+                }
+                try mask.append(a, 0);
+                const n = mask.items.len;
+                try shapes.append(a, .{ 1, 2, 4 });
+                try mask.appendNTimes(a, 1, 2);
+                var geo = try EditGeometry.init(a, dit.cfg, n, mask.items, shapes.items);
+                defer geo.deinit();
+                var cache = try PrefixCache.initEdit(a, dit.blocks.len, &geo, s);
+                defer cache.deinit();
+                const hidden = try TinyPrefixModel.tensor(&.{ 1, @intCast(n), 24 }, @floatFromInt(text_len), 1);
+                defer free(hidden);
+                const ref = try TinyPrefixModel.tensor(&.{ 1, ref_tokens, 8 }, @floatFromInt(refs + text_len), 1);
+                defer free(ref);
+                for ([_]f32{ 0.9, 0.5, 0.02 }, 0..) |t, step| {
+                    const target = try TinyPrefixModel.tensor(&.{ 1, 8, 8 }, t + 0.2, 1);
+                    defer free(target);
+                    const full_input = try concat(&.{ ref, target }, 1, s);
+                    defer free(full_input);
+                    const want = try dit.forwardEdit(full_input, hidden, mask.items, t, &geo);
+                    defer free(want);
+                    const want32 = try astype(want, .float32, s);
+                    defer free(want32);
+                    const got = try dit.forwardEditCached(if (cache.ready) target else full_input, hidden, mask.items, t, &geo, &cache);
+                    defer free(got);
+                    const got32 = try astype(got, .float32, s);
+                    defer free(got32);
+                    try mlx.check(mlx.mlx_array_eval(got32));
+                    for (mlx.mlx_array_data_float32(got32).?[0 .. 8 * 8]) |v|
+                        try testing.expect(std.math.isFinite(v));
+                    try testing.expect(cache.ready);
+                    try testing.expectEqual(dtype, mlx.mlx_array_dtype(got));
+                    try testing.expectEqualSlices(c_int, &.{ 1, 8, 8 }, mlx.getShape(got));
+                    const p = try parity(got, want32, s);
+                    const tolerance: f32 = if (dtype == .float32) 1e-5 else 0.002;
+                    if (!(p.cos > 0.99999) or !(@abs(p.rms_ratio - 1) <= tolerance))
+                        std.debug.print("[qwen-image] edit cache {s} refs={d} text={d} step={d}: cos={d:.7} rms_ratio={d:.7}\n", .{ @tagName(dtype), refs, text_len, step, p.cos, p.rms_ratio });
+                    try testing.expect(p.cos > 0.99999);
+                    try testing.expectApproxEqAbs(@as(f32, 1), p.rms_ratio, tolerance);
+                    for (cache.layers) |kv| {
+                        try testing.expectEqual(geo.target_start, mlx.getShape(kv.?.k)[2]);
+                        try testing.expectEqual(geo.target_start, mlx.getShape(kv.?.v)[2]);
+                    }
                 }
             }
         }
@@ -3446,6 +3652,24 @@ test "QwenImage edit e2e CFG (env-gated)" {
     const d = try maxAbsDiff(plain, guided, engine.s);
     std.debug.print("[qwen-image] edit e2e CFG 2.5: max |cfg - plain| {d:.5}\n", .{d});
     try testing.expect(d > 0.0);
+}
+
+test "QwenImage edit e2e transparent keeps alpha (env-gated)" {
+    const dir = std.mem.span(std.c.getenv("QWEN_IMAGE_TEST_MODEL") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var prev_cap: usize = 0;
+    _ = mlx.mlx_set_cache_limit(&prev_cap, 1 << 30);
+    defer _ = mlx.mlx_set_cache_limit(&prev_cap, prev_cap);
+    const engine = try Engine.load(io, a, dir, true);
+    defer engine.deinit();
+
+    const refs = try editE2eRefs(a);
+    defer for (refs) |p| a.free(p);
+    const img = try engine.editImage(a, "remove the background", &refs, 256, 256, 42, 2, .{ .transparent = true }, null);
+    defer free(img);
+    try testing.expectEqualSlices(c_int, &.{ 1, 4, 256, 256 }, mlx.getShape(img));
+    try expectFiniteImage(img, engine.s);
 }
 
 test "QwenImage edit e2e towerless refuses (env-gated)" {

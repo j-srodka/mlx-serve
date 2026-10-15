@@ -1,19 +1,12 @@
 #!/bin/bash
-# Guard: the built-in console at `GET /` must render on a server with NO model.
+# Guard: the built-in console at `GET /` is served on a server with NO model, byte for byte.
 #
-# `GET /` was dispatched AFTER model resolution and rendered one *LoadedModel,
-# so a headless boot — `mlx-serve serve` / `--serve --model-dir`, now the
-# default way the server starts and the only way the app launches it — answered
-# 503 {"error":"No default model configured"} at the root. The page is the
-# thing a person opens first, and it is also the model PICKER, so it has to
-# render before anything is loaded, by construction.
-#
-# Also pins the two properties a page rewrite can silently drop:
-#   * every endpoint the server serves is documented (the reference had been
-#     missing the whole Ollama /api/* surface);
-#   * the live-metrics mount is present with --metrics and absent without it
-#     (deliberately duplicates one test_metrics.sh assertion — that script
-#     needs a real checkpoint, this one doesn't).
+# `GET /` once rendered one *LoadedModel, so a headless boot answered 503 at the
+# root, the first page a person opens. The page is the model PICKER, so it has to
+# render before anything is loaded. It is also built from app-web/ and embedded
+# as is: the bytes on the wire must be src/html/index.html, nothing templated.
+# What the page does (panes, Markdown, i18n, Monitoring) is app-web's own test
+# suite (`cd app-web && npm test`); the metrics probe the page keys off is here.
 #
 # FULLY HERMETIC: an empty --model-dir discovers zero models, so no weights are
 # needed and the whole thing runs in seconds (same trick as
@@ -46,24 +39,25 @@ if [ ! -x "$BINARY" ]; then
     exit 1
 fi
 
-EMPTY_DIR="$(mktemp -d)"
+WORK_DIR="$(mktemp -d)"
+EMPTY_DIR="$WORK_DIR/models"
+mkdir -p "$EMPTY_DIR" "$WORK_DIR/home"
 LOG="$(mktemp)"
 BODY="$(mktemp)"
 SERVER_PID=""
 cleanup() {
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
-    pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
-    rm -rf "$EMPTY_DIR" "$LOG" "$BODY"
+    [ -n "$SERVER_PID" ] && wait "$SERVER_PID" 2>/dev/null
+    rm -rf "$WORK_DIR" "$LOG" "$BODY"
 }
 trap cleanup EXIT
 
 boot() {
-    pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
-    sleep 0.5
     : > "$LOG"
-    "$BINARY" --serve --model-dir "$EMPTY_DIR" --port "$PORT" --log-file off "$@" > "$LOG" 2>&1 &
+    HOME="$WORK_DIR/home" "$BINARY" --serve --host 127.0.0.1 --model-dir "$EMPTY_DIR" --port "$PORT" --log-file off "$@" > "$LOG" 2>&1 &
     SERVER_PID=$!
     for _ in $(seq 1 60); do
+        kill -0 "$SERVER_PID" 2>/dev/null || break
         curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && return 0
         sleep 0.5
         kill -0 "$SERVER_PID" 2>/dev/null || break
@@ -78,10 +72,13 @@ stop() {
     SERVER_PID=""
 }
 
+if curl -s --max-time 1 "http://127.0.0.1:$PORT/health" >/dev/null; then
+    echo "FAIL: test port $PORT is occupied"; exit 1
+fi
+
 echo "Built-in console at GET / (port $PORT, no model)"
 
-# ── 1. It renders at all without a model ────────────────────────────────────
-echo "[1/3] headless GET /"
+echo "[1/2] headless GET /"
 if boot; then
     STATUS=$(curl -s -o "$BODY" -w '%{http_code}' "http://127.0.0.1:$PORT/")
     CT=$(curl -s -D - -o /dev/null "http://127.0.0.1:$PORT/" | grep -i '^content-type:' | tr -d '\r')
@@ -89,84 +86,28 @@ if boot; then
         "$([ "$STATUS" = "200" ] && echo 1 || echo 0)"
     check "Content-Type is text/html" \
         "$(echo "$CT" | grep -qi 'text/html' && echo 1 || echo 0)"
-    check "no 'No default model configured' in the body" \
-        "$(grep -q 'No default model configured' "$BODY" && echo 0 || echo 1)"
+    check "the bytes served are src/html/index.html, untouched" \
+        "$(cmp -s "$BODY" src/html/index.html && echo 1 || echo 0)"
+    check "it is the console page (one #app mount)" \
+        "$(grep -q '<div id="app">' "$BODY" && echo 1 || echo 0)"
 
-    # ── 2. The console + the full endpoint reference are in the page ────────
-    echo "[2/3] console markup + endpoint coverage"
-    for tab in chat monitor api; do
-        grep -q "data-tab=\"$tab\"" "$BODY"
-        check "sidebar destination '$tab' present" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-    done
-    # Chat opens in its empty state before any JS runs.
-    grep -q '<section class="panel active" id=tab-chat>' "$BODY"
-    check "chat is the default panel" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-    grep -Eq 'id="?chat-empty"?' "$BODY"
-    check "chat has a simple empty state" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-    grep -Eq 'id="?recent-list"?' "$BODY"
-    check "sidebar has a Recents list" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-    # Media work is natural language in the chat, not its own destination.
-    grep -q 'data-tab="images"' "$BODY"
-    check "no separate images tab" "$([ $? -ne 0 ] && echo 1 || echo 0)"
-    grep -q 'data-tab="audio"' "$BODY"
-    check "no separate audio tab" "$([ $? -ne 0 ] && echo 1 || echo 0)"
-    # Quote-tolerant: the page mixes quoted and bare attribute values.
-    grep -Eq 'id="?chat-send"?' "$BODY"
-    check "chat composer present" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-    grep -Eq 'id="?chat-model"?' "$BODY"
-    check "model picker present" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-    grep -Eq 'id="?chat-files"?' "$BODY"
-    check "image attach control present" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-    grep -Eq 'id="?mon-models"?' "$BODY"
-    check "monitor model table present" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-    # Ours now — a user-facing system prompt box would fight it. Sampling knobs
-    # went with it: this is a console, not a tuning rig.
-    grep -Eq 'id="?chat-system"?' "$BODY"
-    check "no user system-prompt box" "$([ $? -ne 0 ] && echo 1 || echo 0)"
-    grep -Eq 'id="?chat-temp"?|id="?chat-maxtok"?' "$BODY"
-    check "no temperature / max-tokens inputs" "$([ $? -ne 0 ] && echo 1 || echo 0)"
-    grep -q '/v1/models' "$BODY"
-    check "console fetches the model list" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-
-    # The Ollama surface is the one the hand-written reference had omitted
-    # wholesale. Zig's `index page documents every endpoint` test pins this
-    # against ROUTE_PATHS; this is the served-bytes end of the same claim.
-    MISSING=""
-    for ep in /api/chat /api/generate /api/tags /api/show /api/ps /api/pull \
-              /api/version /api/embed /api/embeddings; do
-        grep -q "$ep" "$BODY" || MISSING="$MISSING $ep"
-    done
-    check "every /api/* endpoint documented (missing:${MISSING:-none})" \
-        "$([ -z "$MISSING" ] && echo 1 || echo 0)"
-
-    MISSING=""
-    for ep in /v1/chat/completions /v1/completions /v1/responses /v1/messages \
-              /v1/embeddings /v1/images/generations /v1/images/edits \
-              /v1/audio/speech /v1/audio/music-generations /v1/video/generations \
-              /v1/3d/generations /v1/load-model /v1/unload-model /tokenize \
-              /detokenize /props /health /metrics.json; do
-        grep -q "$ep" "$BODY" || MISSING="$MISSING $ep"
-    done
-    check "every non-Ollama endpoint documented (missing:${MISSING:-none})" \
-        "$([ -z "$MISSING" ] && echo 1 || echo 0)"
-
-    check "no metrics panel mount without --metrics" \
-        "$(grep -q 'id=mlx-metrics' "$BODY" && echo 0 || echo 1)"
+    # The console reads "metrics off" from a 503 here, so the status code is its contract.
+    METRICS_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/metrics.json")
+    check "GET /metrics.json without --metrics → 503 (got $METRICS_STATUS)" \
+        "$([ "$METRICS_STATUS" = "503" ] && echo 1 || echo 0)"
     stop
 else
     check "headless boot" 0
 fi
 
-# ── 3. --metrics puts the live panel in the header ──────────────────────────
-echo "[3/3] --metrics panel mount"
+echo "[2/2] --metrics"
 if boot --metrics; then
     STATUS=$(curl -s -o "$BODY" -w '%{http_code}' "http://127.0.0.1:$PORT/")
-    check "page still 200 with --metrics (got $STATUS)" \
-        "$([ "$STATUS" = "200" ] && echo 1 || echo 0)"
-    check "metrics mount present with --metrics" \
-        "$(grep -q 'id=mlx-metrics' "$BODY" && echo 1 || echo 0)"
-    check "panel markup injected (m-status tile)" \
-        "$(grep -q 'm-status' "$BODY" && echo 1 || echo 0)"
+    METRICS_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/metrics.json")
+    check "page is the same file with --metrics (got $STATUS)" \
+        "$([ "$STATUS" = "200" ] && cmp -s "$BODY" src/html/index.html && echo 1 || echo 0)"
+    check "GET /metrics.json with --metrics → 200 (got $METRICS_STATUS)" \
+        "$([ "$METRICS_STATUS" = "200" ] && echo 1 || echo 0)"
     stop
 else
     check "boot with --metrics" 0

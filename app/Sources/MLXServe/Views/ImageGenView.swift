@@ -10,11 +10,10 @@ struct ImageGenView: View {
     @EnvironmentObject var server: ServerManager
     @Environment(\.openWindow) private var openWindow
     @EnvironmentObject var downloads: DownloadManager
-    /// For "Send to Chat" — the hand-off opens a new conversation and switches
-    /// the window to it (`AppState.sendGeneratedMediaToNewChat`).
     @EnvironmentObject var appState: AppState
 
     @State private var prompt: String = ""
+    @State private var showEnhance = false
     /// Selection and focus are read by the image tiles: a click on one drops
     /// its name where the caret is, or on the end when the editor is not
     /// the one being typed into.
@@ -75,8 +74,6 @@ struct ImageGenView: View {
     /// True while a drag carrying a file is hovering the source-image section
     /// — drives that section's dashed-border highlight and the well's fill.
     @State private var isDropTargeted: Bool = false
-    /// Whether the Quality segments fit the column; a menu below that.
-    @State private var qualityFitsSegments: Bool = true
     /// A saved picture was gone on open and the rest renumbered, so the
     /// prompt's "image n" may now name another picture. Cleared by the first
     /// edit to either.
@@ -159,6 +156,10 @@ struct ImageGenView: View {
         } message: {
             Text(L10n.text(ramWarningMessage)).font(.app(.body))
         }
+        .sheet(isPresented: $showEnhance) {
+            PromptRewriteSheet(title: "Rewrite image prompt", request: { _ in PromptRewriter.image(text: prompt, editing: isEditing, groups: model.promptExamples(editing: isEditing)) }, onApply: { prompt = $0 })
+                .environmentObject(appState)
+        }
     }
 
     // MARK: - Sections
@@ -168,6 +169,7 @@ struct ImageGenView: View {
             HStack(spacing: 8) {
                 Text("Prompt").font(.app(.headline).weight(.semibold))
                 Spacer()
+                PromptEnhanceButton(disabled: prompt.isBlank) { showEnhance = true }
                 templatesMenu
             }
             TextEditor(text: $prompt, selection: $promptSelection)
@@ -272,13 +274,9 @@ struct ImageGenView: View {
                     // grid of one.
                     MediaDropWellFilled(isTargeted: isDropTargeted) {
                         HStack(spacing: 8) {
-                            if let img = NSImage(contentsOf: url) {
-                                Image(nsImage: img)
-                                    .resizable()
-                                    .aspectRatio(contentMode: .fill)
-                                    .frame(width: 64, height: 48)
-                                    .clipShape(RoundedRectangle(cornerRadius: 4))
-                            }
+                            MediaImageView(url: url, maxPixel: 160)
+                                .frame(width: 64, height: 48)
+                                .clipShape(RoundedRectangle(cornerRadius: 4))
                             Text(url.lastPathComponent)
                                 .font(.app(.caption)).lineLimit(1).truncationMode(.middle)
                             Spacer()
@@ -447,24 +445,27 @@ struct ImageGenView: View {
         if model.stepsAreFixed {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Quality").font(.app(.headline).weight(.semibold))
-                Text("Fixed at \(model.fixedSteps) steps — this model is distilled for a \(model.fixedSteps)-step schedule, so more steps cost time without adding detail.")
+                Group {
+                    if model.stepsSetByCheckpoint {
+                        Text("Fixed at \(model.fixedSteps) steps — this model runs its own \(model.fixedSteps)-step schedule.")
+                    } else {
+                        Text("Fixed at \(model.fixedSteps) steps — this model is distilled for a \(model.fixedSteps)-step schedule, so more steps cost time without adding detail.")
+                    }
+                }
                     .font(.app(.caption))
                     .foregroundStyle(.secondary)
             }
         } else {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Quality").font(.app(.rowTitle).weight(.semibold))
-                // Measured, not `ViewThatFits`: the menu variant is `fixedSize`
-                // and would never re-fit. Five segments degrade to a menu
-                // rather than shortening the tier names the Create panes share.
-                qualityPicker(segmented: qualityFitsSegments)
+                // Segments degrade to a menu rather than shortening the tier
+                // names the Create panes share.
+                SegmentedOrMenu(qualityPicker)
                 Text(L10n.text(qualityHint))
                     .font(.app(.caption))
                     .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .onGeometryChange(for: Bool.self) { $0.size.width >= Self.qualitySegmentsMinWidth }
-                action: { qualityFitsSegments = $0 }
         }
     }
 
@@ -481,10 +482,6 @@ struct ImageGenView: View {
         ImageQualityMatch.match(steps: steps, model: model, preferring: quality)
     }
 
-    /// The four tier names plus Custom at the segmented control's own
-    /// padding; the Video pane's value.
-    private static let qualitySegmentsMinWidth: CGFloat = 380
-
     /// Reads the DERIVED tier and writes by applying one.
     private var qualitySelection: Binding<QualitySelection> {
         Binding(
@@ -496,9 +493,8 @@ struct ImageGenView: View {
             })
     }
 
-    @ViewBuilder
-    private func qualityPicker(segmented: Bool) -> some View {
-        let picker = Picker("", selection: qualitySelection) {
+    private var qualityPicker: some View {
+        Picker("", selection: qualitySelection) {
             ForEach(QualityPreset.allCases) { q in
                 Text(L10n.text(q.label)).font(.app(.body)).tag(QualitySelection.preset(q))
             }
@@ -507,11 +503,6 @@ struct ImageGenView: View {
             }
         }
         .labelsHidden()
-        if segmented {
-            picker.pickerStyle(.segmented)
-        } else {
-            picker.pickerStyle(.menu).fixedSize()
-        }
     }
 
     /// The steps the request will carry, so Custom reads its own number.
@@ -704,9 +695,12 @@ struct ImageGenView: View {
             FoldingSectionHeader(title: "Advanced options", isExpanded: $showAdvanced)
             if showAdvanced {
                 // Steps stay overridable even where the schedule is fixed —
-                // it's the Advanced panel, and the hint says the cost.
-                intSliderRow("Steps", value: $steps, range: 1...50)
-                if model.stepsAreFixed {
+                // it's the Advanced panel, and the hint says the cost — except
+                // where the pack's own grid decides and the server ignores them.
+                if !model.stepsSetByCheckpoint {
+                    intSliderRow("Steps", value: $steps, range: 1...50)
+                }
+                if model.stepsAreFixed && !model.stepsSetByCheckpoint {
                     Text("This model is distilled for \(model.fixedSteps) steps; other values cost time without adding detail.")
                         .font(.app(.caption2))
                         .foregroundStyle(.secondary)
@@ -964,7 +958,8 @@ struct ImageGenView: View {
 
     private func completedPreview(path: String) -> some View {
         VStack(spacing: 8) {
-            CompletedImage(path: path)
+            MediaImageView(url: URL(fileURLWithPath: path), maxPixel: 3072,
+                           contentMode: .fit)
             // The name and the ways to reach the file belong together, centred
             // under the picture they describe.
             HStack(spacing: 8) {
@@ -978,39 +973,9 @@ struct ImageGenView: View {
                 } label: { Image(systemName: "folder") }
                 .buttonStyle(.borderless)
                 .help("Reveal in Finder")
-                // The one bridge from the workshop to a conversation. It opens
-                // a NEW chat and switches to it — see
-                // `AppState.sendGeneratedMediaToNewChat`.
-                Button {
-                    appState.sendGeneratedMediaToNewChat(
-                        path: path, prompt: prompt, kind: .image)
-                } label: { Image(systemName: "bubble.left.and.text.bubble.right") }
-                .buttonStyle(.borderless)
-                .help("Send to Chat — opens a new conversation with this attached")
             }
         }
         .padding(8)
-    }
-
-    /// Decoded once per path, not in `body`: a fresh `NSImage` on every
-    /// layout pass is a content change, and inside an animated transaction
-    /// (the Advanced fold) SwiftUI cross-fades it.
-    private struct CompletedImage: View {
-        let path: String
-        @State private var image: NSImage?
-
-        var body: some View {
-            // A real container: modifiers on an empty `Group` land on
-            // `EmptyView`, which never appears, so nothing would ever load.
-            ZStack {
-                if let image {
-                    Image(nsImage: image)
-                        .resizable()
-                        .scaledToFit()
-                }
-            }
-            .task(id: path) { image = NSImage(contentsOfFile: path) }
-        }
     }
 
     private var outputFolderLink: some View {

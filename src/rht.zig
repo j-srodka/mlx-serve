@@ -100,7 +100,7 @@ fn transformKernel(x: mlx.mlx_array, signs: mlx.mlx_array, block: c_int, inverse
 /// Input side: `H(signs * x)`; inverse: `signs * H(x)`. Computed in f32 like
 /// the reference, returned in x's dtype. Caller owns the result.
 pub fn transform(x: mlx.mlx_array, signs: mlx.mlx_array, block: c_int, inverse: bool, s: mlx.mlx_stream) !mlx.mlx_array {
-    if (kernelBlock(block)) {
+    if (kernelBlock(block) and mlx.streamIsGpu(s)) {
         const sh = mlx.getShape(x);
         var total: c_int = 1;
         for (sh) |d| total *= d;
@@ -232,7 +232,7 @@ pub const NORM_ROTATE_MAX_ROWS: c_int = 16;
 /// Null when the shape is outside the kernel (caller keeps the composed ops).
 /// `b` null = no residual add; `want_normed` also returns the unrotated norm.
 pub fn normRotate(a: mlx.mlx_array, b: ?mlx.mlx_array, w: mlx.mlx_array, eps: mlx.mlx_array, signs: mlx.mlx_array, block: c_int, want_normed: bool, s: mlx.mlx_stream) !?NormRotate {
-    if (block != 1024 or eps.ctx == null) return null;
+    if (block != 1024 or eps.ctx == null or !mlx.streamIsGpu(s)) return null;
     const sh = mlx.getShape(a);
     if (sh.len == 0 or sh.len > 4) return null;
     const hidden = sh[sh.len - 1];
@@ -370,6 +370,18 @@ pub const Registry = struct {
         if (self.by_width.get(width)) |have| {
             if (have.ctx != shared.ctx) try self.width_conflict.put(self.allocator, width, {});
         } else try self.by_width.put(self.allocator, width, shared);
+    }
+
+    /// Binds a row-joined weight to the one sign vector all `parts` read.
+    /// False (nothing bound) when they read different vectors or none.
+    pub fn alias(self: *Registry, joined: mlx.mlx_array, parts: []const mlx.mlx_array) !bool {
+        const first = self.get(parts[0]) orelse return false;
+        for (parts[1..]) |p| {
+            const sg = self.get(p) orelse return false;
+            if (sg.ctx != first.ctx) return false;
+        }
+        try self.map.put(self.allocator, @intFromPtr(joined.ctx), first);
+        return true;
     }
 
     /// The one sign vector every rotated weight of `width` reads, or null.
@@ -514,6 +526,14 @@ test "rht: two distinct sign vectors at one width dedup the pool and disable sig
     try std.testing.expectEqual(@as(usize, 2), reg.pool.count());
     try std.testing.expect(reg.signsFor(@intCast(n)) == null);
     try std.testing.expect(reg.get(ws[2]) != null);
+
+    // A joined weight reads its parts' vector only when they share one.
+    const joined = mlx.mlx_array_new_data(&sg1, &w_shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(joined);
+    try std.testing.expect(!try reg.alias(joined, &.{ ws[0], ws[2] }));
+    try std.testing.expect(reg.get(joined) == null);
+    try std.testing.expect(try reg.alias(joined, &.{ ws[0], ws[1] }));
+    try std.testing.expectEqual(reg.get(ws[0]).?.ctx, reg.get(joined).?.ctx);
 }
 
 test "rht: normRotate matches add -> rms_norm -> transform" {

@@ -585,9 +585,8 @@ pub const ImageUrlDecoder = *const fn (
 
 /// Translate a Responses `input` value (string or array of input items) into
 /// `chat_mod.Message`s. Optionally prepends `instructions` as the single leading
-/// `system` msg. If `previous_messages` already contains a stored system message
-/// and fresh instructions are provided, the fresh instructions replace it so
-/// templates like Qwen's never see a non-leading/duplicate system message.
+/// `system` msg. Fresh instructions replace stored leading instructions;
+/// historical late system notes remain in conversation order.
 /// `previous_messages` are deep-referenced (not copied) into the result if
 /// non-null — caller must keep them alive.
 /// `namespace_aliases` (from `buildToolsJson`) rewrites echoed `function_call`
@@ -620,10 +619,11 @@ pub fn parseInput(
     }
 
     if (previous_messages) |prev| {
+        var leading = true;
         for (prev) |m| {
-            if (fresh_instructions != null and std.mem.eql(u8, m.role, "system")) {
-                continue;
-            }
+            const is_system = std.mem.eql(u8, m.role, "system");
+            if (!is_system) leading = false;
+            if (fresh_instructions != null and leading and is_system) continue;
             try pi.messages.append(allocator, m);
         }
     }
@@ -663,10 +663,9 @@ pub fn parseInput(
         else => {},
     }
 
-    // Templates we serve require the system turn first; fold any system past
-    // index 0 into the leading one — the same unconditional fold /v1/messages
-    // applies — so the native template renders a multi-system Responses input.
-    if (try chat_mod.foldSystemMessages(allocator, &pi.messages)) |joined| {
+    // Adjacent leading instructions share one turn; late notes stay in order
+    // until the renderer checks the template's role support.
+    if (try chat_mod.foldSystemMessages(allocator, &pi.messages, true)) |joined| {
         errdefer allocator.free(joined);
         try pi.owned_strings.append(allocator, joined);
     }
@@ -917,6 +916,8 @@ pub const ToolChoice = struct {
     include_tools: bool,
     /// Owned by the caller (free with allocator) when non-null.
     instruction: ?[]const u8,
+    /// A call the reply must make; a name borrows from the request JSON.
+    forced: ?chat_mod.ForcedTool = null,
 };
 
 pub fn parseToolChoice(allocator: std.mem.Allocator, choice_val: ?std.json.Value) !ToolChoice {
@@ -925,8 +926,7 @@ pub fn parseToolChoice(allocator: std.mem.Allocator, choice_val: ?std.json.Value
         .string => |s| {
             if (std.mem.eql(u8, s, "none")) return .{ .include_tools = false, .instruction = null };
             if (std.mem.eql(u8, s, "required")) {
-                const ins = try allocator.dupe(u8, "\nYou MUST call one of the available functions. Do not respond with text.");
-                return .{ .include_tools = true, .instruction = ins };
+                return .{ .include_tools = true, .instruction = try chat_mod.toolChoiceInstruction(allocator, .any), .forced = .any };
             }
             return .{ .include_tools = true, .instruction = null }; // "auto" default
         },
@@ -935,8 +935,8 @@ pub fn parseToolChoice(allocator: std.mem.Allocator, choice_val: ?std.json.Value
             if (!std.mem.eql(u8, t, "function")) return .{ .include_tools = true, .instruction = null };
             const name = if (obj.get("name")) |nv| (if (nv == .string) nv.string else "") else "";
             if (name.len == 0) return .{ .include_tools = true, .instruction = null };
-            const ins = try std.fmt.allocPrint(allocator, "\nYou MUST call the function \"{s}\". Do not respond with text.", .{name});
-            return .{ .include_tools = true, .instruction = ins };
+            const forced: chat_mod.ForcedTool = .{ .name = name };
+            return .{ .include_tools = true, .instruction = try chat_mod.toolChoiceInstruction(allocator, forced), .forced = forced };
         },
         else => return .{ .include_tools = true, .instruction = null },
     }
@@ -961,8 +961,13 @@ pub const StoredResponse = struct {
     arena: std.heap.ArenaAllocator,
 
     list_node: std.DoublyLinkedList.Node = .{},
+    /// One per holder: the store (or a WebSocket's cache) holds the first, and every
+    /// `ResponseStore.get` adds one, so an eviction or DELETE never frees a history in use.
+    refs: std.atomic.Value(u32) = .init(1),
 
-    pub fn deinit(self: *StoredResponse) void {
+    /// Drops one holder's reference; the last one frees the entry.
+    pub fn release(self: *StoredResponse) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         var arena = self.arena;
         const gpa = arena.child_allocator;
         arena.deinit();
@@ -989,7 +994,7 @@ pub const ResponseStore = struct {
         while (node) |n| {
             const next = n.next;
             const sr: *StoredResponse = @fieldParentPtr("list_node", n);
-            sr.deinit();
+            sr.release();
             node = next;
         }
         self.map.deinit(self.gpa);
@@ -1006,7 +1011,7 @@ pub const ResponseStore = struct {
         if (self.map.fetchRemove(sr.id)) |kv| {
             const old = kv.value;
             self.lru.remove(&old.list_node);
-            old.deinit();
+            old.release();
         }
 
         if (self.map.count() >= self.cap) {
@@ -1015,7 +1020,7 @@ pub const ResponseStore = struct {
                 const tail: *StoredResponse = @fieldParentPtr("list_node", tail_node);
                 _ = self.map.remove(tail.id);
                 self.lru.remove(tail_node);
-                tail.deinit();
+                tail.release();
             }
         }
 
@@ -1023,14 +1028,24 @@ pub const ResponseStore = struct {
         self.lru.prepend(&sr.list_node);
     }
 
-    /// Returns a borrowed reference (do not free). Touches LRU.
+    /// A new reference the caller `release`s. Touches LRU.
     pub fn get(self: *ResponseStore, id: []const u8) ?*StoredResponse {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         const sr = self.map.get(id) orelse return null;
+        _ = sr.refs.fetchAdd(1, .monotonic);
         self.lru.remove(&sr.list_node);
         self.lru.prepend(&sr.list_node);
         return sr;
+    }
+
+    /// Removes `id` and hands it to the caller, who owns it from here.
+    pub fn take(self: *ResponseStore, id: []const u8) ?*StoredResponse {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        const kv = self.map.fetchRemove(id) orelse return null;
+        self.lru.remove(&kv.value.list_node);
+        return kv.value;
     }
 
     /// Returns true if removed.
@@ -1039,7 +1054,7 @@ pub const ResponseStore = struct {
         defer self.mu.unlock(self.io);
         const kv = self.map.fetchRemove(id) orelse return false;
         self.lru.remove(&kv.value.list_node);
-        kv.value.deinit();
+        kv.value.release();
         return true;
     }
 };
@@ -1514,6 +1529,20 @@ test "parseInput with instructions prepends system" {
     try testing.expectEqualStrings("user", pi.messages.items[1].role);
 }
 
+test "mid-system: fresh Responses instructions retain historical late notes" {
+    const prev = [_]chat_mod.Message{
+        .{ .role = "system", .content = "old instructions" },
+        .{ .role = "user", .content = "first" },
+        .{ .role = "system", .content = "historical note" },
+        .{ .role = "assistant", .content = "answer" },
+    };
+    var pi = try parseInput(testing.allocator, .{ .string = "next" }, "new instructions", &prev, null, null, .{});
+    defer pi.deinit();
+    try testing.expectEqual(@as(usize, 5), pi.messages.items.len);
+    try testing.expectEqualStrings("new instructions", pi.messages.items[0].content);
+    try testing.expectEqualStrings("historical note", pi.messages.items[2].content);
+}
+
 test "parseInput replaces stored system when fresh instructions are provided" {
     const v: std.json.Value = .{ .string = "next" };
     const prev = [_]chat_mod.Message{
@@ -1533,6 +1562,20 @@ test "parseInput replaces stored system when fresh instructions are provided" {
     for (pi.messages.items[1..]) |m| {
         try testing.expect(!std.mem.eql(u8, m.role, "system"));
     }
+}
+
+test "parseInput preserves late system messages for template-aware rendering" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\[ {"role":"user","content":"first"}, {"role":"assistant","content":"answer"},
+        \\  {"role":"system","content":"runtime note"}, {"role":"user","content":"next"} ]
+    , .{});
+    defer parsed.deinit();
+    var pi = try parseInput(testing.allocator, parsed.value, "stable instructions", null, null, null, .{});
+    defer pi.deinit();
+    try testing.expectEqual(@as(usize, 5), pi.messages.items.len);
+    try testing.expectEqualStrings("stable instructions", pi.messages.items[0].content);
+    try testing.expectEqualStrings("system", pi.messages.items[3].role);
+    try testing.expectEqualStrings("runtime note", pi.messages.items[3].content);
 }
 
 test "parseInput folds a non-leading system into the leading one" {
@@ -1667,6 +1710,13 @@ fn makeTestStored(gpa: std.mem.Allocator, id: []const u8) !*StoredResponse {
     return sr;
 }
 
+/// Presence check that returns the reference `get` took.
+fn has(store: *ResponseStore, id: []const u8) bool {
+    const sr = store.get(id) orelse return false;
+    sr.release();
+    return true;
+}
+
 test "ResponseStore basic put/get/delete" {
     const gpa = testing.allocator;
     var store = ResponseStore.init(testing.io, gpa, 4);
@@ -1675,10 +1725,10 @@ test "ResponseStore basic put/get/delete" {
     const sr = try makeTestStored(gpa, "resp_1");
     try store.put(sr);
 
-    try testing.expect(store.get("resp_1") != null);
-    try testing.expect(store.get("missing") == null);
+    try testing.expect(has(&store, "resp_1"));
+    try testing.expect(!has(&store, "missing"));
     try testing.expectEqual(true, store.delete("resp_1"));
-    try testing.expect(store.get("resp_1") == null);
+    try testing.expect(!has(&store, "resp_1"));
 }
 
 test "ResponseStore evicts LRU at cap" {
@@ -1693,7 +1743,36 @@ test "ResponseStore evicts LRU at cap" {
         try store.put(sr);
     }
     // Cap is 2, inserted 3 — first one should be evicted
-    try testing.expect(store.get("id_0") == null);
-    try testing.expect(store.get("id_1") != null);
-    try testing.expect(store.get("id_2") != null);
+    try testing.expect(!has(&store, "id_0"));
+    try testing.expect(has(&store, "id_1"));
+    try testing.expect(has(&store, "id_2"));
+}
+
+test "ResponseStore.take hands the entry over and leaves the LRU consistent" {
+    const gpa = testing.allocator;
+    var store = ResponseStore.init(testing.io, gpa, 2);
+    defer store.deinit();
+    try store.put(try makeTestStored(gpa, "a"));
+    try store.put(try makeTestStored(gpa, "b"));
+    const a = store.take("a").?;
+    defer a.release();
+    try testing.expect(store.take("a") == null);
+    try testing.expect(!has(&store, "a"));
+    // The cap now counts one entry, and eviction walks a list that no longer holds `a`.
+    try store.put(try makeTestStored(gpa, "c"));
+    try store.put(try makeTestStored(gpa, "d"));
+    try testing.expect(!has(&store, "b"));
+    try testing.expect(has(&store, "c") and has(&store, "d"));
+}
+
+test "ResponseStore: a history held through get outlives a DELETE and an eviction" {
+    const gpa = testing.allocator;
+    var store = ResponseStore.init(testing.io, gpa, 1);
+    defer store.deinit();
+    try store.put(try makeTestStored(gpa, "a"));
+    const held = store.get("a").?;
+    try testing.expect(store.delete("a"));
+    try store.put(try makeTestStored(gpa, "b"));
+    try testing.expectEqualStrings("a", held.id);
+    held.release();
 }

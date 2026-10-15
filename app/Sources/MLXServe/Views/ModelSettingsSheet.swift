@@ -36,6 +36,7 @@ struct ModelSettingsSheet: View {
     @State private var override = ModelOverride()
     @State private var initialOverride = ModelOverride()
     @State private var settingsFile = ModelSettingsFile()
+    @State private var inheritedGeneration = GenerationDefaults()
     @State private var addingCustom = false
     @State private var customKey = ""
     @State private var customValue = ""
@@ -44,6 +45,8 @@ struct ModelSettingsSheet: View {
     @State private var socket: DrafterSocket = .automatic
     @State private var initialSocket: DrafterSocket = .automatic
     @State private var modelGB: Double = 0
+    /// The pack's own drafter folder, read once (`DrafterGems.packDrafterFolder`).
+    @State private var packDrafter: String?
 
     private var live: ModelInfo? {
         server.allModels.first { request.path.hasSuffix("/" + $0.name) || $0.name == request.path }
@@ -91,8 +94,7 @@ struct ModelSettingsSheet: View {
     }
 
     private var bindsDflash: Bool {
-        socket.bindsDflash(localDrafter: FileManager.default.fileExists(
-            atPath: (request.path as NSString).appendingPathComponent(DrafterGems.packFolder + "/config.json")))
+        socket.bindsDflash(localDrafter: packDrafter != nil)
     }
 
     private var repoId: String {
@@ -113,10 +115,10 @@ struct ModelSettingsSheet: View {
         var n = isGguf ? 2 : 3
         if hasInt8PrefillRoute { n += 1 }
         if !isGguf { n += 2 + (specLine == nil ? 0 : 1) }
-        if rows.acceptance { n += 1 }
+        if rows.acceptance { n += 2 }
         if live?.loaded == true { n += 1 }
         if !isGguf { n += 2 + override.templateKwargs.count + (addingCustom ? 1 : 0) }
-        return CGFloat(44 * n + 50)
+        return min(650, CGFloat(44 * n + 50 + 10 * 72))
     }
 
     @ViewBuilder
@@ -159,7 +161,7 @@ struct ModelSettingsSheet: View {
 
     private var footnote: String {
         switch plan {
-        case .saveOnly: return "Applied when the model loads."
+        case .saveOnly: return "Generation defaults apply to the next request. Load settings apply when the model loads."
         case .reload: return "Applied when the model loads; the resident model is reloaded now."
         case .restart: return "Applied when the model loads; the server is restarted now."
         }
@@ -200,8 +202,8 @@ struct ModelSettingsSheet: View {
                 }
                 if !isGguf {
                     Section("Speculation") {
-                        SpeculationSocketRow(socket: $socket, repoId: repoId,
-                                             modelDir: request.path, modelGB: modelGB, mtpAvailable: rows.mtp)
+                        SpeculationSocketRow(socket: $socket, repoId: repoId, modelDir: request.path,
+                                             packDrafter: packDrafter, modelGB: modelGB, mtpAvailable: rows.mtp)
                         if let specLine {
                             Text(specLine).font(.app(.caption)).foregroundStyle(.secondary)
                         }
@@ -215,6 +217,16 @@ struct ModelSettingsSheet: View {
                     ForEach(MtpAcceptanceChoice.allCases, id: \.rawValue) { Text(L10n.text($0.label)).tag($0.rawValue) }
                 }
                 }
+                if rows.acceptance {
+                Picker("MTP greedy tail", selection: Binding(
+                    get: { override.mtpGreedyTail.map { $0 ? 1 : 0 } ?? -1 },
+                    set: { override.mtpGreedyTail = $0 < 0 ? nil : $0 == 1 })) {
+                    Text("Default").font(.app(.body)).tag(-1)
+                    Text("On").font(.app(.body)).tag(1)
+                    Text("Off").font(.app(.body)).tag(0)
+                }
+                .help("Sampled requests draft only the first MTP token from the sampler and take the head's argmax after it. Pays with Typical acceptance.")
+                }
                 if hasInt8PrefillRoute {
                 Picker("Int8 prefill (lossy)", selection: Binding(
                     get: { override.int8Prefill.map { $0 ? 1 : 0 } ?? -1 },
@@ -224,6 +236,17 @@ struct ModelSettingsSheet: View {
                     Text("Off").font(.app(.body)).tag(0)
                 }
                 .help("Faster prompt processing by quantizing activations to int8. Changes numerics; needs an M5-class GPU.")
+                }
+                Section("Generation defaults") {
+                    if override.extra["generation_defaults"] != nil {
+                        Text("The stored generation policy contains invalid or unsupported fields. It is preserved; correct model-settings.json before editing it here.")
+                            .font(.app(.caption)).foregroundStyle(.orange)
+                    }
+                    GenerationDefaultsRows(profile: $override.generationDefaults, inheritance: "Global",
+                                           inherited: inheritedGeneration)
+                        .disabled(override.extra["generation_defaults"] != nil)
+                    Text("Applies to the next request without reloading. Model rules replace global values and their client-override policy.")
+                        .font(.app(.caption)).foregroundStyle(.secondary)
                 }
                 if !isGguf {
                     Section {
@@ -299,12 +322,14 @@ struct ModelSettingsSheet: View {
             }
             .padding(16)
         }
-        .frame(width: 440)
+        .frame(width: 660)
         .onAppear {
             settingsFile = ModelSettingsFile.load()
             override = settingsFile.override(for: request.path) ?? ModelOverride()
             initialOverride = override
-            let gems = SpeculationSocketRow.gems(repoId: repoId, modelDir: request.path, mtpAvailable: rows.mtp,
+            inheritedGeneration = (try? GenerationDefaultsFile.load()) ?? .init()
+            packDrafter = DrafterGems.packDrafterFolder(modelDir: request.path)
+            let gems = SpeculationSocketRow.gems(repoId: repoId, packDrafter: packDrafter, mtpAvailable: rows.mtp,
                                                  listing: downloads.packListings[repoId])
             socket = DrafterSocket.read(override, gems: gems) { downloads.gemPath($0, modelDir: request.path) }
             initialSocket = socket
@@ -320,7 +345,7 @@ struct ModelSettingsSheet: View {
             let gemPath: String? = if case .gem(let g) = socket { downloads.gemPath(g, modelDir: request.path) } else { nil }
             socket.write(into: &override, gemPath: gemPath)
         }
-        if bindsDflash { override.mtpAcceptance = nil }
+        if bindsDflash { override.mtpAcceptance = nil; override.mtpGreedyTail = nil }
         var file = ModelSettingsFile.load()
         file.set(override, for: request.path)
         do {
@@ -363,17 +388,18 @@ struct SpeculationSocketRow: View {
     @EnvironmentObject var downloads: DownloadManager
     let repoId: String
     let modelDir: String
+    let packDrafter: String?
     let modelGB: Double
     let mtpAvailable: Bool
     @State private var removing: DrafterGem?
 
     private var gems: [DrafterGem] {
-        Self.gems(repoId: repoId, modelDir: modelDir, mtpAvailable: mtpAvailable, listing: downloads.packListings[repoId])
+        Self.gems(repoId: repoId, packDrafter: packDrafter, mtpAvailable: mtpAvailable, listing: downloads.packListings[repoId])
     }
 
-    static func gems(repoId: String, modelDir: String, mtpAvailable: Bool, listing: [String: Int64]?) -> [DrafterGem] {
-        let local = FileManager.default.fileExists(atPath: (modelDir as NSString).appendingPathComponent(DrafterGems.packFolder + "/config.json"))
-        return DrafterGems.gems(forRepoId: repoId, packFiles: listing, localDrafter: local, mtpAvailable: mtpAvailable)
+    static func gems(repoId: String, packDrafter: String?, mtpAvailable: Bool, listing: [String: Int64]?) -> [DrafterGem] {
+        DrafterGems.gems(forRepoId: repoId, packFiles: listing, localDrafter: packDrafter != nil,
+                         packDrafterFolder: packDrafter ?? DrafterGems.packFolder, mtpAvailable: mtpAvailable)
     }
 
     private var fetching: DrafterGem? { gems.first { downloads.isFetchingGem($0) } }
@@ -427,10 +453,13 @@ struct SpeculationSocketRow: View {
         DrafterGems.fits(g, modelGB: modelGB, memory: .current())
     }
 
-    private func itemLabel(_ g: DrafterGem) -> String {
-        if onDisk(g) { return g.label }
+    private func itemLabel(_ g: DrafterGem) -> String { Self.menuLabel(g, onDisk: onDisk(g), fits: fits(g)) }
+
+    static func menuLabel(_ g: DrafterGem, onDisk: Bool, fits: Bool) -> String {
+        if onDisk { return g.label }
         let size = SystemMemoryInfo.preciseGB(g.sizeGB)
-        return fits(g) ? "\(g.label) (download \(size))" : "\(g.label) (\(size), does not fit in memory)"
+        let terms = g.licenseNote.map { ", \($0)" } ?? ""
+        return fits ? "\(g.label) (download \(size)\(terms))" : "\(g.label) (\(size), does not fit in memory)"
     }
 
     private func pick(_ g: DrafterGem) {

@@ -34,6 +34,8 @@ const mage_flow = @import("mage_flow.zig");
 /// Runtime LoRA adapters, shared with the image/LTX backends — ONE loader for
 /// every adapter format we accept, Turbo included.
 const lora_mod = @import("lora.zig");
+const h3_glue = @import("h3_glue.zig");
+const add_norm = @import("add_norm.zig");
 const ane = @import("ane.zig");
 const gen_sse = @import("gen_sse.zig");
 /// Vision presentation math (grids, adaLN tags, mRoPE), pinned against
@@ -75,9 +77,8 @@ pub const PATCH_W: u32 = 2;
 
 /// Snap UP to the model's 17k+5 grid. 40 -> 56, 200 -> 209, 363 -> 379.
 pub fn alignFrameCount(n: u32) u32 {
-    var v = n;
-    while (v % 17 != 5) v += 1;
-    return v;
+    // Saturates near the u32 limit, where no ladder rung exists; the transport cap refuses it.
+    return n +| (22 - n % 17) % 17;
 }
 
 /// Snap DOWN to the same ladder, with the model's 5-frame floor. A ref2va
@@ -112,7 +113,8 @@ pub fn temporalShape(length: u32) TemporalShape {
             .audio_t = @intFromFloat(audio_t),
         };
     }
-    const frame_count = alignFrameCount(@max(5, length));
+    // 2^24 frames is past what the transport cap admits at any canvas, and keeps audio_t in range.
+    const frame_count = alignFrameCount(std.math.clamp(@max(5, length), 5, 1 << 24));
     const fc: f64 = @floatFromInt(frame_count);
     // audio_t = round(frame_count / 24 * 40) = round(frame_count * 5 / 3). The
     // reference uses Python's banker's rounding, but frame_count*5/3 can only
@@ -1004,13 +1006,22 @@ fn concat(arrs: []const mlx.mlx_array, axis: c_int, s: S) !mlx.mlx_array {
     try mlx.check(mlx.mlx_concatenate_axis(&o, vec, axis, s));
     return o;
 }
+/// Equal views along `axis`, taken with `mlx_slice`: MLX 0.32.3's split view records its element
+/// COUNT as its data size, so elementwise kernels pick 32-bit indexing and read out of bounds once
+/// `row * stride` passes 2^31 (fc1's [S, 28672] past S = 74,898: a NaN latent, a black clip).
 fn splitEqual(x: mlx.mlx_array, n: usize, axis: c_int, out: []mlx.mlx_array, s: S) !void {
-    var vec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(vec);
-    try mlx.check(mlx.mlx_split(&vec, x, @intCast(n), axis, s));
+    const shp = mlx.getShape(x);
+    const ax: usize = @intCast(axis);
+    const part = @divExact(shp[ax], @as(c_int, @intCast(n)));
+    var start: [8]c_int = @splat(0);
+    var stop: [8]c_int = undefined;
+    var step: [8]c_int = @splat(1);
+    @memcpy(stop[0..shp.len], shp);
     for (0..n) |i| {
+        start[ax] = @as(c_int, @intCast(i)) * part;
+        stop[ax] = start[ax] + part;
         var o = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_vector_array_get(&o, vec, i));
+        try mlx.check(mlx.mlx_slice(&o, x, &start, shp.len, &stop, shp.len, &step, shp.len, s));
         out[i] = o;
     }
 }
@@ -1160,9 +1171,7 @@ const LoraSlot = struct {
 fn loraAdd(y: mlx.mlx_array, x: mlx.mlx_array, slot: LoraSlot, s: S) !mlx.mlx_array {
     if (slot.count == 0) return y;
     defer _ = mlx.mlx_array_free(y);
-    const d = try lora_mod.deltaSum(x, slot.active(), s);
-    defer _ = mlx.mlx_array_free(d);
-    return addA(y, d, s);
+    return lora_mod.addTo(y, x, slot.active(), s);
 }
 
 const AttnW = struct {
@@ -1686,20 +1695,17 @@ fn sliceAxis4(x: mlx.mlx_array, axis: usize, lo: c_int, hi: c_int, s: S) !mlx.ml
     return contig(o, s);
 }
 
-/// x [S, hidden] -> [S, hidden]. Full bidirectional attention (no mask): this
-/// is a diffusion transformer, every token sees every other.
-///
-/// `ablate` is `.none` everywhere except the profile ladder; `.sdpa` passes v
-/// through in place of the attention output (same shape, projections intact).
-fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTables, ablate: Ablate, sparse: ?SparseSpec, s: S) !mlx.mlx_array {
-    const n: c_int = @intCast(mlx.getShape(x)[0]);
+/// qkv [S, 3*inner] -> q, k, v as [1, H, S, hd] for SDPA: per-head RMSNorm over head_dim, THEN rope
+/// (the reference's fused-kernel order; swapping it changes the result), then the head-major
+/// transpose. One fused dispatch when `h3_glue` serves the shape; this chain is its oracle.
+fn qkvHeadMajor(aw: *const AttnW, qkv: mlx.mlx_array, cfg: Config, rope: ?RopeTables, s: S) ![3]mlx.mlx_array {
+    const n: c_int = @intCast(mlx.getShape(qkv)[0]);
     const h: c_int = @intCast(cfg.num_attention_heads);
     const hd: c_int = @intCast(cfg.attention_head_dim);
     const half: c_int = @intCast(cfg.rotDim() / 2);
-
-    const qkv_base = try aw.qkv.forward(x, null, s);
-    const qkv = try loraAdd(qkv_base, x, aw.qkv_lora, s);
-    defer _ = mlx.mlx_array_free(qkv);
+    if (rope) |rp| {
+        if (hd == 128) if (try h3_glue.qkvPrep(qkv, aw.q_norm, aw.k_norm, rp.cos, rp.sin, cfg.qk_norm_eps, h, half, s)) |f| return .{ f.q, f.k, f.v };
+    }
     var parts: [3]mlx.mlx_array = undefined;
     try splitEqual(qkv, 3, 1, &parts, s);
     defer for (&parts) |*p| {
@@ -1720,13 +1726,11 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
             continue;
         }
         defer _ = mlx.mlx_array_free(v4);
-        // Per-head RMSNorm over head_dim, THEN rope — that order is the
-        // reference's fused kernel, and swapping it changes the result.
         const nw = if (i == 0) aw.q_norm else aw.k_norm;
         const normed = try rmsNormLast(v4, nw, cfg.qk_norm_eps, s);
         if (rope) |rp| {
             defer _ = mlx.mlx_array_free(normed);
-    qkvn[i] = try applyRopePub(normed, rp, half, hd, s);
+            qkvn[i] = try applyRopePub(normed, rp, half, hd, s);
         } else {
             qkvn[i] = normed;
         }
@@ -1738,11 +1742,33 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
 
     // [1,S,H,hd] -> [1,H,S,hd] for SDPA
     var t: [3]mlx.mlx_array = undefined;
+    var made: usize = 0;
+    errdefer for (t[0..made]) |p| {
+        _ = mlx.mlx_array_free(p);
+    };
     for (0..3) |i| {
         const tr = try transpose(qkvn[i], &[_]c_int{ 0, 2, 1, 3 }, s);
         defer _ = mlx.mlx_array_free(tr);
         t[i] = try contig(tr, s);
+        made += 1;
     }
+    return t;
+}
+
+/// x [S, hidden] -> [S, hidden]. Full bidirectional attention (no mask): this
+/// is a diffusion transformer, every token sees every other.
+///
+/// `ablate` is `.none` everywhere except the profile ladder; `.sdpa` passes v
+/// through in place of the attention output (same shape, projections intact).
+fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTables, ablate: Ablate, sparse: ?SparseSpec, s: S) !mlx.mlx_array {
+    const n: c_int = @intCast(mlx.getShape(x)[0]);
+    const h: c_int = @intCast(cfg.num_attention_heads);
+    const hd: c_int = @intCast(cfg.attention_head_dim);
+
+    const qkv_base = try aw.qkv.forward(x, null, s);
+    const qkv = try loraAdd(qkv_base, x, aw.qkv_lora, s);
+    defer _ = mlx.mlx_array_free(qkv);
+    var t = try qkvHeadMajor(aw, qkv, cfg, rope, s);
     defer for (&t) |*p| {
         _ = mlx.mlx_array_free(p.*);
     };
@@ -1781,11 +1807,9 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
     return loraAdd(out_base, flat, aw.out_lora, s);
 }
 
-/// fc1 emits gate and up FUSED as [S, 2*ffn]; SwiGLU is silu(gate) * up.
-fn mlpForward(mw: *const MlpW, x: mlx.mlx_array, s: S) !mlx.mlx_array {
-    const y_base = try mw.fc1.forward(x, null, s);
-    const y = try loraAdd(y_base, x, mw.fc1_lora, s);
-    defer _ = mlx.mlx_array_free(y);
+/// silu(gate) * up over the fused [S, 2*ffn] fc1 output.
+fn swigluAct(y: mlx.mlx_array, s: S) !mlx.mlx_array {
+    if (try h3_glue.swiglu(y, s)) |a| return a;
     var halves: [2]mlx.mlx_array = undefined;
     try splitEqual(y, 2, 1, &halves, s);
     defer for (&halves) |*p| {
@@ -1793,7 +1817,15 @@ fn mlpForward(mw: *const MlpW, x: mlx.mlx_array, s: S) !mlx.mlx_array {
     };
     const g = try siluA(halves[0], s);
     defer _ = mlx.mlx_array_free(g);
-    const act = try mulA(g, halves[1], s);
+    return mulA(g, halves[1], s);
+}
+
+/// fc1 emits gate and up FUSED as [S, 2*ffn]; SwiGLU is silu(gate) * up.
+fn mlpForward(mw: *const MlpW, x: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const y_base = try mw.fc1.forward(x, null, s);
+    const y = try loraAdd(y_base, x, mw.fc1_lora, s);
+    defer _ = mlx.mlx_array_free(y);
+    const act = try swigluAct(y, s);
     defer _ = mlx.mlx_array_free(act);
     const o_base = try mw.fc2.forward(act, null, s);
     return loraAdd(o_base, act, mw.fc2_lora, s);
@@ -1863,6 +1895,70 @@ fn modGate(x: mlx.mlx_array, gate: mlx.mlx_array, other: mlx.mlx_array, runs: []
         _ = mlx.mlx_array_free(p);
     };
     return concat(pieces, 0, s);
+}
+
+/// A branch output waiting for its gated residual add, `h += gate[row] * x`, carried to the next
+/// norm so `add_norm.gateNormMod` fuses the two. Owns both handles.
+const PendingGate = struct {
+    x: mlx.mlx_array,
+    gate: mlx.mlx_array,
+
+    fn init(x: mlx.mlx_array, gate: mlx.mlx_array) PendingGate {
+        var p: PendingGate = .{ .x = mlx.mlx_array_new(), .gate = mlx.mlx_array_new() };
+        _ = mlx.mlx_array_set(&p.x, x);
+        _ = mlx.mlx_array_set(&p.gate, gate);
+        return p;
+    }
+    fn deinit(self: *PendingGate) void {
+        _ = mlx.mlx_array_free(self.x);
+        _ = mlx.mlx_array_free(self.gate);
+    }
+};
+
+/// What the fused gate+norm+modulation kernel needs beyond the block's own arrays.
+const FusedMod = struct { row_mod: mlx.mlx_array, eps: mlx.mlx_array };
+
+/// Row r -> its modulation row, from the timestep plan's runs: the [S] i32 table `gateNormMod` indexes.
+fn buildRowMod(a: std.mem.Allocator, seq: u32, runs: []const ModRun) !mlx.mlx_array {
+    const rows = try a.alloc(i32, seq);
+    defer a.free(rows);
+    @memset(rows, 0);
+    for (runs) |r| @memset(rows[r.start..r.end], @intCast(r.mod_row));
+    const shape = [_]c_int{@intCast(seq)};
+    return mlx.mlx_array_new_data(rows.ptr, &shape, 1, .int32);
+}
+
+/// `h += pending` by the chain (`modGate`); the fallback for anything that is not the fused seam.
+fn applyPending(h: *mlx.mlx_array, pend: *?PendingGate, runs: []const ModRun, a: std.mem.Allocator, s: S) !void {
+    var p = pend.* orelse return;
+    const h1 = try modGate(h.*, p.gate, p.x, runs, a, s);
+    _ = mlx.mlx_array_free(h.*);
+    h.* = h1;
+    p.deinit();
+    pend.* = null;
+}
+
+/// The seam between two sublayers: `h += pending` (when there is one), then
+/// `rmsnorm(h) * w * (1 + scale) + shift`. `h` is replaced and `pend` cleared. One dispatch when
+/// `add_norm.gateNormMod` serves the shape, the op chain it is bit-equal to otherwise.
+fn gateNormMod(h: *mlx.mlx_array, pend: *?PendingGate, w: mlx.mlx_array, shift: mlx.mlx_array, scale: mlx.mlx_array, fused: ?FusedMod, runs: []const ModRun, a: std.mem.Allocator, norm_eps: f32, s: S) !mlx.mlx_array {
+    if (fused) |f| {
+        if (try add_norm.gateNormMod(h.*, if (pend.*) |g| .{ .x = g.x, .gate = g.gate } else null, w, scale, shift, f.row_mod, f.eps, s)) |o| {
+            if (pend.*) |*p| {
+                _ = mlx.mlx_array_free(h.*);
+                h.* = o.h;
+                p.deinit();
+                pend.* = null;
+            } else {
+                _ = mlx.mlx_array_free(o.h); // unwritten: no add ran
+            }
+            return o.normed;
+        }
+    }
+    try applyPending(h, pend, runs, a, s);
+    const n = try rmsNormLast(h.*, w, norm_eps, s);
+    defer _ = mlx.mlx_array_free(n);
+    return modScaleShift(n, shift, scale, runs, a, s);
 }
 
 // ── Timestep rows ───────────────────────────────────────────────────────────
@@ -2489,9 +2585,7 @@ pub const Model = struct {
         try mlx.check(mlx.mlx_eval(vec));
     }
 
-    /// Every linear a LoRA may target, in ONE list, so attach and the
-    /// completeness check below cannot disagree about what "all of them" is.
-    /// The 259 modules the Turbo LoRA ships: 50 blocks x (qkv, out, fc1, fc2,
+    /// Every linear a LoRA may target: 50 blocks x (qkv, out, fc1, fc2,
     /// adaln) + 2 refiner blocks x (qkv, out, fc1, fc2) + the final adaln.
     pub const LORA_TARGETS: u32 = 259;
 
@@ -2500,9 +2594,9 @@ pub const Model = struct {
     /// model. Must run BEFORE `precomputeAdaln` — the adaln delta has to be
     /// in place while the tables are built, since the weights are freed after.
     /// Returns per-file attachment counts (index = position in the stack), so
-    /// the caller can hold a file to its own expectation: a Turbo file that
-    /// attaches to fewer than `LORA_TARGETS` modules is a broken artifact, not
-    /// a smaller speedup, while a style LoRA targeting a subset is ordinary.
+    /// the caller can hold a file to its own expectation: a Turbo file must
+    /// attach every module it ships (`turboAttachComplete`), while a style LoRA
+    /// targeting a subset is ordinary.
     pub fn attachLoras(self: *Model, stack: *const lora_mod.Stack) ![lora_mod.MAX_LORAS]u32 {
         var counts: [lora_mod.MAX_LORAS]u32 = @splat(0);
         var buf: [96]u8 = undefined;
@@ -2541,6 +2635,25 @@ pub const Model = struct {
         const fa = if (self.final_adaln) |*fa| fa else return error.LoraAfterAdalnPrecompute;
         bind(stack, "final_layer.adaln_proj.linear", &fa.lora, &rbuf, &counts);
         return counts;
+    }
+
+    /// Unbind every adapter so a resident DiT can take the next request's stack. The stack the
+    /// refs point into is request-scoped, so this runs before it is freed.
+    pub fn clearLoras(self: *Model) void {
+        for (self.blocks) |*b| {
+            b.attn.qkv_lora.count = 0;
+            b.attn.out_lora.count = 0;
+            b.mlp.fc1_lora.count = 0;
+            b.mlp.fc2_lora.count = 0;
+            if (b.adaln) |*ad| ad.lora.count = 0;
+        }
+        for (self.refiner) |*b| {
+            b.attn.qkv_lora.count = 0;
+            b.attn.out_lora.count = 0;
+            b.mlp.fc1_lora.count = 0;
+            b.mlp.fc2_lora.count = 0;
+        }
+        if (self.final_adaln) |*fa| fa.lora.count = 0;
     }
 
     /// Materialize AdaLN for the whole schedule and RELEASE the 13B AdaLN
@@ -2761,6 +2874,18 @@ pub const Model = struct {
             try mlx.check(mlx.mlx_zeros(&zero_mods, &[_]c_int{ zrows, @intCast(cfg.hidden_size) }, 2, self.dtype, s));
         }
 
+        // Each block ends in a gated add that the NEXT norm absorbs (`gateNormMod`), so a branch
+        // output rides in `pend` until then.
+        var pend: ?PendingGate = null;
+        defer if (pend) |*p| p.deinit();
+        const row_mod = if (h3_glue.enabled()) try buildRowMod(a, layout.seq_len, plan.runs) else mlx.mlx_array{ .ctx = null };
+        defer if (row_mod.ctx != null) {
+            _ = mlx.mlx_array_free(row_mod);
+        };
+        const eps_a = mlx.mlx_array_new_float(cfg.norm_eps);
+        defer _ = mlx.mlx_array_free(eps_a);
+        const fused: ?FusedMod = if (row_mod.ctx != null) .{ .row_mod = row_mod, .eps = eps_a } else null;
+
         for (self.blocks, 0..) |*b, bi| {
             var mods: [6]mlx.mlx_array = undefined;
             var mods_owned = true;
@@ -2786,12 +2911,11 @@ pub const Model = struct {
             var at_owned = true;
             const cacheable = attn_bcast != null and self.ablate == .none;
             if (cacheable and !attn_refresh and attn_bcast.?.blocks[bi].ctx != null) {
+                try applyPending(&h, &pend, plan.runs, a, s);
                 at = attn_bcast.?.blocks[bi];
                 at_owned = false;
             } else {
-                const n1 = try rmsNormLast(h, b.norm1, cfg.norm_eps, s);
-                defer _ = mlx.mlx_array_free(n1);
-                const m1 = try modScaleShift(n1, mods[0], mods[1], plan.runs, a, s);
+                const m1 = try gateNormMod(&h, &pend, b.norm1, mods[0], mods[1], fused, plan.runs, a, cfg.norm_eps, s);
                 defer _ = mlx.mlx_array_free(m1);
                 const smode = if (self.ablate == .none) sparseModeForLayer(bi, self.blocks.len, self.sparse_policy) else SparseMode.dense;
                 const spec: ?SparseSpec = if (smode == .dense) null else .{
@@ -2810,20 +2934,14 @@ pub const Model = struct {
             defer if (at_owned) {
                 _ = mlx.mlx_array_free(at);
             };
-            const h1 = try modGate(h, mods[2], at, plan.runs, a, s);
-            _ = mlx.mlx_array_free(h);
-            h = h1;
-
-            const n2 = try rmsNormLast(h, b.norm2, cfg.norm_eps, s);
-            defer _ = mlx.mlx_array_free(n2);
-            const m2 = try modScaleShift(n2, mods[3], mods[4], plan.runs, a, s);
+            pend = PendingGate.init(at, mods[2]);
+            const m2 = try gateNormMod(&h, &pend, b.norm2, mods[3], mods[4], fused, plan.runs, a, cfg.norm_eps, s);
             defer _ = mlx.mlx_array_free(m2);
             const mo = if (self.ablate == .mlp) try contig(m2, s) else try self.mlpMaybeAne(&b.mlp, m2, bi, s);
             defer _ = mlx.mlx_array_free(mo);
-            const h2 = try modGate(h, mods[5], mo, plan.runs, a, s);
-            _ = mlx.mlx_array_free(h);
-            h = h2;
+            pend = PendingGate.init(mo, mods[5]);
         }
+        try applyPending(&h, &pend, plan.runs, a, s);
         defer _ = mlx.mlx_array_free(h);
 
         // Final layer: 1 modality, so the mod row is just the timestep row.
@@ -3561,6 +3679,10 @@ pub const RefMedia = struct {
 };
 
 pub const GenRequest = struct {
+    /// Keep the text encoder and DiT loaded in this cache between requests (null = the staged
+    /// plan: load, run, free). `resident_bytes` is what the cache reports holding.
+    resident: ?*Resident = null,
+    resident_bytes: u64 = 0,
     prompt: []const u8,
     width: u32 = 256,
     height: u32 = 256,
@@ -3571,9 +3693,9 @@ pub const GenRequest = struct {
     seed: u64 = 0,
     shift_video: f64 = SIGMA_SHIFT_VIDEO,
     shift_audio: f64 = SIGMA_SHIFT_AUDIO,
-    /// Fast recipe switch: null/true = ON (the default), false = full-quality
-    /// per-step compute (every forward, dense attention branch every step).
-    fast: ?bool = null,
+    /// The recipe `resolveSpeed` picked from the request's `fast`, `turbo` and the env; the
+    /// caller bills its attention cache before the run, so both read one answer.
+    speed: SpeedConfig = resolveSpeed(null, false, null, null),
     /// Turbo distillation LoRA (larryvrh/MiniMax-H3-Turbo-Lora): 4-8 step
     /// sampling instead of ~30. Requires `paths.turbo_lora`; forces the fast
     /// recipe OFF (its slow-drift premise is false at giant steps) and switches
@@ -3669,6 +3791,70 @@ pub fn audioStepFactor(turbo: bool, sigma_cur: f64, sigma_next: f64, shift_v: f6
     return (sa_n - sa_c) / timeShiftSlope(@max(sigma_cur, 1e-6), shift_v, shift_a);
 }
 
+/// The text encoder and the whole DiT, kept loaded between requests while the engine stays loaded
+/// and `gen.h3KeepResident` says memory allows. The DiT keeps its AdaLN weights (no per-schedule
+/// precompute) so it serves any request. Inference thread only: every free is an MLX free.
+pub const Resident = struct {
+    allocator: std.mem.Allocator,
+    te: ?TextEncoder = null,
+    dit: ?Model = null,
+    /// The adapters bound to `dit`. Their refs point into it, so it outlives the model's slots.
+    stack: lora_mod.Stack,
+    /// True while `dit`'s slots are bound to `stack`; a fresh DiT starts unbound.
+    lora_bound: bool = false,
+    /// File bytes of what is held, for the "held" figure the policy and the log read:
+    /// stamped once the DiT is in, never from the plan (a failed load holds nothing).
+    bytes: u64 = 0,
+
+    pub fn init(allocator: std.mem.Allocator) Resident {
+        return .{ .allocator = allocator, .stack = .{ .allocator = allocator } };
+    }
+
+    pub fn held(self: *const Resident) bool {
+        return self.te != null or self.dit != null;
+    }
+
+    /// Frees everything held; returns the bytes it was holding.
+    pub fn release(self: *Resident) u64 {
+        const freed = self.bytes;
+        if (self.te) |*t| t.deinit();
+        self.te = null;
+        if (self.dit) |*m| m.deinit();
+        self.dit = null;
+        self.lora_bound = false;
+        self.stack.deinit();
+        self.bytes = 0;
+        if (freed > 0) _ = mlx.mlx_clear_cache();
+        return freed;
+    }
+};
+
+/// Every engine's cache, so another model's load can ask them all to let go.
+var live_residents: [8]?*Resident = @splat(null);
+
+pub fn registerResident(r: *Resident) void {
+    for (&live_residents) |*slot| if (slot.* == null) {
+        slot.* = r;
+        return;
+    };
+}
+
+pub fn unregisterResident(r: *Resident) void {
+    for (&live_residents) |*slot| if (slot.* == r) {
+        slot.* = null;
+    };
+}
+
+/// Frees every registered cache and returns the bytes released. Called before another load would
+/// be refused for memory: residency is opportunistic and never blocks anything.
+pub fn releaseAllResidents() u64 {
+    var freed: u64 = 0;
+    for (live_residents) |slot| if (slot) |r| {
+        freed += r.release();
+    };
+    return freed;
+}
+
 pub const GenPaths = struct {
     /// Directory holding tokenizer.json.
     tokenizer_dir: []const u8,
@@ -3705,7 +3891,7 @@ pub const GenResult = struct {
     }
 };
 
-/// Monotonic lap clock over std.Io (this Zig nightly has no std.time.Timer).
+/// Monotonic lap clock over std.Io (Zig 0.17 has no std.time.Timer).
 const LapClock = struct {
     io: std.Io,
     start: std.Io.Timestamp,
@@ -4034,6 +4220,69 @@ pub fn generate(
     }
     if (req.chain_windows > 1) return generateChain(allocator, io, paths, req, progress, s);
     return generateOne(allocator, io, paths, req, progress, s);
+}
+
+/// The adapters a request asks for, in stack order: Turbo first (the file's alpha == rank, so
+/// scale 1), then the caller's. A style LoRA and the distillation sum on the same linears.
+fn wantedLoras(paths: GenPaths, req: GenRequest, out_paths: *[lora_mod.MAX_LORAS][]const u8, out_scales: *[lora_mod.MAX_LORAS]f32) !usize {
+    var n: usize = 0;
+    if (req.turbo) {
+        out_paths[0] = paths.turbo_lora orelse return error.TurboLoraMissing;
+        out_scales[0] = 1.0;
+        n = 1;
+    }
+    if (req.lora_paths.len + n > lora_mod.MAX_LORAS) return error.TooManyLoras;
+    for (req.lora_paths, 0..) |p, i| {
+        out_paths[n] = p;
+        out_scales[n] = if (i < req.lora_scales.len) req.lora_scales[i] else 1.0;
+        n += 1;
+    }
+    return n;
+}
+
+/// A Turbo file is whole when EVERY module it ships attaches: distillations train different
+/// subsets (Lightx2v's skips the AdaLN projections larryvrh's trains), while a module that finds
+/// no linear means a file for another layout.
+pub fn turboAttachComplete(attached: u32, shipped: usize) bool {
+    return attached == shipped;
+}
+
+/// Loads every wanted adapter into `stack` and binds it to `model`, holding each file to its own
+/// expectation: engagement is COUNTED and logged, because a rejected or half-matching adapter is
+/// otherwise a silent no-op that looks exactly like a working one.
+fn bindLoras(allocator: std.mem.Allocator, stack: *lora_mod.Stack, model: *Model, want_paths: []const []const u8, want_scales: []const f32, turbo: bool) !void {
+    model.clearLoras();
+    stack.deinit();
+    for (want_paths, want_scales) |p, sc| {
+        stack.files[stack.count] = try lora_mod.loadFile(allocator, p, .minimax_h3);
+        stack.paths[stack.count] = try allocator.dupe(u8, p);
+        stack.scales[stack.count] = sc;
+        stack.count += 1;
+    }
+    if (stack.count == 0) return;
+    // Attach BEFORE precomputeAdaln so the adaln delta folds into the tables (after it, the
+    // modulation weights are gone).
+    const counts = try model.attachLoras(stack);
+    for (stack.paths[0..stack.count], stack.scales[0..stack.count], counts[0..stack.count], 0..) |p, sc, n, i| {
+        const is_turbo = turbo and i == 0;
+        log.info("[minimax-h3] lora {d}/{d}: {d}/{d} modules, scale {d:.2}{s} — {s}\n", .{
+            i + 1,          stack.count, n, Model.LORA_TARGETS, sc,
+            if (is_turbo) " (turbo)" else "", std.fs.path.basename(p),
+        });
+        // A style LoRA legitimately targets a subset, but matching NOTHING means the file is for
+        // another architecture and the user would wait an hour for an unchanged render.
+        if (is_turbo and !turboAttachComplete(n, stack.files[i].entries.len)) return error.TurboLoraIncomplete;
+        if (n == 0) return error.LoraNoMatch;
+    }
+}
+
+/// The DiT, with its weights map freed as soon as the model owns the arrays: a map that outlived
+/// `Model.load` would hold +1 refs on every raw file-backed array, so anything the model later
+/// frees (the 13 GB of AdaLN under precompute) would stay resident.
+fn loadDit(allocator: std.mem.Allocator, path: []const u8, dt: mlx.mlx_dtype, s: S) !Model {
+    var dw = try model_mod.loadWeightsSingleFile(allocator, path);
+    defer dw.deinit();
+    return Model.load(allocator, &dw, .{}, dt, s);
 }
 
 /// One window, with STAGED residency: the 50-layer text encoder (~48 GB bf16)
@@ -4371,20 +4620,30 @@ fn generateOne(
     }
     try present.append(allocator, .{ .text = ids });
 
-    // ── 3. text encoder, then FREE it before the DiT loads ──
+    // ── 3. text encoder, then FREE it before the DiT loads (kept when resident) ──
     var te_active: usize = 0;
     var enc: EncodedPrompt = blk: {
-        var tw = try model_mod.loadWeightsSingleFile(allocator, paths.text_encoder);
-        defer tw.deinit();
-        var te = try TextEncoder.load(allocator, &tw, .{}, dt, s);
-        defer te.deinit();
+        const needs_vision = for (present.items) |it| {
+            if (it == .vision) break true;
+        } else false;
+        // The weights map is opened only when something has to be read from it.
+        var tw: ?Weights = null;
+        defer if (tw) |*w| w.deinit();
+        if (req.resident == null or req.resident.?.te == null or (needs_vision and req.resident.?.te.?.vision == null))
+            tw = try model_mod.loadWeightsSingleFile(allocator, paths.text_encoder);
+        var te_local: ?TextEncoder = null;
+        defer if (te_local) |*t| t.deinit();
+        const te: *TextEncoder = if (req.resident) |r| rb: {
+            if (r.te == null) r.te = try TextEncoder.load(allocator, &tw.?, .{}, dt, s) else log.info("[minimax-h3] text encoder: resident hit\n", .{});
+            break :rb &r.te.?;
+        } else lb: {
+            te_local = try TextEncoder.load(allocator, &tw.?, .{}, dt, s);
+            break :lb &te_local.?;
+        };
         // The tower is 1.2 GB and only the presentation knows whether anything
         // needs it — a keyframe with vision blocks off, or an audio-only ref
         // set, does not.
-        for (present.items) |it| if (it == .vision) {
-            try te.loadVision(&tw, s);
-            break;
-        };
+        if (needs_vision and te.vision == null) try te.loadVision(&tw.?, s);
         var e = try te.encodeItems(allocator, present.items, s);
         errdefer e.deinit();
         try mlx.check(mlx.mlx_array_eval(e.hidden));
@@ -4399,10 +4658,11 @@ fn generateOne(
     _ = mlx.mlx_clear_cache();
     const te_len: u32 = @intCast(mlx.getShape(text_hidden)[0]);
     const te_ms = phase_timer.lapMs();
-    log.info("[minimax-h3] text encoded ({d} rows, {d} vision), encoder resident {d:.2} GB, released ({d} ms load+encode)\n", .{
+    log.info("[minimax-h3] text encoded ({d} rows, {d} vision), encoder resident {d:.2} GB, {s} ({d} ms load+encode)\n", .{
         te_len,
         te_len - @as(u32, @intCast(ids.len)),
         @as(f64, @floatFromInt(te_active)) / (1024.0 * 1024.0 * 1024.0),
+        if (req.resident != null) "kept" else "released",
         te_ms,
     });
 
@@ -4511,26 +4771,13 @@ fn generateOne(
         log.warn("[minimax-h3] MINIMAX_H3_ABLATE='{s}' not recognized; profiling arms OFF\n", .{abl_raw.?});
 
     {
-        // Adapters are loaded BEFORE the DiT and outlive it (declared first ⇒
-        // its `defer` runs last), because every attached `Ref` points into
-        // this stack. Turbo is file 0 when asked for, then the user's, so a
-        // style LoRA and the distillation sum on the same linears.
-        var stack: lora_mod.Stack = .{ .allocator = allocator };
-        defer stack.deinit();
-        if (req.turbo) {
-            const tp = paths.turbo_lora orelse return error.TurboLoraMissing;
-            stack.files[stack.count] = try lora_mod.loadFile(allocator, tp, .minimax_h3);
-            stack.paths[stack.count] = try allocator.dupe(u8, tp);
-            stack.scales[stack.count] = 1.0; // the file's alpha == rank
-            stack.count += 1;
-        }
-        if (req.lora_paths.len + stack.count > lora_mod.MAX_LORAS) return error.TooManyLoras;
-        for (req.lora_paths, 0..) |p, i| {
-            stack.files[stack.count] = try lora_mod.loadFile(allocator, p, .minimax_h3);
-            stack.paths[stack.count] = try allocator.dupe(u8, p);
-            stack.scales[stack.count] = if (i < req.lora_scales.len) req.lora_scales[i] else 1.0;
-            stack.count += 1;
-        }
+        // The stack outlives the DiT (declared first, so its `defer` runs last): every attached
+        // `Ref` points into it. A resident DiT keeps its stack in the cache instead.
+        var stack_local: lora_mod.Stack = .{ .allocator = allocator };
+        defer stack_local.deinit();
+        var want_paths: [lora_mod.MAX_LORAS][]const u8 = undefined;
+        var want_scales: [lora_mod.MAX_LORAS]f32 = undefined;
+        const want_n = try wantedLoras(paths, req, &want_paths, &want_scales);
 
         // The weights MAP must not outlive Model.load: it holds +1 refs on
         // every raw file-backed array, so anything the model later FREES (the
@@ -4538,38 +4785,31 @@ fn generateOne(
         // end. Lazy graphs keep their inputs alive internally, so dropping
         // the map right away is safe — caught live by the `dit resident` log
         // reading 33.4 GB where ~22 was expected.
-        var model = blk: {
-            var dw = try model_mod.loadWeightsSingleFile(allocator, paths.dit);
-            defer dw.deinit();
-            break :blk try Model.load(allocator, &dw, .{}, dt, s);
+        var model_local: ?Model = null;
+        defer if (model_local) |*m| m.deinit();
+        const model: *Model = if (req.resident) |r| rb: {
+            if (r.dit == null) r.dit = try loadDit(allocator, paths.dit, dt, s) else log.info("[minimax-h3] dit: resident hit\n", .{});
+            r.bytes = req.resident_bytes;
+            break :rb &r.dit.?;
+        } else lb: {
+            model_local = try loadDit(allocator, paths.dit, dt, s);
+            break :lb &model_local.?;
         };
-        defer model.deinit();
-        if (stack.count > 0) {
-            // Attach BEFORE precomputeAdaln so the adaln delta folds into the
-            // tables (after it, the modulation weights are gone).
-            const counts = try model.attachLoras(&stack);
-            for (stack.paths[0..stack.count], stack.scales[0..stack.count], counts[0..stack.count], 0..) |p, sc, n, i| {
-                const is_turbo = req.turbo and i == 0;
-                // Engagement is COUNTED and logged per file: a rejected or
-                // half-matching adapter is otherwise a silent no-op that looks
-                // exactly like a working one.
-                log.info("[minimax-h3] lora {d}/{d}: {d}/{d} modules, scale {d:.2}{s} — {s}\n", .{
-                    i + 1,          stack.count, n, Model.LORA_TARGETS, sc,
-                    if (is_turbo) " (turbo)" else "", std.fs.path.basename(p),
-                });
-                // The Turbo file names every target; anything less is a broken
-                // artifact, not a smaller speedup. A style LoRA legitimately
-                // targets a subset, but matching NOTHING means the file is for
-                // another architecture and the user would wait an hour for an
-                // unchanged render.
-                if (is_turbo and n < Model.LORA_TARGETS) return error.TurboLoraIncomplete;
-                if (n == 0) return error.LoraNoMatch;
+        if (req.resident) |r| {
+            if (r.lora_bound and r.stack.matches(want_paths[0..want_n], want_scales[0..want_n])) {
+                log.info("[minimax-h3] lora: resident hit ({d} adapters)\n", .{want_n});
+            } else {
+                r.lora_bound = false;
+                try bindLoras(allocator, &r.stack, model, want_paths[0..want_n], want_scales[0..want_n], req.turbo);
+                r.lora_bound = true;
             }
+        } else {
+            try bindLoras(allocator, &stack_local, model, want_paths[0..want_n], want_scales[0..want_n], req.turbo);
         }
         // AdaLN precompute must run while the trunk is still lazy — see
         // precomputeAdaln. Default ON: it is what keeps the DiT residency at
         // ~22 GB instead of ~35 on the 8-bit pack.
-        if (adalnPrecomputeOn()) {
+        if (adalnPrecomputeOn() and req.resident == null) {
             const ts = try collectScheduleTs(allocator, &layout, sigmas[0..req.steps], req.shift_video, req.shift_audio, .{});
             defer allocator.free(ts);
             try model.precomputeAdaln(ts, s);
@@ -4578,7 +4818,7 @@ fn generateOne(
         try model.evalWeights();
         // ANE MLP offload for this run's row count (opt-in; declines under a
         // LoRA, so a Turbo run stays GPU-only).
-        model.buildAne(io, layout.seq_len, s);
+        if (req.resident == null) model.buildAne(io, layout.seq_len, s);
         var active_bytes: usize = 0;
         _ = mlx.mlx_get_active_memory(&active_bytes);
         const load_ms = phase_timer.lapMs();
@@ -4602,8 +4842,8 @@ fn generateOne(
         // only on every k-th mid-schedule step and reuses the cached output
         // between — the branch is ~70% of a 768p step. Cache cost: one
         // [S, hidden] bf16 per block (~20 GB at 768p, ~1.4 GB at 256px).
-        const speed = resolveSpeed(req.fast, req.turbo, envStr("MINIMAX_H3_STEP_CACHE"), envStr("MINIMAX_H3_ATTN_BCAST"));
-        log.info("[minimax-h3] speed recipe: step-cache {d:.3}, attn-broadcast k={d} (fast={any}, turbo={})\n", .{ speed.step_cache, speed.bcast_k, req.fast, req.turbo });
+        const speed = req.speed;
+        log.info("[minimax-h3] speed recipe: step-cache {d:.3}, attn-broadcast k={d} (turbo={})\n", .{ speed.step_cache, speed.bcast_k, req.turbo });
         const bcast_k: u32 = speed.bcast_k;
         var attn_bcast: ?AttnBroadcast = if (bcast_k > 1) try AttnBroadcast.init(allocator, model.blocks.len) else null;
         defer if (attn_bcast) |*ab| ab.deinit();
@@ -4733,7 +4973,7 @@ fn generateOne(
                 sc_consec += 1;
                 sc_skipped += 1;
                 if (progress) |p| {
-                    if (p.cancelled()) return error.Cancelled;
+                    if (p.boundary()) return error.Cancelled;
                     p.emit("Generating", @intCast(i + 1), req.steps);
                 }
                 log.info("[minimax-h3] step {d}/{d} sigma {d:.4} (cached velocity, {d} ms)\n", .{ i + 1, req.steps, sigma, step_timer.lapMs() });
@@ -4775,7 +5015,7 @@ fn generateOne(
             // pre-Euler noisy latent. Cached-velocity steps already continued
             // above without a preview. A failed JPEG never fails the job.
             if (progress) |p| {
-                if (p.cancelled()) return error.Cancelled;
+                if (p.boundary()) return error.Cancelled;
                 tryEmitH3Preview(p, allocator, "Generating", @intCast(i + 1), req.steps, video_x, out.video, sigma, shape.latent_t, lat_h, lat_w, preview_first_frame, s);
             }
 
@@ -4834,7 +5074,7 @@ fn generateOne(
             try mlx.check(mlx.mlx_array_eval(video_x));
             try mlx.check(mlx.mlx_array_eval(audio_x));
             if (progress) |p| {
-                if (p.cancelled()) return error.Cancelled;
+                if (p.boundary()) return error.Cancelled;
             }
             // Every denoise loop owes a periodic cache clear: MLX's pool is
             // unbounded and these shapes repeat, so without it the process
@@ -5691,7 +5931,7 @@ test "minimax h3 live: generates a clip" {
 }
 
 /// libc getenv, matching generate.zig's allocator-free env idiom.
-fn envStr(name: [:0]const u8) ?[]const u8 {
+pub fn envStr(name: [:0]const u8) ?[]const u8 {
     const raw = std.c.getenv(name.ptr) orelse return null;
     const slice = std.mem.sliceTo(raw, 0);
     return if (slice.len == 0) null else slice;
@@ -6865,6 +7105,60 @@ fn sumAll(x: mlx.mlx_array, s: S) !f32 {
     return v;
 }
 
+test "minimax h3: splitEqual returns the n column blocks in order" {
+    const s = mlx.gpuStream();
+    var buf: [12]f32 = undefined;
+    for (&buf, 0..) |*v, i| v.* = @floatFromInt(i);
+    const x = mlx.mlx_array_new_data(&buf, &[_]c_int{ 2, 6 }, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(x);
+    var parts: [3]mlx.mlx_array = undefined;
+    try splitEqual(x, 3, 1, &parts, s);
+    defer for (parts) |p| {
+        _ = mlx.mlx_array_free(p);
+    };
+    for (parts, 0..) |p, k| {
+        const c = try contig(p, s);
+        defer _ = mlx.mlx_array_free(c);
+        try mlx.check(mlx.mlx_array_eval(c));
+        const got = (mlx.mlx_array_data_float32(c) orelse return error.NoData)[0..4];
+        const b: f32 = @floatFromInt(2 * k);
+        try std.testing.expectEqualSlices(f32, &[_]f32{ b, b + 1, b + 6, b + 7 }, got);
+    }
+}
+
+test "minimax h3 live: the SwiGLU fallback reads every row of a [S, 28672] fc1 output past 2^31" {
+    // 6.5 GB of GPU memory. Rows from 74,898 on read out of bounds when the split view picks
+    // 32-bit indexing (a black clip).
+    _ = std.c.getenv("MINIMAX_H3_SPLIT_OVERFLOW") orelse return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const rows: c_int = 75_157;
+    const f: c_int = 14_336;
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_ones(&x, &[_]c_int{ rows, 2 * f }, 2, mlx.mlx_dtype.bfloat16, s));
+    var halves: [2]mlx.mlx_array = undefined;
+    try splitEqual(x, 2, 1, &halves, s);
+    defer for (halves) |p| {
+        _ = mlx.mlx_array_free(p);
+    };
+    const act = try siluA(halves[1], s);
+    defer _ = mlx.mlx_array_free(act);
+    const tail = try sliceRows(act, 74_898, rows, s);
+    defer _ = mlx.mlx_array_free(tail);
+    var ones = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ones);
+    try mlx.check(mlx.mlx_ones(&ones, &[_]c_int{ rows - 74_898, f }, 2, mlx.mlx_dtype.bfloat16, s));
+    const want = try siluA(ones, s);
+    defer _ = mlx.mlx_array_free(want);
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, tail, want, false, s));
+    try mlx.check(mlx.mlx_array_eval(eq));
+    var same = false;
+    try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+    try std.testing.expect(same);
+}
+
 test "minimax h3: DiT block matches the reference transcription" {
     // Hermetic: a 1.8 MB toy-geometry fixture with synthetic weights, from
     // tests/dump_minimax_h3_fixtures.py. See that file's header for exactly
@@ -7461,6 +7755,12 @@ test "minimax h3: resolveSpeed — turbo forces the recipe off, env still strong
     try testing.expectEqual(@as(u32, 2), c.bcast_k);
 }
 
+test "minimax h3: a Turbo file is held to the modules it ships, not to one exporter's list" {
+    try testing.expect(turboAttachComplete(Model.LORA_TARGETS, Model.LORA_TARGETS));
+    try testing.expect(turboAttachComplete(208, 208)); // Lightx2v: no AdaLN projections
+    try testing.expect(!turboAttachComplete(200, 208)); // ships modules this DiT does not have
+}
+
 test "minimax h3: audioStepFactor — exact mapped delta under turbo, first-order otherwise" {
     const sv = SIGMA_SHIFT_VIDEO; // 12
     const sa = SIGMA_SHIFT_AUDIO; // 3
@@ -7484,6 +7784,15 @@ test "minimax h3: audioStepFactor — exact mapped delta under turbo, first-orde
     const fine_exact = audioStepFactor(true, 0.5, 0.49, sv, sa);
     const fine_first = audioStepFactor(false, 0.5, 0.49, sv, sa);
     try testing.expect(@abs(fine_exact - fine_first) < @abs(fine_first) * 0.02);
+}
+
+test "minimax h3: a frame count near the u32 limit reaches the transport cap instead of overflowing" {
+    const max = std.math.maxInt(u32);
+    try testing.expectEqual(@as(u32, 22), alignFrameCount(18));
+    try testing.expectEqual(@as(u32, 22), alignFrameCount(22));
+    try testing.expectEqual(@as(u32, max), alignFrameCount(max - 3));
+    try testing.expect(chainDeliveredFrames(6, max, 0) > 1 << 24);
+    try testing.expect(temporalShape(max).frame_count >= 1 << 24);
 }
 
 test "minimax h3: chain math — delivered frames, overlap width, cross-fade seam" {
@@ -7668,12 +7977,12 @@ test "minimax h3: loraAdd sums every attached adapter onto the base output" {
 
     const shAT = [_]c_int{ 3, 2 };
     const shBT = [_]c_int{ 2, 4 };
-    const at = mlx.mlx_array_new_data(@constCast(@ptrCast(&AT)), &shAT, 2, f32t);
+    const at = mlx.mlx_array_new_data(@ptrCast(@constCast(&AT)), &shAT, 2, f32t);
     defer _ = mlx.mlx_array_free(at);
-    const bt = mlx.mlx_array_new_data(@constCast(@ptrCast(&BT)), &shBT, 2, f32t);
+    const bt = mlx.mlx_array_new_data(@ptrCast(@constCast(&BT)), &shBT, 2, f32t);
     defer _ = mlx.mlx_array_free(bt);
     const shX = [_]c_int{ 2, 3 };
-    const x = mlx.mlx_array_new_data(@constCast(@ptrCast(&X)), &shX, 2, f32t);
+    const x = mlx.mlx_array_new_data(@ptrCast(@constCast(&X)), &shX, 2, f32t);
     defer _ = mlx.mlx_array_free(x);
 
     // Turbo at 1.0 plus a style adapter at 0.5 — the stacking case, on the
@@ -7686,7 +7995,7 @@ test "minimax h3: loraAdd sums every attached adapter onto the base output" {
 
     const zbuf = [_]f32{ 0, 0, 0, 0, 0, 0, 0, 0 }; // zero base: the deltas alone come back
     const shZ = [_]c_int{ 2, 4 };
-    const zero = mlx.mlx_array_new_data(@constCast(@ptrCast(&zbuf)), &shZ, 2, f32t);
+    const zero = mlx.mlx_array_new_data(@ptrCast(@constCast(&zbuf)), &shZ, 2, f32t);
     const got = try loraAdd(zero, x, slot, s); // consumes `zero`
     defer _ = mlx.mlx_array_free(got);
     try mlx.check(mlx.mlx_array_eval(got));
@@ -7705,7 +8014,7 @@ test "minimax h3: loraAdd sums every attached adapter onto the base output" {
     // An empty slot is the identity — and returns the SAME handle, since the
     // no-adapter path must cost nothing on a 50-block DiT.
     const empty: LoraSlot = .{};
-    const base2 = mlx.mlx_array_new_data(@constCast(@ptrCast(&zbuf)), &shZ, 2, f32t);
+    const base2 = mlx.mlx_array_new_data(@ptrCast(@constCast(&zbuf)), &shZ, 2, f32t);
     defer _ = mlx.mlx_array_free(base2);
     const same = try loraAdd(base2, x, empty, s);
     try testing.expectEqual(base2.ctx, same.ctx);
@@ -7731,8 +8040,8 @@ test "minimax h3: an adapter file resolves to our own module names, dotted or fl
     const bv = [_]f32{ 0.5, 0.6, 0.7, 0.8 };
     const ash = [_]c_int{ 2, 2 };
     const bsh = [_]c_int{ 2, 2 };
-    const aarr = mlx.mlx_array_new_data(@constCast(@ptrCast(&av)), &ash, 2, mlx.mlx_dtype.float32);
-    const barr = mlx.mlx_array_new_data(@constCast(@ptrCast(&bv)), &bsh, 2, mlx.mlx_dtype.float32);
+    const aarr = mlx.mlx_array_new_data(@ptrCast(@constCast(&av)), &ash, 2, mlx.mlx_dtype.float32);
+    const barr = mlx.mlx_array_new_data(@ptrCast(@constCast(&bv)), &bsh, 2, mlx.mlx_dtype.float32);
     defer _ = mlx.mlx_array_free(aarr);
     defer _ = mlx.mlx_array_free(barr);
     // One module under the reference's own key shape (ComfyUI writes the

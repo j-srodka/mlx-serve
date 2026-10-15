@@ -460,7 +460,7 @@ final class LocalizationTests: XCTestCase {
 
         // Headers are uppercased AFTER the lookup, so the key is the source
         // spelling; `TTFT` and `n` are notation and stay Latin.
-        let headers = ["Rung", "Prompt", "Prefill", "Decode", "Ceiling", "TTFT", "Ctx", "n"]
+        let headers = ["Rung", "Prompt", "Prefill", "Decode", "Max", "Max decode", "TTFT", "Ctx", "n"]
 
         // One dictionary per chip branch, including the ds4 / llama.cpp
         // engines and the two drafter spellings.
@@ -664,6 +664,19 @@ final class LocalizationTests: XCTestCase {
             return XCTFail("\(pin) did not decide as unavailable: \(decision)")
         }
         assertResolves(reason, "unreachable model", values: [(pin, "%@")], keys: keys)
+    }
+
+    /// The Decisions pane's Clef copy. The choice example is one interpolated
+    /// literal, so its catalog key carries `%@`.
+    func testClefDecisionPaneCopyResolvesInTheCatalog() throws {
+        let keys = Set(try catalog().map(\.key))
+        assertResolves("Clef Decisions", "pane title", keys: keys)
+        assertResolves("Clef reads the state and all questions together, then scores their allowed options jointly. It returns probabilities for routing, triage, labeling and scoring.",
+                       "clef description", keys: keys)
+        assertResolves("Answers carry the chosen value and per-option `probabilities`; choice and score add a `confidence`.",
+                       "answer note", keys: keys)
+        assertResolves("**choice** picks one of your options.\n`%@`", "choice example", keys: keys)
+        assertResolves("Pick a decision model in Models → Downloaded and press Use.", "empty state", keys: keys)
     }
 
     private static func specs(_ text: String) -> [String] {

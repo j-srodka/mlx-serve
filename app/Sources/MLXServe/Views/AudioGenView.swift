@@ -2,14 +2,16 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-/// Audio generation window — two tabs over one window: **Voice** (neural TTS
-/// with zero-shot voice cloning, Qwen3-TTS) and **Music** (prompt-driven music
-/// generation, ACE-Step). Each tab is its own self-contained pane; this
-/// container only hosts the segmented switcher.
+/// Audio generation window — three tabs over one window: **Voice** (neural TTS
+/// with zero-shot voice cloning, Qwen3-TTS), **Music** (prompt-driven music
+/// generation, ACE-Step) and **Sound Effects** (text-to-audio, Stable Audio 3).
+/// Each tab is its own self-contained pane; this container only hosts the
+/// segmented switcher.
 struct AudioGenView: View {
     enum Tab: String, CaseIterable {
         case voice = "Voice"
         case music = "Music"
+        case sound = "Sound Effects"
     }
 
     /// The left menu's "Audio & Music" row must reopen on the tab you left it
@@ -29,13 +31,14 @@ struct AudioGenView: View {
             .pickerStyle(.segmented)
             .controlSize(.large)
             .labelsHidden()
-            .frame(width: 280)
+            .frame(width: 400)
             .padding(.top, 10)
             .padding(.bottom, 14).font(.app(.body))
 
             switch tab {
             case .voice: VoiceGenView()
             case .music: MusicGenView()
+            case .sound: SoundGenView()
             }
         }
     }
@@ -65,68 +68,33 @@ enum AudioSidecar {
 /// clicking a row plays it through the owning tab's player, replacing
 /// whatever was playing.
 struct AudioHistoryShelf: View {
-    let title: String
     let paths: [String]
     let playingPath: String?
+    var paused = false
     let onPlay: (String) -> Void
     let onStop: () -> Void
+    @AppStorage(InterfacePrefKey.audioPlayerStyle) private var style = AudioPlayerStyle.defaultStyle
 
     var body: some View {
         Group {
             if !paths.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(L10n.text(title)).font(.app(.caption).weight(.semibold)).foregroundStyle(.secondary)
-                    ScrollView {
-                        VStack(spacing: 2) {
-                            ForEach(paths, id: \.self) { path in
-                                row(path)
-                            }
+                Group {
+                    switch style {
+                    case .mlxAmp:
+                        MlxAmpStretched { width, _ in
+                            MlxAmpPlaylist(width: width, height: MlxAmpPlaylist.minHeight, paths: paths, current: playingPath,
+                                           onPlay: onPlay, onStop: onStop)
                         }
+                        .frame(height: MlxAmpPlaylist.minHeight * MlxAmpStyle.scale)
+                    case .modern:
+                        ModernPlaylist(paths: paths, current: playingPath, paused: paused, onPlay: onPlay, onStop: onStop)
+                            .frame(height: 300)
                     }
-                    .frame(maxHeight: 150)
                 }
+                .onAppear { AudioClipPlayer.shared.queue = paths }
+                .onChange(of: paths) { _, p in AudioClipPlayer.shared.queue = p }
             }
         }
-    }
-
-    private func row(_ path: String) -> some View {
-        let playing = playingPath == path
-        return HStack(spacing: 8) {
-            // The same glyph throughout — what says it is playing is that it
-            // MOVES, and a row that stopped has to look like the ones that
-            // never started.
-            Image(systemName: "waveform")
-                .foregroundStyle(playing ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
-                .symbolEffect(.variableColor.iterative.dimInactiveLayers.nonReversing,
-                              options: .repeat(.continuous), isActive: playing)
-                .frame(width: 16)
-            Text(URL(fileURLWithPath: path).lastPathComponent)
-                .font(.app(.caption))
-                .lineLimit(1).truncationMode(.middle)
-                .help(path)
-            Spacer()
-            Button {
-                playing ? onStop() : onPlay(path)
-            } label: {
-                Image(systemName: playing ? "stop.fill" : "play.fill")
-            }
-            .buttonStyle(.borderless)
-            .help(playing ? "Stop" : "Play")
-            Button {
-                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
-            } label: { Image(systemName: "folder") }
-            .buttonStyle(.borderless)
-            .foregroundStyle(.secondary)
-            .help("Reveal in Finder")
-        }
-        .padding(.vertical, 3)
-        .padding(.horizontal, 6)
-        .background(
-            RoundedRectangle(cornerRadius: 5)
-                .fill(playing ? Color.accentColor.opacity(0.12) : Color.clear)
-        )
-        .contentShape(Rectangle())
-        .onTapGesture { playing ? onStop() : onPlay(path) }
     }
 }
 
@@ -149,8 +117,6 @@ struct VoiceGenView: View {
     @EnvironmentObject var server: ServerManager
     @Environment(\.openWindow) private var openWindow
     @EnvironmentObject var downloads: DownloadManager
-    /// For "Send to Chat" — the hand-off opens a new conversation and switches
-    /// the window to it (`AppState.sendGeneratedMediaToNewChat`).
     @EnvironmentObject var appState: AppState
 
     @StateObject private var recorder = AudioRecorder()
@@ -204,10 +170,7 @@ struct VoiceGenView: View {
             // the picker (discovery lands seconds after the server boots).
             if server.status == .running { Task { await server.refreshModels() } }
         }
-        .onDisappear {
-            stopDictation()
-            stopPlayback()
-        }
+        .onDisappear { stopDictation() }
         .onChange(of: model) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: stickySnapshot) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: service.phase) { _, phase in
@@ -250,9 +213,9 @@ struct VoiceGenView: View {
             VStack(spacing: 12) {
                 previewArea
                 AudioHistoryShelf(
-                    title: "History",
                     paths: service.recent,
                     playingPath: clipPlayer.playingPath,
+                    paused: clipPlayer.isPaused,
                     onPlay: { play($0) },
                     onStop: { stopPlayback() }
                 )
@@ -306,7 +269,7 @@ struct VoiceGenView: View {
         Button { toggleDictation() } label: {
             HStack(spacing: 5) {
                 Image(systemName: dictating ? "microphone.fill" : "microphone")
-                Text(dictating ? "Listening…" : "Speak it")
+                Text(L10n.text(dictating ? "Listening…" : "Speak it"))
                 if dictating { Image(systemName: "stop.fill") }
             }
             .font(.app(.caption))

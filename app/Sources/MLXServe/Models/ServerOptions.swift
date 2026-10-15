@@ -1,17 +1,5 @@
 import Foundation
 
-/// All user-tunable mlx-serve options, persisted to UserDefaults as JSON.
-///
-/// Split into two groups:
-/// 1. Server-launch flags: passed on the `mlx-serve --serve` CLI; require a
-///    server restart to take effect.
-/// 2. Per-request defaults: injected into the JSON body of every chat request
-///    by APIClient; apply on the next request, no restart needed.
-///
-/// The Settings UI introspects these via the `serverFlagFields` /
-/// `requestDefaultFields` metadata to render labels, captions and the
-/// "needs restart" badge automatically — every option carries its own
-/// human-readable explainer.
 /// The voice backend for hands-free mode.
 enum VoiceEngine: String, Codable, CaseIterable, Sendable {
     /// macOS `AVSpeechSynthesizer`. No download, no GPU, but robotic.
@@ -97,10 +85,9 @@ struct ServerOptions: Codable, Equatable {
     /// auto-loads when present and models without one are unaffected, so
     /// `toCLIArgs` emits `--no-mtp` ONLY when the user turns it off.
     var enableMTP: Bool = true
-    /// How many tokens the MTP head drafts per round. `0` = auto, which is the
-    /// server's own default (`--mtp-depth 0` → the adaptive EV controller tunes
-    /// depth live from the measured acceptance rate). A fixed value is a
-    /// benchmarking lever; emitted only when non-zero.
+    /// Maximum tokens the MTP head drafts per round. `0` = auto: omit the
+    /// flag so the server tunes depth from measured acceptance. An explicit
+    /// value emits `--mtp-max-depth`; the planner may choose a lower depth.
     var mtpDepth: Int = 0
     /// Decode attention requant, TRI-STATE: nil = the server's own default
     /// (laguna-class dense attention requants ON, DeepSeek-V4's comp_in
@@ -146,13 +133,11 @@ struct ServerOptions: Codable, Equatable {
     /// KV-cache quantization scheme. `off` = dense bf16. `int4` / `int8` apply
     /// affine quant.
     var kvQuant: KVQuant = .off
-    /// Hot prefix cache entry count. >0 enables cross-request KV reuse for
-    /// shared system prompts. 0 disables. The launcher RAM-clamps the emitted
-    /// value via `ramCappedPrefixCacheEntries` — each entry on a hybrid SSM
-    /// model (Qwen 3.5/3.6, etc.) retains large per-position KV + conv/SSM
-    /// snapshots whose true footprint dwarfs the model, so an uncapped count
-    /// fills a 16 GB Mac and starves the context window. Default 8 suits
-    /// 32 GB+; a 16 GB Mac caps to 1.
+    /// Keep completed prefix snapshots in RAM for low-latency reuse. Turning this off keeps
+    /// the live request KV but retains reusable prefixes only on the SSD tier when enabled.
+    var hotPrefixCacheEnabled: Bool = true
+    /// Hot prefix cache entry count. Used only while RAM retention is enabled. The launcher
+    /// RAM-clamps the emitted value via `ramCappedPrefixCacheEntries`.
     var prefixCacheEntries: Int = 8
     /// Hot prefix cache memory budget. `2GB`, `512MB`, etc. `0` or `off`
     /// disables the byte cap (count cap still applies). Empty = server default
@@ -171,7 +156,7 @@ struct ServerOptions: Codable, Equatable {
     /// Disk budget when `enablePrefixCacheDisk` is on. `10GB`, `2GB`, etc.
     var prefixCacheDisk: String = "10GB"
     /// Registry residency cap (`--max-resident-mem`), in GiB. 0 = Auto, the
-    /// server's own default of 80% of the wired limit at startup. This is the
+    /// server's own default (the GPU working-set limit). This is the
     /// gate that decides whether a cold load is admitted AT ALL, and it runs
     /// BEFORE the memory pre-flight — so `skipMemPreflight` cannot overturn
     /// it, and without this field a model the auto cap refuses was unloadable
@@ -203,9 +188,8 @@ struct ServerOptions: Codable, Equatable {
     /// so a load it refuses often still fits — but a genuine over-commit can
     /// hard-crash the server, so this is opt-in.
     var skipMemPreflight: Bool = false
-    /// When false, launch with `--os-reserve-gib 0`: the server stops holding free RAM back for
-    /// macOS (an eighth of RAM, 2 to 8 GB) when it plans context and admits requests.
-    var osMemoryReserve: Bool = true
+    /// `--os-reserve-gib` in GiB; nil = the server's automatic reserve, 0 = none.
+    var osReserveGiB: Int? = nil
 
     // MARK: Engines
     /// `--mlx-gguf`. EXPERIMENTAL: lib/mlx-serve-gguf claims the `.gguf` files
@@ -220,14 +204,17 @@ struct ServerOptions: Codable, Equatable {
     /// some quality cost. Auto-enables flash-attn server-side when
     /// non-default.
     var llamaKvQuant: LlamaKVQuant = .off
-    /// Multi-session LRU size for the embedded llama.cpp engine. 1 keeps the
-    /// legacy single-session behavior (every flip between long-doc prompts
-    /// evicts the other). N > 1 keeps the N most-recently-used prompts hot in
-    /// independent KV contexts. Default 4 MUST match `server.zig`
-    /// `llama_cache_entries` — `toCLIArgs` omits the flag at this value, so a
-    /// mismatch would silently run the server's default instead (see the
-    /// "ServerOptions defaults must mirror the Zig server" gotcha in CLAUDE.md).
+    /// Sequences per llama.cpp model: requests decoded together in one batch,
+    /// each keeping its own prompt KV warm (and holding a full context of KV
+    /// from load). Default 4 MUST match `scheduler.zig` `LlamaSettings.seqs` —
+    /// `toCLIArgs` omits the flag at this value, so a mismatch would silently
+    /// run the server's default instead.
     var llamaCacheEntries: Int = 4
+    /// Draft tokens per MTP round for a GGUF with an MTP head (its own, or an
+    /// `mtp-*.gguf` beside it); 0 = off. Default 2 mirrors `LlamaSettings.mtp_drafts`.
+    var llamaMtpDrafts: Int = 2
+    /// llama.cpp prefill batch in tokens; 0 = libllama's default (512).
+    var llamaUbatch: Int = 0
 
     // MARK: ds4-only (DeepSeek-V4-Flash engine)
     /// When true, launch with `--ssd-streaming` so the embedded ds4 engine
@@ -329,6 +316,16 @@ struct ServerOptions: Codable, Equatable {
     /// `WakeWord.normalizePhrase` (blank → default). App-side like the other
     /// voice fields — never a server-launch flag.
     var wakePhrase: String = WakeWord.defaultPhrase
+
+    // MARK: Transcribe (app-level, like the voice fields: never a launch flag)
+    /// The chat model that writes a tray transcript's notes: a model path, ""
+    /// for the chat model in use, or `notesOff`.
+    var transcriptNotesModel: String = ""
+    static let notesOff = "off"
+    /// Minutes of silence after which a tray recording stops itself; 0 never.
+    var transcriptAutoStopMinutes: Int = 10
+    /// Start a tray recording when an app turns the camera on.
+    var transcriptAutoStartCamera: Bool = false
 
     enum LogLevel: String, Codable, CaseIterable, Identifiable {
         case error, warn, info, debug
@@ -512,6 +509,7 @@ struct ServerOptions: Codable, Equatable {
         aneAudio == other.aneAudio &&
         maxConcurrent == other.maxConcurrent &&
         kvQuant == other.kvQuant &&
+        hotPrefixCacheEnabled == other.hotPrefixCacheEnabled &&
         prefixCacheEntries == other.prefixCacheEntries &&
         prefixCacheMem == other.prefixCacheMem &&
         pleGpu == other.pleGpu &&
@@ -521,19 +519,14 @@ struct ServerOptions: Codable, Equatable {
         maxResidentModels == other.maxResidentModels &&
         idleEvictSecs == other.idleEvictSecs &&
         skipMemPreflight == other.skipMemPreflight &&
-        osMemoryReserve == other.osMemoryReserve &&
+        osReserveGiB == other.osReserveGiB &&
         llamaKvQuant == other.llamaKvQuant &&
         llamaCacheEntries == other.llamaCacheEntries &&
+        llamaMtpDrafts == other.llamaMtpDrafts &&
+        llamaUbatch == other.llamaUbatch &&
         ssdStreaming == other.ssdStreaming &&
         mlxGguf == other.mlxGguf &&
-        tokenizeCacheEntries == other.tokenizeCacheEntries &&
-        // Sampling defaults are ALSO launch flags (server-side defaults for
-        // clients that omit sampling, e.g. Claude Code) — changing them must
-        // trip the restart detector. The app's own chats still pick them up
-        // immediately via request bodies.
-        defaultTemperature == other.defaultTemperature &&
-        defaultTopP == other.defaultTopP &&
-        defaultTopK == other.defaultTopK
+        tokenizeCacheEntries == other.tokenizeCacheEntries
     }
 
     // MARK: CLI args builder
@@ -551,7 +544,7 @@ struct ServerOptions: Codable, Equatable {
     /// as resident memory climbs, the auto-context ceiling shrinks until
     /// prompts no longer fit ("Prompt exceeds maximum context length"). Capping
     /// the entry count is the reliable lever — the byte cap under-counts the
-    /// true retained allocation. An explicit 0 (disable) is preserved.
+    /// true retained allocation. Disabling RAM retention uses `hotPrefixCacheEnabled`.
     ///   ≤18 GB (16 GB Macs): 1   ≤36 GB (24/32 GB): 8   else: uncapped.
     /// Snap points for the model memory cap slider, in GiB. 0 is Auto and is
     /// always first. The ladder stops at the machine's RAM — a cap above it
@@ -560,6 +553,11 @@ struct ServerOptions: Codable, Equatable {
         let ram = Int(physicalMemoryBytes / 1_073_741_824)
         return [0] + [4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512]
             .filter { $0 <= max(ram, 8) }
+    }
+
+    /// Mirrors `server.osReserveBytes`: an eighth of RAM in GiB, never under 2 or over 8.
+    static func autoOsReserveGiB(physicalMemoryBytes: UInt64) -> Double {
+        min(max(Double(physicalMemoryBytes) / 8 / 1_073_741_824, 2), 8)
     }
 
     /// Snap points for the idle-eviction slider, in seconds. Off first; every
@@ -574,7 +572,7 @@ struct ServerOptions: Codable, Equatable {
     }
 
     static func ramCappedPrefixCacheEntries(_ requested: Int, physicalMemoryBytes: UInt64) -> Int {
-        if requested <= 0 { return requested }
+        let requested = max(requested, 1)
         let gib = physicalMemoryBytes / 1_073_741_824
         let ceiling: Int
         if gib <= 18 { ceiling = 1 }
@@ -662,7 +660,7 @@ struct ServerOptions: Codable, Equatable {
             args += ["--no-mtp"]
         }
         if mtpDepth > 0 {
-            args += ["--mtp-depth", "\(mtpDepth)"]
+            args += ["--mtp-max-depth", "\(mtpDepth)"]
         }
         // DSpark (DeepSeek-V4 draft stages): server default is OFF (opt-in —
         // the stages cost ~11 GB resident), so only ON emits.
@@ -698,6 +696,7 @@ struct ServerOptions: Codable, Equatable {
         // Macs. Emit the RAM-clamped value so the entry count stays bounded.
         let cappedEntries = Self.ramCappedPrefixCacheEntries(prefixCacheEntries, physicalMemoryBytes: physicalMemoryBytes)
         args += ["--prefix-cache-entries", "\(cappedEntries)"]
+        if !hotPrefixCacheEnabled { args += ["--no-prefix-cache-ram"] }
         // Empty leaves the size to the server; any value, the old "2GB" default included, is sent.
         let trimmedPrefixMem = prefixCacheMem.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedPrefixMem.isEmpty {
@@ -736,32 +735,26 @@ struct ServerOptions: Codable, Equatable {
         if llamaKvQuant != .off {
             args += ["--llama-kv-quant", llamaKvQuant.cliValue]
         }
-        if llamaCacheEntries != 4 {  // 4 = server default (server.zig llama_cache_entries)
+        if llamaCacheEntries != 4 {  // 4 = server default (LlamaSettings.seqs)
             args += ["--llama-cache-entries", "\(llamaCacheEntries)"]
+        }
+        if llamaMtpDrafts != 2 {  // 2 = server default (LlamaSettings.mtp_drafts)
+            args += ["--llama-mtp-drafts", "\(llamaMtpDrafts)"]
+        }
+        if llamaUbatch != 0 {
+            args += ["--llama-ubatch", "\(llamaUbatch)"]
         }
         // All-engines knob — applies to MLX, llama, and ds4 alike.
         if tokenizeCacheEntries != 4 {
             args += ["--tokenize-cache-entries", "\(tokenizeCacheEntries)"]
         }
-        // Sampling defaults double as server-launch flags so third-party
-        // clients that omit sampling params (Claude Code sends none at all)
-        // inherit the Settings values. Per-request body fields always win.
-        // Top-k 0 = "no opinion": OMIT the flag so the model's own
-        // generation_config.json recommendation (Qwen 3.6: 20, Gemma 4: 64)
-        // stays in effect rather than being force-disabled.
-        // %g: slider arithmetic leaves float dirt (0.8 - 0.1 stepped to
-        // 0.7000000000000001) that "\(Double)" would print verbatim into argv.
-        args += ["--temp", String(format: "%g", defaultTemperature)]
-        args += ["--top-p", String(format: "%g", defaultTopP)]
-        if defaultTopK > 0 {
-            args += ["--top-k", "\(defaultTopK)"]
-        }
+        // Generation defaults are read per request from generation-settings.json.
         // Opt-in escape hatch — omitted by default so the load pre-flight runs.
         if skipMemPreflight {
             args += ["--skip-mem-preflight"]
         }
-        if !osMemoryReserve {
-            args += ["--os-reserve-gib", "0"]
+        if let gib = osReserveGiB {
+            args += ["--os-reserve-gib", "\(gib)"]
         }
         // ds4-only opt-in: stream DeepSeek-V4-Flash experts from SSD. The MLX
         // and llama.cpp engines ignore the flag, so it's safe to leave in argv
@@ -853,6 +846,9 @@ extension ServerOptions {
     private enum LegacyDecodeAttnQuantKey: String, CodingKey {
         case decodeAttnQuant
     }
+    private enum LegacyOsMemoryReserveKey: String, CodingKey {
+        case osMemoryReserve
+    }
 
     init(from decoder: Decoder) throws {
         self.init()   // every property seeded with its default
@@ -898,18 +894,33 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .aneAudio) { aneAudio = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxConcurrent) { maxConcurrent = v }
         if let v = try c.decodeIfPresent(KVQuant.self, forKey: .kvQuant) { kvQuant = v }
-        if let v = try c.decodeIfPresent(Int.self, forKey: .prefixCacheEntries) { prefixCacheEntries = v }
+        let storedPrefixEntries = try c.decodeIfPresent(Int.self, forKey: .prefixCacheEntries)
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .hotPrefixCacheEnabled) {
+            hotPrefixCacheEnabled = v
+        } else if storedPrefixEntries == 0 {
+            hotPrefixCacheEnabled = false
+        }
+        if let v = storedPrefixEntries { prefixCacheEntries = max(v, 1) }
         if let v = try c.decodeIfPresent(String.self, forKey: .prefixCacheMem) { prefixCacheMem = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .pleGpu) { pleGpu = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enablePrefixCacheDisk) { enablePrefixCacheDisk = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .prefixCacheDisk) { prefixCacheDisk = v }
+        if !c.contains(.hotPrefixCacheEnabled) && storedPrefixEntries == 0 { enablePrefixCacheDisk = false }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxResidentMemGB) { maxResidentMemGB = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxResidentModels) { maxResidentModels = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .idleEvictSecs) { idleEvictSecs = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .skipMemPreflight) { skipMemPreflight = v }
-        if let v = try c.decodeIfPresent(Bool.self, forKey: .osMemoryReserve) { osMemoryReserve = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .osReserveGiB) {
+            osReserveGiB = v
+        } else if try decoder.container(keyedBy: LegacyOsMemoryReserveKey.self)
+            .decodeIfPresent(Bool.self, forKey: .osMemoryReserve) == false
+        {
+            osReserveGiB = 0
+        }
         if let v = try c.decodeIfPresent(LlamaKVQuant.self, forKey: .llamaKvQuant) { llamaKvQuant = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .llamaCacheEntries) { llamaCacheEntries = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .llamaMtpDrafts) { llamaMtpDrafts = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .llamaUbatch) { llamaUbatch = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .ssdStreaming) { ssdStreaming = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .mlxGguf) { mlxGguf = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .tokenizeCacheEntries) { tokenizeCacheEntries = v }
@@ -939,6 +950,9 @@ extension ServerOptions {
         }
         if let v = try c.decodeIfPresent(String.self, forKey: .kokoroVoice) { kokoroVoice = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .wakePhrase) { wakePhrase = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .transcriptNotesModel) { transcriptNotesModel = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .transcriptAutoStopMinutes) { transcriptAutoStopMinutes = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .transcriptAutoStartCamera) { transcriptAutoStartCamera = v }
     }
 }
 
@@ -1013,11 +1027,11 @@ extension ServerOptions {
     static let serverFlagFields: [String: ServerOptionField] = [
         "host": .init(
             title: "Host",
-            explainer: "Bind address. 0.0.0.0 lets other devices on your network reach the server; 127.0.0.1 is local-only. The app itself connects via 127.0.0.1, so pick an address that includes localhost.",
+            explainer: "0.0.0.0 lets other devices on your network connect; 127.0.0.1 keeps the server on this Mac.",
             needsRestart: true),
         "port": .init(
             title: "Port",
-            explainer: "HTTP port the server listens on (default 11234). Change if it conflicts with another local service.",
+            explainer: "The port the server listens on; change it only if another app uses it.",
             needsRestart: true),
         "ctxSize": .init(
             title: "Context size",
@@ -1025,208 +1039,177 @@ extension ServerOptions {
             needsRestart: true),
         "noVision": .init(
             title: "Disable vision",
-            explainer: "Skip loading the SigLIP image encoder. Saves ~3 GB of memory on text-only workloads.",
+            explainer: "Skip loading image support to save about 3 GB of memory.",
             needsRestart: true),
         "logLevel": .init(
             title: "Log level",
-            explainer: "Server log verbosity. Use 'debug' to capture Jinja errors, KV cache hits and per-request token counts.",
+            explainer: "How much detail goes into the server log; use debug when troubleshooting.",
             needsRestart: true),
         "logToFile": .init(
             title: "Log to file",
-            explainer: "Write the server log to ~/.mlx-serve/logs/mlx-serve-<port>.log (32 MB rotation, one file per port). This is the file to check after a crash — the in-app log viewer only holds what arrived while the app was running.",
+            explainer: "Save the server log to ~/.mlx-serve/logs so you can check it after a crash.",
             needsRestart: true),
         "requestTimeout": .init(
             title: "Request timeout (s)",
-            explainer: "Max seconds a single HTTP request is allowed to take. 0 = unlimited. Long agent loops may need 600+.",
+            explainer: "How long one request may run, in seconds; 0 means no limit.",
             needsRestart: true),
         "enableMetrics": .init(
             title: "Metrics panel",
-            explainer: "Expose Prometheus metrics at /metrics and a live throughput/latency/GPU/memory panel on the server index page. Zero cost when off.",
+            explainer: "Show live speed and memory charts on the server's web page.",
             needsRestart: true),
         "apiKey": .init(
             title: "API key",
-            explainer: "Require this key for requests from OTHER machines (the OpenAI/Anthropic/Ollama APIs + index page + metrics). Sent as Authorization: Bearer, x-api-key, HTTP Basic, or ?api_key=. Localhost is trusted, so this app never needs it — it protects the server when exposed on the network. Blank = no auth.",
+            explainer: "A key other devices must send to use this server; this Mac never needs it.",
             needsRestart: true),
         "lanShareEnabled": .init(
             title: "Share my models on this network",
-            explainer: "Advertise this Mac over Bonjour and let other Macs on your local network run inference on the models you share below. Only inference is exposed — model management, metrics, and the status page stay private to this Mac.",
+            explainer: "Let other Macs on your network use the models you share.",
             needsRestart: true),
         "lanShareAll": .init(
             title: "Share all models",
-            explainer: "Share everything in your library (chat AND image/audio/video/3D). Turn off to pick individual models.",
+            explainer: "Share every model, or turn off to choose which ones.",
             needsRestart: true),
         "lanName": .init(
             title: "Shown to others as",
-            explainer: "The name other Macs see next to your shared models. Blank = this Mac's hostname.",
+            explainer: "The name other Macs see; leave blank to use this Mac's name.",
             needsRestart: true),
         "lanDiscoverEnabled": .init(
             title: "Use models shared by other Macs",
-            explainer: "Discover models other mlx-serve hosts share on this network. They appear in the model pickers as \u{201C}model · peer\u{201D} and run on the hosting Mac — nothing to download.",
+            explainer: "Show models other Macs share, which run on their Mac.",
             needsRestart: true),
         "toolAutocorrect": .init(
             title: "Tool-call auto-correct",
-            explainer: "Coerce tool-call arguments to the types the tool schema declares (e.g. a model sending Python's \"False\" or a list-as-string) so strict clients like Claude Code stop rejecting them with \"expected boolean, provided string\". Recommended on. Turn off to pass the model's arguments through exactly as written.",
+            explainer: "Fix tool-call arguments that don't match the types the tool expects.",
             needsRestart: true),
         "enableMTP": .init(
             title: "Multi-Token Prediction (recommended)",
-            explainer: "Qwen 3.5 / 3.8 models that ship a trained MTP head guess several of the next tokens at once and check them all in a single pass — typically a big speed-up on replies, with output identical to normal decoding. It switches on by itself for models that have the head, and does nothing for models that don't, so there's rarely a reason to turn it off.",
+            explainer: "Makes supported Qwen models reply faster with the same output.",
             needsRestart: true),
         "mtpDepth": .init(
             title: "Tokens guessed ahead",
-            explainer: "How many tokens the MTP head guesses per step. Automatic (recommended) tunes this live — it guesses deeper while the model keeps accepting the guesses and backs off when it doesn't. Pick a fixed number only if you're measuring performance.",
+            explainer: "How far ahead MTP guesses; Automatic adjusts it as it goes.",
             needsRestart: true),
         "enableDSpark": .init(
             title: "DSpark draft stages (DeepSeek‑V4)",
-            explainer: "DeepSeek‑V4‑Flash ships its own 3‑stage speculative draft (DSpark). Enabling it loads about 11 GB of extra draft weights at startup, so it stays off unless you turn it on — and the server still refuses when the Mac doesn't have the memory for model + draft + working room, serving normally instead. For DeepSeek‑V4 GGUF files this arms the embedded ds4 engine's DSpark runtime instead, using the DSpark support GGUF downloaded beside the model (nothing happens without that file). Only affects DeepSeek‑V4 models; greedy (temperature 0) requests only.",
+            explainer: "Faster DeepSeek-V4 replies for about 11 GB of extra memory.",
             needsRestart: true),
         "anePrefill": .init(
             title: "Neural Engine prefill boost",
-            explainer: "Runs part of long-prompt processing on the Apple Neural Engine in parallel with the GPU, so big prompts start answering sooner — measured 19–26% faster prompt processing at 16k–32k tokens on an M4 Max with Qwen family models (4, 6 and 8-bit builds alike). Reply speed is unchanged. The server checks the exact fit at load and declines by name when this Mac can't hold it. First load of a model adds a one-time compile of about 1–2 minutes. Models it can't accelerate simply serve normally. Not recommended on M5-family Macs yet: their GPUs carry neural accelerator (NAX) cores that already speed up prompt processing, so the Neural Engine's extra help shrinks to little or nothing there.",
+            explainer: "Read long prompts faster with the Neural Engine (little gain on M5 Macs); the server declines if this Mac can't fit it.",
             needsRestart: true,
             cost: "Memory: about 1 GB more for a small model, up to 11 GB for a 27B. Disk: roughly as much again for its compiled copy."),
         "aneImage": .init(
             title: "Neural Engine image boost",
-            explainer: "Runs part of image generation on the Neural Engine alongside the GPU. Measured 1.30x on an M4 Max and 1.77x on an M1 Pro with Krea — smaller Macs gain more, since every Mac has the same 16-core Neural Engine and only the GPU scales. The split is solved per Mac and model at the first request, which adds a one-time compile of about a minute. Off by default; the server declines by name when this Mac cannot hold it.",
+            explainer: "Generate images faster with the Neural Engine; off by default, and the server declines if this Mac can't fit it.",
             needsRestart: true,
             cost: "Memory: 5–7 GB more while Krea is loaded, plus up to 4 GB during the one-time build. Disk: 3.5–6.6 GB once; every image size shares it."),
         "aneVideo": .init(
             title: "Neural Engine video boost",
-            explainer: "Runs part of video generation on the Neural Engine alongside the GPU. Measured 1.22x per denoise step on an M4 Max with MiniMax-H3. The split is solved per Mac and model; H3 rebuilds it per request (about 30 s cold, 8 s warm), so it pays on long renders. Blocks that carry a LoRA (the Turbo recipe) stay on the GPU. Off by default; the server declines by name when this Mac cannot hold it.",
+            explainer: "Generate videos faster with the Neural Engine; off by default, and the server declines if this Mac can't fit it.",
             needsRestart: true,
             cost: "Memory: 7–10 GB more while MiniMax-H3 is loaded, plus up to 3.6 GB while it builds, on every request. Disk: 5–9 GB once; every resolution and frame count shares it."),
         "aneAudio": .init(
             title: "Neural Engine music boost",
-            explainer: "Runs part of music generation on the Neural Engine alongside the GPU. Measured 1.33x on an M4 Max, 1.58x on an M4 base — smaller Macs gain more, since every Mac has the same 16-core Neural Engine and only the GPU scales. Off by default; the server declines by name when this Mac cannot hold it.",
+            explainer: "Generate music faster with the Neural Engine; off by default, and the server declines if this Mac can't fit it.",
             needsRestart: true,
             cost: "Memory: 1.5–2 GB more while ACE-Step is loaded, plus up to 2.5 GB during the one-time build. Disk: 1–2 GB once; every song length shares it."),
         "enablePLD": .init(
             title: "Enable PLD (recommended)",
-            explainer: "Prompt Lookup Decoding. Big wins on echo-heavy workloads (code editing, RAG, agent loops). The adaptive prompt-time gate auto-disables it on novel content. On models with a native MTP head, MTP takes priority and PLD stays dormant — except MoE models (e.g. 35B-A3B), where PLD is the default speedup.",
+            explainer: "Speeds up replies that repeat text from the conversation, like code edits.",
             needsRestart: true),
         "pldDraftLen": .init(
             title: "PLD draft length",
-            explainer: "Maximum draft tokens proposed per PLD step (default 5). Higher = bigger speedup when matches hit, more wasted work when they miss.",
+            explainer: "How many tokens to copy ahead with each guess.",
             needsRestart: true),
         "pldKeyLen": .init(
             title: "PLD key length",
-            explainer: "N-gram match key length for PLD lookup (default 3). Shorter keys = more matches, lower precision.",
+            explainer: "How many matching tokens it takes to start a guess.",
             needsRestart: true),
         "maxConcurrent": .init(
             title: "Concurrent requests",
-            explainer: "Queue depth for in-flight chat requests. Concurrent requests always decode together; whether they share one forward pass depends on the loaded model (shown below). Dense and Qwen3.5/3.8 models batch, other MoE and hybrid models take turns.",
+            explainer: "How many requests the server works on at once.",
             needsRestart: true),
         "decodeAttnQuant": .init(
             title: "Fast decode for bf16-attention models (recommended)",
-            explainer: "Serves decode from quantized copies of attention weights that ship un-quantized (bf16): 8-bit for most layers, 4-bit for the last fifth, where quantization error matters far less. Models like poolside Laguna decode ~25% faster overall. Slightly lossy: replies can differ in wording from the exact bf16 decode, but measured answers stay the same quality (prompt reading and speculative checks keep the exact weights). Flipping this ON (rather than leaving it untouched) also enables DeepSeek-V4's compressor-input requant — ~7% faster decode there, with rare wording-level artifacts. Models with fully quantized attention are unaffected. Turn off for bit-exact bf16 decoding.",
+            explainer: "Faster replies on models with unquantized attention, with slightly different wording.",
             needsRestart: true),
         "kvQuant": .init(
             title: "KV cache quantization",
-            explainer: "A memory-for-speed trade, not a free upgrade: shrinks KV-cache RAM (8-bit ≈ 2× smaller, 4-bit ≈ 4×) but makes decode ~10% slower at typical contexts — and slower still on long ones, since every generated token pays a dequantize step. Turn on when memory is the constraint (long contexts or big models on a 16 GB Mac); leave OFF for maximum tokens/sec if you have plenty of RAM.",
+            explainer: "Uses less memory for long chats but replies about 10% slower, so leave it off if you have plenty of memory.",
+            needsRestart: true),
+        "hotPrefixCacheEnabled": .init(
+            title: "Hot prefix cache",
+            explainer: "Keep recent conversations in memory so follow-ups start faster.",
             needsRestart: true),
         "prefixCacheEntries": .init(
             title: "Prefix cache entries",
-            explainer: "Hot prefix cache size: how many separate KV snapshots to keep across requests. Lets multi-turn chats skip re-prefilling shared system prompts. 0 disables. Auto-capped on RAM-limited Macs (a 16 GB Mac caps to 1) — on hybrid SSM models each entry pins large KV + state snapshots that can otherwise fill memory.",
+            explainer: "How many conversations to keep in memory.",
             needsRestart: true),
         "prefixCacheMem": .init(
             title: "Prefix cache memory cap",
-            explainer: "Maximum RAM for the prefix cache. Accepts '2GB', '512MB', '0' (disable byte cap). Empty = Auto: 2GB, or enough for one full-length conversation on long-context hybrid models, so their longest chats restore instead of re-reading the tail.",
+            explainer: "The most memory the conversation cache may use; leave blank to choose automatically.",
             needsRestart: true),
         "pleGpu": .init(
             title: "Keep n-gram table in memory (Qwen3.8-Flash-Next)",
-            explainer: "Qwen3.8-Flash-Next looks up rows in a ~30 GB n-gram table on every token. Off (default): the table stays on disk and only the rows a prompt needs are read, so it costs almost no memory. On: the whole table is loaded into GPU memory beside the weights, for a few percent faster prompt processing and up to ~15% faster replies at long context. On a Mac without ~30 GB to spare, the first request after a load can stall for a minute or more while the table is pulled in. Other models ignore this setting.",
+            explainer: "Faster long-context Qwen3.8 Flash Next replies for about 30 GB of extra memory.",
             needsRestart: true,
             cost: "Memory: about 30 GB more while Qwen3.8-Flash-Next is loaded."),
         "enablePrefixCacheDisk": .init(
             title: "SSD prefix cache",
-            explainer: "Persist seen KV prefixes to disk (~/.mlx-serve/kv-cache) so they survive restarts + RAM evictions — turns a cold 30-50s long-context first-token wait into a fast SSD read. OFF by default because it can use many gigabytes of disk.",
+            explainer: "Save conversations to disk so they pick up quickly after a restart.",
             needsRestart: true),
         "prefixCacheDisk": .init(
             title: "SSD cache size",
-            explainer: "Disk budget for the SSD prefix cache when enabled. Accepts '10GB', '2GB', etc. LRU-evicted to this cap. Only used when 'SSD prefix cache' is on.",
+            explainer: "The most disk space the SSD cache may use.",
             needsRestart: true),
         "maxResidentMemGB": .init(
             title: "Model memory cap",
-            explainer: "Total RAM the server will hold in loaded models before it evicts one — or refuses the load when there is nothing to evict. Auto = 80% of what Metal recommends for this Mac. Raise it when a model you know fits is refused with \"not enough memory\" on an idle server; the refusal in the log names the estimate it used. Passes --max-resident-mem.",
+            explainer: "The most memory loaded models may use before one is unloaded.",
             needsRestart: true),
         "maxResidentModels": .init(
             title: "Max models loaded at once",
-            explainer: "How many models the server keeps resident before it evicts the least-recently-used one to make room for the next. Switching models in the composer's picker never explicitly unloads the old one — it relies on this cap. Set to 1 so every switch unloads the previous model first, freeing its memory immediately. Passes --max-resident-models.",
+            explainer: "How many models stay loaded before the oldest is unloaded.",
             needsRestart: true),
         "idleEvictSecs": .init(
             title: "Unload idle models",
-            explainer: "Free a model's memory once it has served nothing for this long; the next request reloads it. Off by default. Turn it on when something else needs the RAM between sessions. The trade is paid on the next request: a cold load (seconds to a minute for a large model) plus a full re-prefill of the conversation, and if the memory is gone by then the reload is refused and that request fails. A model with a request in flight is never evicted. Passes --idle-evict-secs.",
+            explainer: "Unload a model after it sits unused this long; your next message reloads it.",
             needsRestart: true),
-        "osMemoryReserve": .init(
+        "osReserveGiB": .init(
             title: "Keep a memory reserve for macOS",
-            explainer: "The server leaves an eighth of your RAM (2 to 8 GB) out of its plans so macOS always has room. Turning this off gives models more context and admits more requests at once, but on a small Mac under heavy load it can freeze or restart the machine. Leave it on unless you know the load fits.",
+            explainer: "Memory kept free for macOS and your other apps.",
             needsRestart: true),
         "skipMemPreflight": .init(
             title: "Skip memory pre-flight check",
-            explainer: "Bypass the safety check that refuses to load an MLX model when free RAM looks too low for its weights plus warmup headroom. The check is conservative — macOS reclaims file cache as the model loads — so turn this on if a load you know fits is being refused. A genuine over-commit can hard-crash the server. Passes --skip-mem-preflight.",
+            explainer: "Load models even when memory looks too low, which can crash the server.",
             needsRestart: true),
         "mlxGguf": .init(
             title: "Serve GGUF files on MLX (experimental)",
-            explainer: "Let mlx-serve-gguf serve the .gguf files it supports on MLX itself, with the MLX prefix cache and spec decode, instead of handing every .gguf to llama.cpp. Files it cannot serve still go to llama.cpp or ds4. Experimental: turn it off if a GGUF model misbehaves. Passes --mlx-gguf.",
+            explainer: "Run supported .gguf files on the MLX engine instead of llama.cpp (experimental).",
             needsRestart: true),
         "llamaKvQuant": .init(
             title: "KV cache quantization",
-            explainer: "llama.cpp's KV-quant scheme (ggml Q8_0 / Q4_0). Same trade as the MLX version: less KV RAM, slower decode — leave off for maximum tokens/sec if you have plenty of RAM. Distinct kernels from the MLX KV-quant; auto-enables flash-attn on the server side when non-default.",
+            explainer: "Uses less memory for llama.cpp models but replies slower, so leave it off if you have plenty of memory.",
             needsRestart: true),
         "llamaCacheEntries": .init(
-            title: "Session cache entries",
-            explainer: "How many independent llama.cpp KV contexts to keep resident. 1 = legacy single-session (every flip between long prompts evicts the other). >1 keeps the N most-recently-used prompts hot — alternating multi-doc workloads stop cold-prefilling on every flip.",
+            title: "Parallel sequences",
+            explainer: "How many requests llama.cpp answers at once, each with its own memory.",
+            needsRestart: true),
+        "llamaMtpDrafts": .init(
+            title: "MTP draft tokens",
+            explainer: "How many tokens to guess ahead for GGUF models with an MTP head; 0 turns it off.",
+            needsRestart: true),
+        "llamaUbatch": .init(
+            title: "Prefill batch size",
+            explainer: "How much of a prompt llama.cpp reads at a time; larger is faster but uses more memory.",
             needsRestart: true),
         "ssdStreaming": .init(
             title: "SSD weight streaming",
-            explainer: "Stream DeepSeek-V4-Flash expert weights from SSD instead of holding the whole model in RAM (skips full residency + warmup). Turn on when the model is larger than available memory — it loads instead of OOMing, trading some decode speed for the disk reads. ds4 / DeepSeek-V4-Flash only; ignored by the MLX and llama.cpp engines. Passes --ssd-streaming.",
+            explainer: "Read DeepSeek-V4-Flash from disk so it runs, a bit slower, on Macs with less memory.",
             needsRestart: true),
         "tokenizeCacheEntries": .init(
             title: "Tokenize cache entries",
-            explainer: "Per-LoadedModel LRU of chat-template render+tokenize results. Skips re-rendering identical message lists on warm reuse — drops warm tokenize_ms from ~240 ms to ~0 on long-prompt repeats. Applies to all engines. 0 disables.",
+            explainer: "Remember recent prompts so repeats start faster; 0 turns it off.",
             needsRestart: true),
     ]
 
-    /// Human-readable metadata for the per-request defaults.
-    static let requestDefaultFields: [String: ServerOptionField] = [
-        "defaultMaxTokens": .init(
-            title: "Max tokens",
-            explainer: "Max tokens to generate per chat turn. \"Auto\" pegs it to the remaining context window — the safe choice on a small-RAM / small-context machine. Per-message overrides win when set.",
-            needsRestart: false),
-        "defaultTemperature": .init(
-            title: "Temperature",
-            explainer: "0 = deterministic greedy. 0.6–1.0 typical chat. Above 1.0 gets erratic. Applies to the app's chats immediately; also becomes the server default for external clients that omit temperature (Claude Code) after a restart.",
-            needsRestart: true),
-        "defaultTopP": .init(
-            title: "Top-p",
-            explainer: "Nucleus sampling threshold. 0.95 keeps all but the long tail. 1.0 disables top-p filtering. Also the server default for external clients that omit top_p (restart needed for that part).",
-            needsRestart: true),
-        "defaultTopK": .init(
-            title: "Top-k",
-            explainer: "Cap on candidate tokens per step. 0 = follow the model's own recommendation from generation_config.json (Qwen 3.6: 20, Gemma 4: 64); explicit values override it server-wide after a restart.",
-            needsRestart: true),
-        "defaultRepeatPenalty": .init(
-            title: "Repetition penalty",
-            explainer: "Penalty multiplier for tokens already in the context. 1.0 = none. 1.1 is a typical anti-repeat setting.",
-            needsRestart: false),
-        "defaultPresencePenalty": .init(
-            title: "Presence penalty",
-            explainer: "Additive penalty per token already present in the context. 0 = none.",
-            needsRestart: false),
-        "defaultReasoningBudget": .init(
-            title: "Reasoning budget",
-            explainer: "Max thinking tokens per request. -1 = unlimited. Only applies when thinking is enabled.",
-            needsRestart: false),
-        "defaultEnableThinking": .init(
-            title: "Enable thinking",
-            explainer: "Default the chat client to send `enable_thinking: true`. Only models with reasoning support honor this.",
-            needsRestart: false),
-        "perRequestEnablePLD": .init(
-            title: "Per-request PLD",
-            explainer: "Auto = follow the server's --pld setting (and the adaptive gate). On/Off forces it.",
-            needsRestart: false),
-        "perRequestEnableDrafter": .init(
-            title: "Per-request drafter",
-            explainer: "Auto = follow the server. On/Off forces it. Only meaningful when --drafter is loaded.",
-            needsRestart: false),
-    ]
 }

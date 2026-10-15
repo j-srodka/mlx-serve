@@ -89,6 +89,56 @@ req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"stop\":[\"\"
 [[ -n "$(echo "$BODY" | J 'd["choices"][0]["message"]["content"]')" ]] && ok "empty stop entry in an array is ignored" || bad "empty stop entry in an array" "$(echo "$BODY" | head -c 160)"
 req POST /v1/messages "{\"model\":\"m\",\"max_tokens\":60,\"stop_sequences\":[\"four\"],\"messages\":[$CNT],\"temperature\":0}"
 [[ "$(echo "$BODY" | J 'd["stop_reason"]')" == stop_sequence && "$(echo "$BODY" | J 'd["stop_sequence"]')" == four ]] && ok "/v1/messages echoes the matched stop_sequence" || bad "/v1/messages stop_sequence echo" "$(echo "$BODY" | head -c 160)"
+# A stop string spanning tokens: the stream sends the same bytes as the reply, both when it
+# matches and when a reply ENDS on a prefix of it (the held tail must still go out).
+cat > "$WORK/stop_stream.py" <<'PY'
+import json, sys, urllib.request
+BASE = sys.argv[1]
+def post(path, body):
+    req = urllib.request.Request(BASE + path, json.dumps(body).encode(), {"Content-Type": "application/json"})
+    return urllib.request.urlopen(req, timeout=120)
+def events(r):
+    for line in r:
+        line = line.decode().strip()
+        if line.startswith("data: {"):
+            yield json.loads(line[6:])
+COUNT = "Count from 1 to 30, separated by commas and spaces. Output only the numbers."
+def chat(stop, stream):
+    body = {"model": "m", "messages": [{"role": "user", "content": COUNT}], "max_tokens": 200, "temperature": 0,
+            "chat_template_kwargs": {"enable_thinking": False}, "stop": [stop], "stream": stream}
+    r = post("/v1/chat/completions", body)
+    if not stream:
+        return json.load(r)["choices"][0]["message"]["content"]
+    return "".join((c.get("delta") or {}).get("content") or "" for d in events(r) for c in d.get("choices", []))
+def completions(stop, stream):
+    body = {"model": "m", "prompt": "1, 2, 3, 4, 5, 6, 7, 8,", "max_tokens": 40, "temperature": 0, "stop": [stop], "stream": stream}
+    r = post("/v1/completions", body)
+    if not stream:
+        return json.load(r)["choices"][0]["text"]
+    return "".join(c.get("text") or "" for d in events(r) for c in d.get("choices", []))
+def messages(stop, stream):
+    body = {"model": "m", "messages": [{"role": "user", "content": COUNT}], "max_tokens": 200, "temperature": 0,
+            "thinking": {"type": "disabled"}, "stop_sequences": [stop], "stream": stream}
+    r = post("/v1/messages", body)
+    if not stream:
+        return "".join(b.get("text", "") for b in json.load(r)["content"] if b["type"] == "text")
+    return "".join((d.get("delta") or {}).get("text") or "" for d in events(r) if d.get("type") == "content_block_delta")
+def responses(stop, stream):
+    body = {"model": "m", "input": COUNT, "max_output_tokens": 200, "temperature": 0, "reasoning": {"effort": "none"},
+            "stop": [stop], "stream": stream}
+    r = post("/v1/responses", body)
+    if not stream:
+        return "".join(c["text"] for o in json.load(r)["output"] if o["type"] == "message" for c in o["content"] if c["type"] == "output_text")
+    return "".join(d.get("delta") or "" for d in events(r) if d.get("type") == "response.output_text.delta")
+for name, call in (("chat", chat), ("completions", completions), ("messages", messages), ("responses", responses)):
+    for stop, what in ((", 12", "a matching multi-token stop"), (", 30x", "a reply ending on a stop prefix")):
+        ns, st = call(stop, False), call(stop, True)
+        print(f"{'ok' if ns and ns == st else 'bad'}|{name}: stream == non-stream with {what} ({st[-12:]!r} vs {ns[-12:]!r})")
+PY
+python3 "$WORK/stop_stream.py" "$BASE" > "$WORK/stop_stream.out" 2>&1 || bad "stop stream script" "$(tail -3 "$WORK/stop_stream.out")"
+while IFS='|' read -r verdict name; do
+    case "$verdict" in ok) ok "$name" ;; bad) bad "$name" ;; esac
+done < "$WORK/stop_stream.out"
 
 echo "=== ignore_eos ==="
 # vLLM contract: with ignore_eos the reply runs to max_tokens even though the
@@ -100,6 +150,12 @@ FR=$(echo "$BODY" | J 'd["choices"][0]["finish_reason"]'); NT=$(echo "$BODY" | J
 req POST /v1/completions "{\"model\":\"m\",\"prompt\":\"The capital of France is\",\"max_tokens\":32,\"temperature\":0,\"ignore_eos\":true}"
 FR=$(echo "$BODY" | J 'd["choices"][0]["finish_reason"]'); NT=$(echo "$BODY" | J 'd["usage"]["completion_tokens"]')
 [[ "$FR" == length && "$NT" == 32 ]] && ok "ignore_eos on /v1/completions runs to max_tokens" || bad "ignore_eos completions" "fr=$FR tokens=$NT"
+# /v1/completions usage is chat completions' shape: prompt_tokens_details.cached_tokens, streamed or not.
+CT=$(echo "$BODY" | J 'd["usage"]["prompt_tokens_details"]["cached_tokens"]')
+[[ "$CT" =~ ^[0-9]+$ ]] && ok "/v1/completions usage carries cached_tokens" || bad "/v1/completions cached_tokens" "$(echo "$BODY" | head -c 200)"
+CT=$(curl -s -m 120 -X POST "$BASE/v1/completions" -H 'Content-Type: application/json' --data-binary '{"model":"m","prompt":"The capital of France is","max_tokens":8,"temperature":0,"stream":true,"stream_options":{"include_usage":true}}' \
+    | python3 -c 'import sys,json; print(next(json.loads(l[6:])["usage"]["prompt_tokens_details"]["cached_tokens"] for l in sys.stdin if l.startswith("data: {") and "\"usage\"" in l))' 2>/dev/null)
+[[ "$CT" =~ ^[0-9]+$ ]] && ok "/v1/completions streamed usage carries cached_tokens" || bad "/v1/completions streamed cached_tokens" "got '$CT'"
 req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"max_tokens\":32,\"temperature\":0}"
 FR=$(echo "$BODY" | J 'd["choices"][0]["finish_reason"]'); NT=$(echo "$BODY" | J 'd["usage"]["completion_tokens"]')
 [[ "$FR" == stop && "$NT" -lt 32 ]] && ok "without ignore_eos, EOS still stops early" || bad "eos still stops" "fr=$FR tokens=$NT"
@@ -128,6 +184,12 @@ expect_status 400 "chat: undecodable image_url refused"
 req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":[$IMG_HTTP]}],\"max_tokens\":5}"
 expect_status 400 "chat: remote image URL refused by name"
 [[ "$(echo "$BODY" | J 'd["error"]["message"]')" == *"remote URLs are not fetched"* ]] && ok "chat: refusal names the cause" || bad "chat: refusal names the cause" "$(echo "$BODY" | head -c 160)"
+# the bare-string image_url is read as the URL, and a part with no URL is refused, never dropped
+req POST /v1/chat/completions '{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"what"},{"type":"image_url","image_url":"http://127.0.0.1:1/x.png"}]}],"max_tokens":5}'
+expect_status 400 "chat: a bare-string image_url is read as the URL"
+[[ "$(echo "$BODY" | J 'd["error"]["message"]')" == *"remote URLs are not fetched"* ]] && ok "chat: bare-string refusal names the cause" || bad "chat: bare-string refusal names the cause" "$(echo "$BODY" | head -c 160)"
+req POST /v1/chat/completions '{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"what"},{"type":"image_url","image_url":{"href":"x"}}]}],"max_tokens":5}'
+expect_status 400 "chat: an image_url part without a url is refused"
 req POST /v1/messages '{"model":"m","max_tokens":5,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}'
 expect_status 400 "messages: undecodable image block refused"
 req POST /v1/responses '{"model":"m","input":[{"role":"user","content":[{"type":"input_image","image_url":"http://127.0.0.1:1/x.png"}]}],"max_output_tokens":5}'
@@ -168,6 +230,9 @@ req POST /api/generate '{"model":"m","prompt":"The capital of France is","raw":t
 req POST /api/chat '{"model":"m","messages":[{"role":"user","content":"weather in Paris?"}],"stream":false,"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"options":{"num_predict":60,"temperature":0}}'
 [[ "$R" == 200 ]] && ok "/api/chat with tools answers" || bad "/api/chat tools" "$R"
 req POST /api/show '{"name":"zzz"}';                                   expect_status 404 "/api/show unknown model"
+req POST /detokenize '{"tokens":[-1, 1099511627776]}';               expect_status 400 "detokenize ids outside the vocabulary"
+req POST /v1/load-model '{"model":42}';                                expect_status 400 "load-model: a non-string model is refused, not the default loaded"
+req POST /v1/completions '{"model":"m","prompt":"","max_tokens":4}';        expect_status 400 "completions: empty prompt (generating from it killed the server)"
 
 echo "=== Responses API ==="
 req POST /v1/responses '{"model":"m"}';                                expect_status 400 "responses: no input"
@@ -177,9 +242,63 @@ req POST /v1/responses '{"model":"m","input":"Give a person with name and age.",
 echo "$BODY" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=[c["text"] for o in d["output"] if o["type"]=="message" for c in o["content"]][0]; j=json.loads(t); assert isinstance(j["age"],int)' 2>/dev/null && ok "responses: text.format json_schema enforced" || bad "responses json_schema" "$(echo "$BODY" | head -c 160)"
 req POST /v1/messages "{\"model\":\"m\",\"messages\":[$U]}";           expect_status 400 "messages: max_tokens required"
 
+echo "=== framing ==="
+# A body longer than its Content-Length arrives in the header read: the excess overflowed the
+# request buffer (heap corruption, the process aborted on the next free).
+python3 -I - "$PORT" <<'PY'
+import json, socket, sys
+body = json.dumps({"model": "m", "messages": [{"role": "user", "content": "hello world"}], "max_tokens": 4}).encode()
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=30)
+s.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 5\r\nConnection: close\r\n\r\n" + body + b"x" * 8000)
+while s.recv(65536): pass
+PY
+for i in 1 2 3; do req GET /health; done
+expect_status 200 "short Content-Length: server alive"
+
+echo "=== nesting depth ==="
+# A tool schema 50000 levels deep overflowed a connection thread's stack. Bodies past
+# MAX_JSON_DEPTH (4096) are a 400; the deepest accepted body, deep inside a tool's
+# parameters, must walk and re-serialize without crashing. Built here: past Linux's argv limit.
+DEPTHS=$(python3 -I - "$PORT" <<'PY'
+import json, sys, urllib.request, urllib.error
+port = sys.argv[1]
+def depth(b):
+    d = m = 0; s = False; i = 0
+    while i < len(b):
+        c = b[i]
+        if s:
+            if c == "\\": i += 1
+            elif c == '"': s = False
+        elif c == '"': s = True
+        elif c in "[{": d += 1; m = max(m, d)
+        elif c in "]}": d = max(d - 1, 0)
+        i += 1
+    return m
+def body(n):
+    head = '{"model":"m","max_tokens":4,"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{"x":{"type":"array","default":'
+    b = head + "[" * n + "]" * n + "}}}}}]}"
+    return b, depth(b)
+out = []
+for want in (50000, 4096, 4097):
+    b, got = body(want - 7)
+    assert got == want, (want, got)
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", b.encode(), {"Content-Type": "application/json"})
+    try: code = urllib.request.urlopen(req, timeout=120).status
+    except urllib.error.HTTPError as e: code = e.code
+    except Exception: code = 0
+    out.append(str(code))
+print(" ".join(out))
+PY
+)
+read -r D50000 D4096 D4097 <<< "$DEPTHS"
+[[ "$D50000" == 400 ]] && ok "50000-deep body: 400" || bad "50000-deep body" "$D50000"
+[[ "$D4097" == 400 ]] && ok "4097-deep body: 400 (one past MAX_JSON_DEPTH)" || bad "4097-deep body" "$D4097"
+[[ "$D4096" =~ ^[24][0-9][0-9]$ ]] && ok "4096-deep tool schema: answered ($D4096), no crash" || bad "4096-deep tool schema" "$D4096"
+req GET /health; expect_status 200 "nesting depth: server alive"
+
 echo "=== alive ==="
 req GET /health; expect_status 200 "server alive after every edge"
-grep -qE "\[mlx\] error|panic|Segmentation" "$WORK/server.log" && bad "no MLX error / crash line in the log" || ok "no MLX error / crash line in the log"
+grep -qE "\[mlx\] error|panic|Segmentation|free\(\)|double free|corrupted|Aborted" "$WORK/server.log" && bad "no MLX error / crash line in the log" || ok "no MLX error / crash line in the log"
 
 echo
 echo "api-edges: $PASS passed, $FAIL failed  (log: $WORK/server.log)"

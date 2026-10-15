@@ -10,7 +10,8 @@
 set -uo pipefail
 
 PORT="${1:-11439}"
-MODEL="${KOKORO_MODEL:-$HOME/.mlx-serve/models/hexgrad/Kokoro-82M-mlx-serve}"
+source "$(dirname "$0")/_lib_models.sh"
+MODEL="${KOKORO_MODEL:-$(find_model ddalcu/Kokoro-82M-MLX-Serve hexgrad/Kokoro-82M-mlx-serve || true)}"
 BIN="./zig-out/bin/mlx-serve"
 LOG="/tmp/kokoro-test-$PORT.log"
 TMP="$(mktemp -d)"
@@ -99,6 +100,7 @@ BODY_BADVOICE="{\"model\":\"$ID\",\"input\":\"hi\",\"voice\":\"nope\"}"
 BODY_BADBLEND="{\"model\":\"$ID\",\"input\":\"hi\",\"voice\":\"af_heart,nope\"}"
 BODY_BADSPEED="{\"model\":\"$ID\",\"input\":\"hi\",\"speed\":99}"
 BODY_EMPTY="{\"model\":\"$ID\",\"input\":\"\"}"
+BODY_MARKS="{\"model\":\"$ID\",\"input\":\"!!! ... ???\"}"
 BODY_MUSIC="{\"model\":\"$ID\",\"prompt\":\"jazz\"}"
 BODY_CHAT="{\"model\":\"$ID\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
 
@@ -107,6 +109,7 @@ expect_code "[6] unknown voice"          400 "$BODY_BADVOICE"
 expect_code "[6] blend w/ one bad voice" 400 "$BODY_BADBLEND"
 expect_code "[6] speed out of range"     400 "$BODY_BADSPEED"
 expect_code "[6] empty input"            400 "$BODY_EMPTY"
+expect_code "[6] punctuation only"       400 "$BODY_MARKS"
 expect_code "[6] music endpoint on TTS"  400 "$BODY_MUSIC" /v1/audio/music-generations
 expect_code "[6] chat on a TTS model"    400 "$BODY_CHAT"  /v1/chat/completions
 
@@ -122,6 +125,21 @@ speech "{\"model\":\"$ID\",\"input\":\"It costs dollars.\"}" > "$TMP/nonum.wav"
 NUM="$(secs "$TMP/num.wav")"; NONUM="$(secs "$TMP/nonum.wav")"
 python3 -c "import sys;sys.exit(0 if float('$NUM')>float('$NONUM')+0.15 else 1)" \
   && ok "[8] '42' adds speech (${NUM}s vs ${NONUM}s)" || bad "[8] number vanished (${NUM}s vs ${NONUM}s)"
+
+echo "== [8b] many distinct lengths: every request answers, the server lives =="
+# Each length is a new conv shape. MLX's CUDA conv-plan cache threw once its
+# lifetime misses passed 256 (about the 7th request), and the unchecked eval
+# after it then crashed the server reading a buffer that was never filled.
+WORDS="one two three four five six seven eight nine ten"
+GOOD=0
+for i in $(seq 1 40); do
+  TEXT="$(echo $WORDS $WORDS $WORDS $WORDS | cut -d' ' -f1-$i)"
+  SPEED="$(python3 -c "print(0.7 + ($i % 7) * 0.1)")"
+  speech "{\"model\":\"$ID\",\"input\":\"$TEXT.\",\"speed\":$SPEED}" > "$TMP/len.wav"
+  head -c 4 "$TMP/len.wav" | grep -q RIFF && GOOD=$((GOOD+1))
+done
+check "[8b] 40 distinct-length requests return WAV" "$GOOD" "40"
+check "[8b] server still alive" "$(curl -s -o /dev/null -w '%{http_code}' "localhost:$PORT/health")" "200"
 
 echo "== [9] unload =="
 curl -s -X POST "localhost:$PORT/v1/unload-model" -H 'content-type: application/json' \

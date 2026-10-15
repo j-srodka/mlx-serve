@@ -35,6 +35,7 @@ pub const panic = std.debug.simple_panic;
 // pub: lib/mlx-serve-gguf and lib/sushi reach these through their host root.
 pub const mlx = @import("mlx.zig");
 pub const io_util = @import("io_util.zig");
+pub const mtp_acceptance = @import("mtp_acceptance.zig");
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
 const model_discovery = @import("model_discovery.zig");
@@ -221,6 +222,6 @@ fn run(models_dir: []const u8, host: []const u8, port: u16, ctx_size: u32, max_r
         .default_enable_pld = true,
         .default_pld_draft_len = 5,
         .default_pld_key_len = 3,
-        .default_kv_attn_fused = false,
+        .kv_attn_mode = .dense,
     });
 }

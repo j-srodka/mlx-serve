@@ -16,6 +16,7 @@
 // straight through.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const gguf_meta = @import("../gguf_meta.zig");
 const ffi = @import("../ds4_ffi.zig");
 const metal_sources = @import("ds4_metal_sources");
@@ -23,6 +24,7 @@ const log = @import("../log.zig");
 
 pub const Error = error{
     EngineOpenFailed,
+    SplitGgufUnsupported,
     SessionCreateFailed,
     SessionSyncFailed,
     SessionEvalFailed,
@@ -208,7 +210,7 @@ pub fn ensureMetalKernels(allocator: std.mem.Allocator) Error!void {
 }
 
 pub const OpenOptions = struct {
-    backend: ffi.Backend = .metal,
+    backend: ffi.Backend = if (builtin.os.tag == .macos) .metal else .cuda,
     n_threads: c_int = 0,
     warm_weights: bool = true,
     quality: bool = false,
@@ -236,6 +238,9 @@ pub const OpenOptions = struct {
     ssd_streaming_cache_experts: u32 = 0,
     ssd_streaming_cache_bytes: u64 = 0,
     ssd_streaming_preload_experts: u32 = 0,
+    /// Graph prefill chunk (`--prefill-chunk`); 0 = ds4's default. Its scratch
+    /// scales with it, so a small GPU needs a small chunk to stream experts.
+    prefill_chunk: u32 = 0,
 };
 
 /// Whether to actually pass `--dspark` to the engine: only when a support
@@ -248,6 +253,17 @@ pub fn ggufDeclaresEmbeddedMtp(io: std.Io, allocator: std.mem.Allocator, path: [
     var info = gguf_meta.readFromFile(io, allocator, path) catch return false;
     defer info.deinit(allocator);
     return info.embedded_mtp;
+}
+
+/// ds4 reads ONE file and exit()s the process on a missing tensor, so a split
+/// GGUF (its shard 1 may hold no tensors at all) is refused here by name (#586).
+fn refuseSplitGguf(allocator: std.mem.Allocator, path: []const u8) Error!void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var info = gguf_meta.readFromFile(io, allocator, path) catch return;
+    defer info.deinit(allocator);
+    if (info.split_count <= 1) return;
+    log.err("[ds4] {s} is one shard of a {d}-file split GGUF, and the ds4 engine reads one file: serve it with --engine llama, or merge the shards (llama-gguf-split --merge)\n", .{ path, info.split_count });
+    return Error.SplitGgufUnsupported;
 }
 
 pub fn dsparkEffective(requested: bool, has_support_gguf: bool) bool {
@@ -264,7 +280,8 @@ pub const Ds4Engine = struct {
     embedded_mtp: bool,
 
     pub fn open(allocator: std.mem.Allocator, model_path: []const u8, opts: OpenOptions) Error!*Ds4Engine {
-        try ensureMetalKernels(allocator);
+        try refuseSplitGguf(allocator, model_path);
+        if (builtin.os.tag == .macos) try ensureMetalKernels(allocator);
 
         const path_z = allocator.dupeSentinel(u8, model_path, 0) catch return Error.OutOfMemory;
         errdefer allocator.free(path_z);
@@ -304,6 +321,7 @@ pub const Ds4Engine = struct {
             .ssd_streaming_cache_experts = opts.ssd_streaming_cache_experts,
             .ssd_streaming_cache_bytes = opts.ssd_streaming_cache_bytes,
             .ssd_streaming_preload_experts = opts.ssd_streaming_preload_experts,
+            .prefill_chunk = opts.prefill_chunk,
         };
 
         var raw: ?*ffi.Engine = null;
@@ -344,6 +362,16 @@ pub const Ds4Engine = struct {
 
     pub fn eosToken(self: *Ds4Engine) i32 {
         return @intCast(ffi.ds4_token_eos(self.handle));
+    }
+
+    /// ds4's own end-of-generation set: EOS, end-of-text and, on GLM, the
+    /// role markers that open the next turn (`<|user|>`, `<|observation|>`).
+    pub fn isStop(self: *Ds4Engine, token: i32) bool {
+        return ffi.ds4_token_is_stop(self.handle, token);
+    }
+
+    pub fn vocabSize(self: *Ds4Engine) u32 {
+        return @intCast(ffi.ds4_engine_vocab_size(self.handle));
     }
 
     pub fn assistantToken(self: *Ds4Engine) i32 {
@@ -700,6 +728,7 @@ test "clampSessionCtx: idempotent (re-clamping a clamped value is a no-op except
 }
 
 test "kernel hash is stable across calls" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest; // Metal kernels only
     const a = computeKernelHash();
     const b = computeKernelHash();
     try std.testing.expectEqualSlices(u8, &a, &b);

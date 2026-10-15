@@ -45,6 +45,10 @@ Guard: `media renders one template placeholder per item` (chat.zig, real Qwen3.8
 the `expandMediaPlaceholders` tests (server.zig), `media spans bound the reusable prefix`
 (prefix_cache.zig), `EmbeddingCache serves a hit and evicts` (vision.zig), `tests/test_multi_image_history.sh`.
 
+### A bare-string `image_url` vanished from the prompt (2026-10-13)
+
+`{"type":"image_url","image_url":"data:..."}` (the shape some clients send, and the Responses API's own) answered 200 while the model described a picture it never saw: the chat parser `continue`d past any part whose `image_url` was not an object, and so did every malformed one (`{"href":...}`, a non-string `url`). `imageUrlOfPart` reads the object and the string form, and any other shape is the named decode 400, on chat and embeddings. Guard: its unit test + `tests/test_api_edges.sh` (red on 26.10.2: 200).
+
 ### A `seed` that only the synchronous sampler read (seeded replies flipped between identical requests)
 
 `integration_test.sh`'s "same seed produces same first token" went red on the v26.8.11 release run: `Ephemeral` vs `**Ephemeral**` with identical top-2 logprobs (gap 0.75 nats, not a tie). The lazy decode sampler (`sampleTokenLazy`, every serial/batched/spec site) passed a null key to `mlx_random_categorical`, i.e. MLX's global RNG; only the synchronous `sampleToken` (the `logprobs` path) built a key from `seed`, and it built the SAME key every step, so a seeded reply was a single coin flip replayed. The test had passed for months on an 82/18 draw. Fix: `seedKey(sampling)` mixes `seed` with a per-draw index (`SamplingParams.draw`); `Generator.sampleLazy` is the one lazy sampler a slot calls and advances the index; init paths hand the Generator `draw = 1` after drawing t1. Bar: seeded replay identical at temp 1.0 across cold and prefix-cache-hit requests; no seed still varies.
@@ -52,17 +56,27 @@ the `expandMediaPlaceholders` tests (server.zig), `media spans bound the reusabl
 ### A client-supplied path handed straight to mlx is a one-request server kill (lora_path)
 Found by a test that expected a 400 and got `000` — curl couldn't complete, because the server was gone. `POST /v1/images/generations` with `{"lora_path":"/tmp/nope.safetensors"}` flows into `lora.loadFile` → `mlx_load_safetensors`, which for a missing file raises an MLX error; mlx-c errors are FATAL, so the process dies. Log's last line is `MLX error: [load_safetensors] Failed to open file …` and nothing after it. This isn't a MageFlow issue — it's every image backend, and every client on the box loses its connection because one request named a moved or mistyped adapter. The path check that existed (`isAbsolute`, added for the `openFileAbsolute` UB class) proves the shape of the string, not that a file is there. Fix: open + stat before mlx sees it, and require a REGULAR FILE — a directory opens fine and would die one layer deeper — returning `error.BadLoraPath` → the existing 400. General rule: any request-supplied path that flows into an mlx loader must be validated on OUR side of that boundary, the same way `textGenRejectReason` 400s before prefill rather than letting a null transformer deref take the server down. Guards: two `loadFile` unit tests (missing file, directory) and the LoRA case in `tests/test_mageflow_edit.sh`. Multi-LoRA (`lora_paths`, an array) goes through the same `loadFile` per entry in `ImageEngine.setLoras`/`VideoEngine.setLoras` — a bad path anywhere in the array 400s before any adapter in that request attaches (partial stacks never install; `lora.Stack.deinit` unwinds whatever loaded before the failing entry).
 
+### A host path a remote client may name is a file-existence oracle (lora_paths, #540)
+`lora_paths` are files on the server's disk. A missing file 400s in `lora.validatePath`; an existing non-LoRA passes it and fails later with a different error, so any client that reaches a media route (keyless `--lan-share` peers, `--api-key` holders on another machine) could probe whether any host path exists. Fix: `gen.parseLoraFields` takes `local` (`server.peerIsLoopback`) and refuses LoRA fields from anyone else with a named 403, before a path is touched; every handler goes through it, the multipart edit surface included. Guard: `parseLoraFields: a LoRA path is accepted only from this machine`.
+
 ### An error message that quotes a field value is not a JSON string (media-gen 400 bodies)
 Found live while checking that a MageFlow txt2img checkpoint correctly refuses an edit request: the 400 came back as `{"error":{"message":"instruction editing (mode:"edit") requires a FLUX.2 or Mage-Flow-Edit model"}}` — raw double quotes inside a JSON string, so every client sees a parse error instead of the (perfectly good) explanation. The Zig source reads `"… (mode:\"edit\") …"`, which is a Zig escape producing a real `"` byte; `gen.sendError` then interpolated it with `{s}` straight into a JSON body. Six messages in `gen.zig` had it (`'mode' must be "edit" or "variation"`, the edit/variation gates, `'ref_images' requires mode:"edit"`, the content-filter refusal), and the SSE variant shared the flaw. A second failure hid behind the same line: both senders build into a fixed 256-byte buffer with `bufPrint(...) catch return`, so a message longer than the buffer sent NO body at all — a bare status code with an empty payload. Fix is at the SINK, not the literals (a future message must not be able to reintroduce it): `gen_sse.jsonEscapeMessage(out, msg)` escapes `"` `\` and the control bytes, maps other sub-0x20 bytes to a space, and TRUNCATES to fit while backing off to a UTF-8 boundary so the tail can never be a torn sequence; both `gen.sendError` and `gen_sse.sendError` route through it into a 640-byte body buffer. Pinned by a hermetic test that feeds the exact live message through a real `std.json` parse. Same class as the tool-calling `appendJsonString` rule — the mistake there is trusting model output, here it's trusting your own literal; both are just bytes going into a JSON string.
 
 ### A buffered streaming surface must beat on SOCKET SILENCE, not on token arrival (client idle-timeout class)
-Every streaming surface buffers generated tokens while it might be looking at a tool call (`chat.streamShouldBufferForTools`) or an unclosed thinking block (`chat.streamThinkGate` → `.hold_thinking`); `/v1/responses` buffers a tool-active request outright (`if (active_has_tools) continue;`). During that span the handler emits NOTHING. The keepalive used to fire only on the `.idle` arm of `ts.nextOrIdle` — i.e. only while WAITING for the first token (long prefill) — so once tokens started flowing into a buffer the socket went dead silent for the whole tool call. **Tokens flowing ≠ bytes flowing**, and only bytes hold off a client's idle-body timeout. Live failure 2026-07-08: a pi agent session (Node `fetch` → undici, default `bodyTimeout: 300_000`) building a JS game lost two ~5-minute `write` calls to `TypeError: terminated` / `BodyTimeoutError` — ~10 minutes of 27B GPU work discarded, twice, and the agent never learned why. Reproduced exactly: old binary dies at 301.6 s having received 1 chunk / 267 bytes; fixed binary streams a 612 s generation to completion with 122 keepalives and a 5.0 s max gap. Symptom signature: a client-side `terminated` / read-timeout at almost exactly the client's idle timeout, `chunks=1` before it, the server log showing the request later completing normally (the server never noticed) or a `[cancel] client disconnected` line one keepalive later.
+Every streaming surface buffers generated tokens while it might be looking at a tool call (`chat.streamShouldBufferForTools`) or an unclosed thinking block (`chat.streamThinkGate` → `.hold_thinking`); `/v1/responses` holds a tool-active answer until the parse (only the leading thought streams). During that span the handler emits NOTHING. The keepalive used to fire only on the `.idle` arm of `ts.nextOrIdle` — i.e. only while WAITING for the first token (long prefill) — so once tokens started flowing into a buffer the socket went dead silent for the whole tool call. **Tokens flowing ≠ bytes flowing**, and only bytes hold off a client's idle-body timeout. Live failure 2026-07-08: a pi agent session (Node `fetch` → undici, default `bodyTimeout: 300_000`) building a JS game lost two ~5-minute `write` calls to `TypeError: terminated` / `BodyTimeoutError` — ~10 minutes of 27B GPU work discarded, twice, and the agent never learned why. Reproduced exactly: old binary dies at 301.6 s having received 1 chunk / 267 bytes; fixed binary streams a 612 s generation to completion with 122 keepalives and a 5.0 s max gap. Symptom signature: a client-side `terminated` / read-timeout at almost exactly the client's idle timeout, `chunks=1` before it, the server log showing the request later completing normally (the server never noticed) or a `[cancel] client disconnected` line one keepalive later.
 - Fix: `Conn.heartbeat` (`server.StreamHeartbeat`) is stamped by `Conn.writeAll`/`writeAllNoFlush`/`flush` — the only places bytes reach the socket — and every token loop calls `beatStreamKeepalive(stream, .sse_comment | .anthropic_ping)` once per iteration, at the BOTTOM of the loop (so all branches, including the ones that wrote nothing, are covered) or before an early `continue` (`/v1/responses`). It emits only when `Conn.keepaliveDue()` (no bytes for `STREAM_KEEPALIVE_MS` = 5 s), so a normally-streaming request pays one timestamp per token and sends nothing extra. WS transports no-op both senders (a raw comment would corrupt framing) and are stamped anyway.
 - **Rule: liveness is a property of the SOCKET, never of the generator.** Any new streaming surface, or any new branch that swallows a token into a buffer, must beat once per loop iteration. Never gate the keepalive on "no token available".
 - `StreamHeartbeat` is the mirror of `generate.StallClock`: StallClock protects the SERVER from a wedged model (silence = no new *tokens*), StreamHeartbeat protects the CLIENT from a wedged-looking socket (silence = no new *bytes*). Confusing the two is what produced the bug.
 - Guards: `tests/test_stream_keepalive.sh` (class guard — asserts for chat + messages + responses that the max inter-chunk gap stays under 15 s across a long buffered tool call, that a keepalive/ping actually arrived, and that the tool call still parses with valid JSON args so the injected bytes never corrupt the stream; SKIPs when the generation was too short to exercise the buffer) plus the `StreamHeartbeat` unit tests in server.zig (verified red-on-revert: all three surfaces FAIL with `max_gap ≈ 17.8s, keepalives=0`).
 - KNOWN GAP: the Ollama surface is still exposed. `Conn.writeAll` feeds `ollama_sink`, whose SSE re-framer DROPS comment lines (`ollama.zig` `if (line[0] == ':') continue;`), and NDJSON has no comment/ping form — so a buffered tool call over `/api/chat` still writes nothing. Fix (if an Ollama client ever reports it): translate the keepalive comment into an empty-content `{"message":{"role":"assistant","content":""},"done":false}` line in the sink.
 - Related but NOT the same bug: pi's `~/.pi/agent/models.json` declared `contextWindow: 32768` for a model whose server advertises `meta.context_length` ≈ 96k, so pi's own `max_tokens` budget collapsed late in the session and its `write` calls truncated mid-argument — surfacing as our (deliberate) truncation salvage: tool name recovered, `arguments: {}`, `finish_reason: "length"`. A client that validates args against the schema instead of honoring `finish_reason: "length"` reads that as a malformed call. Clients should read `context_length` off `/v1/models`.
+
+### A reader that lags the end of a stream got ECONNRESET instead of EOF
+A client that processed a streamed response slower than the server produced it read every byte through `response.completed` and `[DONE]`, then failed with `Connection reset by peer`. Deltas go out one per token, so a client that spends tens of milliseconds per event can sit a minute behind the server's last write; every surface that ends by closing the socket has it.
+- Cause: the SSE head is `Connection: close` with no length or chunking, so the end of the body IS the close. `Conn.close` released the fd at once. A socket the process has closed is orphaned in FIN_WAIT_2, and macOS drops it with an RST after `net.inet.tcp.fin_timeout` (60 s), which replaces the EOF the reader had not reached yet.
+- Fix: for a close-delimited body (SSE, NDJSON: no `Content-Length`), `Conn.close` sends the FIN (`shutdown(SHUT_WR)`) and keeps the socket until the peer hangs up (polling, `CLOSE_WAIT_MS` = 5 min, or server shutdown), so it is never orphaned. The slot is already released by then; only the connection thread waits.
+- A response with a `Content-Length` ends by its length, so it closes at once: the writers (`sendResponseFramed`, `sendUnauthorized`, `sendModelsResponse`, the media `sendBytes*`/`sendError`) set `Conn.length_framed`. Waiting there would pin a thread for 5 minutes per request on a client that ignores `Connection: close`. Any head not marked keeps the wait (the safe default). KNOWN GAP: Ollama's aggregated non-stream JSON (`Sink.sendHttpJson`) and the LAN tunnel relay (`lan.tunnel`) are unmarked, so they still wait; mark them if a keep-alive client there pins threads.
+- Guards: the hermetic `Conn.close keeps the socket until the peer hangs up, after a close-delimited body` and `Conn.close does not wait for the peer after a Content-Length response`; `tests/test_responses_streaming.sh` [G] (a reader that waits out `fin_timeout` after the server is done must still get EOF; takes over a minute).
 
 ### Shutdown race: drain connection threads before `Scheduler.deinit` (SIGSEGV in `complete`)
 Per-connection threads are spawned in `server.serve`'s accept loop. On shutdown the accept loop breaks and `serve` returns, firing `defer scheduler.deinit()` — which frees the slot queues (`pending`/`decoding`/`cleanup_queue`) on the assumption that "all conn threads called `complete` properly". They hadn't: a conn thread still inside `Scheduler.complete` (touching those very lists) raced the free → use-after-free SIGSEGV (crash report `mlx-serve-2026-06-20-141700.ips`: thread 0 in `Scheduler.deinit`/`Thread.join`, thread 13 in `Scheduler.complete`; null-deref at +0x18). Triggered by a shutdown/model-switch while a stream was in flight. Fix (three parts):
@@ -88,8 +102,15 @@ Live SIGSEGV 2026-07-06 (`mlx-serve run <flux dir>`): a chat request whose resol
 - Client side: `app/Sources/MLXServe/Services/AgentBudget.swift` derives `(context, output)` from `ModelInfo.contextLength` and `AgentConfigs` writes them into `~/.pi/agent/models.json` (`contextWindow`/`maxTokens`), the opencode provider config (`models.<id>.limit.{context,output}`), and Claude Code's `CLAUDE_CODE_MAX_OUTPUT_TOKENS` + `CLAUDE_CODE_MAX_CONTEXT_TOKENS`. That second export was long believed not to exist; Claude Code 2.1.260 names it in the very message it prints for an off-catalog model ("auto-compact keeps this session within 200k tokens (the context window it assumes) … set CLAUDE_CODE_MAX_CONTEXT_TOKENS to its real window"), so without it a 786k-context server was driven as a 200k one. Omitted when the server advertises no context — an unknown window is not a claim. These were hardcoded to `32768`/`8192`, which is what actually killed long pi sessions on a 94k-context model. The advertised context is declared **verbatim** — the server already reserved 15%, so a second client-side margin double-counts it AND makes the CLI report a different number than Settings shows (opencode said 75K where the server said 77K). Guard: `AgentBudgetTests`.
 - UI: Settings → Context size shows three counts that are easy to confuse — **Model max** (`max_position_embeddings`, architectural), **GPU-safe max** (`/props` `maxSafeContext`, what memory could hold *now*), and **In use** (`meta.context_length`, the pinned value actually enforced and handed to agent CLIs). `ContextSizeDisplay` owns the formatting + the one help string, shared with `ServerOptions.serverFlagFields["ctxSize"].explainer` so the two descriptions of "Auto" cannot drift. The shipped copy claimed Auto "uses the model's declared maximum" — it never has. Guard: `ContextSizeDisplayTests`.
 
+### A split GGUF on the ds4 engine killed the process with nothing in the log (#586)
+A 4-shard `qwen4exp` pack routed to ds4 by arch. ds4 reads one file; shard 1 of a split carries the metadata and no tensors, so `required_tensor` printed `ds4: required tensor is missing: token_embd.weight` to stderr and called `exit(1)`: the log ended after kernel staging. Fix: `gguf_meta` reads `split.count` (writers put it after every key, so the header walk no longer stops early) and `preferredEngine` sends any split file to llama.cpp, which loads the siblings itself; `Ds4Engine.open` refuses a split by name before ds4 sees it (`--engine ds4`). Guard: `preferredEngine: a split GGUF goes to llama.cpp, whatever its arch`.
+
+### A DeepSeek-V4 GGUF refused to open with default flags (2026-10-13)
+
+From 26.9.x every antirez DeepSeek-V4-Flash GGUF failed to load unless the user passed `--no-mtp` or `--ssd-streaming`: `ds4: --mtp requires a model with embedded MTP weights`, `EngineOpenFailed`. `gguf_meta` armed ds4's in-checkpoint MTP for any arch that declares `nextn_predict_layers`, and DeepSeek-V4 declares it while shipping its head as a separate GGUF (`--mtp-model`); ds4 drafts in-checkpoint only for glm-dsa, glm5-next and qwen4exp. Fix: `ds4_embedded_mtp_archs` gates `embedded_mtp`. Guard: the `embedded MTP is read from <arch>.nextn_predict_layers` test (deepseek4 case) + `tests/test_ds4_serve.sh` on a DeepSeek-V4 GGUF.
+
 ### Auto-context budget + the misleading libllama OOM backtrace
-A runtime Metal OOM during MLX generation (`[METAL] Command buffer execution failed: Insufficient Memory`) prints a backtrace whose top frames are `libllama.dylib` (`ggml_print_backtrace` / `ggml_uncaught_exception`) — even for a pure-MLX model. That's a RED HERRING: libllama installs a global `std::set_terminate` handler at load (for GGUF support), so it prints the trace, but the throw is from `libmlx` (`mlx::core::gpu::check_error`). Don't chase a GGUF/llama bug — it's MLX exceeding the GPU working set. The auto-context budget (`computeMaxSafeContext` → `safeContextForBudget`, server.zig) must therefore: (1) ceiling = `max_recommended_working_set_size` (`getGpuWorkingSetLimit`), NOT `hw.memsize × 0.75` (`getMetalBufferLimit`) — the latter over-estimates the real limit on small-RAM Macs (16 GB: 12 GB vs ~11.9 GB recommended); (2) reserve the FULL hot prefix cache budget (`prefix_cache_mem_bytes`, default 2 GB) up front — it fills over an agentic session, so an auto-ctx computed against an empty cache (24k on a 16 GB Mac) later collides with the filled cache + a large cold MoE prefill and crashes. `checkAttentionMemory` (the per-request prefill guard) shares the same `getGpuWorkingSetLimit` ceiling. When the budget tightens, an oversized prompt hits the graceful `400 "Prompt exceeds maximum context length"` gate (all four HTTP paths) instead of the process-killing Metal allocator. **(3) — the ceiling must also see EXTERNAL memory pressure (#64, 2026-07):** `getGpuWorkingSetLimit()` is a STATIC device max (128 GB Mac → 115 GB) that assumes the whole GPU working set is MLX's to claim; it is blind to memory held by OTHER processes (the field crash: a Claude Code session running a docker-compose stack — firecrawl/rabbitmq/postgres/playwright — held tens of GB, so the guard budgeted 115 GB, admitted a 90 K-token MoE prefill, and Metal OOM'd). Both guards now budget against `currentGpuMemoryCeiling(active) = min(getGpuWorkingSetLimit(), mlx_active + mlx_cache_memory + getAvailableMemBytes())` — capping the static max by what's PHYSICALLY reachable now (MLX's own footprint + free system RAM via `status.getAvailableMemBytes`, which counts wired+compressed+internal-anon, so docker's pages tighten it). Idle machines see `mlx_active + cache + free ≈ static max` → no auto-ctx regression (verified: 128 GB Mac ctx 169516 idle → 55787 under a 55 GB hog, oversized prompt then 400s, server stays alive). The OOM is NOT catchable — the throw is async on a Metal completion-handler GCD thread (`addCompletedHandler`) via `std::terminate`, so PREVENTION (a tighter guard) is the only lever, not a try/catch. Pure-helper unit tests in server.zig (`physicalMemoryCeiling …`, `safeContextForBudget …`). NOTE: the per-token working-set term still under-models a batched MoE prefill spike — if OOMs persist on ≤16 GB, fall back to `--ctx-size <N>` + `--prefix-cache-mem 512MB`.
+A runtime Metal OOM during MLX generation (`[METAL] Command buffer execution failed: Insufficient Memory`) prints a backtrace whose top frames are `libllama.dylib` (`ggml_print_backtrace` / `ggml_uncaught_exception`) — even for a pure-MLX model. That's a RED HERRING: libllama installs a global `std::set_terminate` handler at load (for GGUF support), so it prints the trace, but the throw is from `libmlx` (`mlx::core::gpu::check_error`). Don't chase a GGUF/llama bug — it's MLX exceeding the GPU working set. The auto-context budget (`computeMaxSafeContext` → `safeContextForBudget`, server.zig) must therefore: (1) ceiling = `max_recommended_working_set_size` (`getGpuWorkingSetLimit`), NOT `hw.memsize × 0.75` (`getMetalBufferLimit`) — the latter over-estimates the real limit on small-RAM Macs (16 GB: 12 GB vs ~11.9 GB recommended); (2) reserve the FULL hot prefix cache budget (`prefix_cache_mem_bytes`, default 2 GB) up front — it fills over an agentic session, so an auto-ctx computed against an empty cache (24k on a 16 GB Mac) later collides with the filled cache + a large cold MoE prefill and crashes. `checkAttentionMemory` (the per-request prefill guard) shares the same `getGpuWorkingSetLimit` ceiling. When the budget tightens, an oversized prompt hits the graceful `400 "Prompt exceeds maximum context length"` gate (all four HTTP paths) instead of the process-killing Metal allocator. **(3) — the ceiling must also see EXTERNAL memory pressure (#64, 2026-07):** `getGpuWorkingSetLimit()` is a STATIC device max (128 GB Mac → 115 GB) that assumes the whole GPU working set is MLX's to claim; it is blind to memory held by OTHER processes (the field crash: a Claude Code session running a docker-compose stack — firecrawl/rabbitmq/postgres/playwright — held tens of GB, so the guard budgeted 115 GB, admitted a 90 K-token MoE prefill, and Metal OOM'd). Both guards now budget against `currentGpuMemoryCeiling(active) = min(getGpuWorkingSetLimit(), mlx_active + mlx_cache_memory + getAvailableMemBytes())` — capping the static max by what's PHYSICALLY reachable now (MLX's own footprint + free system RAM via `status.getAvailableMemBytes` — the OS-grantable classes (free less speculative, plus file-backed) capped by the RAM outside wired + compressor — so a hog's pages collapse the reclaimable sum and tighten it). Idle machines see `mlx_active + cache + free ≈ static max` → no auto-ctx regression (verified: 128 GB Mac ctx 169516 idle → 55787 under a 55 GB hog, oversized prompt then 400s, server stays alive). The OOM is NOT catchable — the throw is async on a Metal completion-handler GCD thread (`addCompletedHandler`) via `std::terminate`, so PREVENTION (a tighter guard) is the only lever, not a try/catch. Pure-helper unit tests in server.zig (`physicalMemoryCeiling …`, `safeContextForBudget …`). NOTE: the per-token working-set term still under-models a batched MoE prefill spike — if OOMs persist on ≤16 GB, fall back to `--ctx-size <N>` + `--prefix-cache-mem 512MB`.
 
 ### Request timeout is a STALL timeout, and a truncated generation must keep finish_reason "length" through tool-call parse
 Two coupled rules from one live failure (2026-07-03, Qwen3.6-27B agent writing a website): the model one-shot ~33KB `writeFile` calls (~8-10K tokens ≈ 5 min at 30 tok/s); the old wall-clock `--timeout` (default 300s, measured from request start) guillotined every round that ran a few seconds long, mid-tool-call; `parseToolCalls`' truncation salvage then recovered a name + path-only/`{}` call; and the tool-parse sites OVERRODE the generator's `finish_reason="length"` with `"tool_calls"` — so the app saw a "complete" call with no content, told the model IT forgot `content`, and the model re-emitted the same doomed mega-call. Three of six writeFile rounds (≈15 min of GPU) were silently discarded. Diagnosis signature: failed agent rounds whose `completion_tokens / tok_s ≈ the timeout` exactly, while raw speed looks nominal; app-side `tool-calls.log` shows `EMIT rawArgs={}`/path-only after a full-length generation. Rules: (1) `--timeout` counts seconds WITHOUT a new token (`generate.StallClock` — progress detected from `generated_ids.len` at the check site, so every decode path resets it without instrumentation); a request that keeps producing never times out. (2) Every site that sets a tool-call finish reason goes through `server.toolCallFinishReason(pre_parse)` — "length" survives the parse (all four surfaces), so clients' truncation recovery (the app's chunk-and-retry nudge; APIClient emits accumulated calls on "length" too) actually fires. (3) `AgentPrompt.outputBudgetGuidance` is a SCARCITY warning and is emitted ONLY when the effective budget is tight (< `outputBudgetGuidanceThreshold`, 12288 — a one-shot file write measured live runs 8–10.7K tokens); roomy machines get NO section at all, because an honest "~419430 tokens per response" on a 1M-ctx machine reads as an invitation to one-shot mega-calls and OVERRIDES the writeFile description's ~200-line chunking convention (two prompt layers in conflict → the specific number wins). Guards: `toolCallFinishReason` + `StallClock` unit tests, `testOutputBudgetGuidanceOnlyAppearsWhenBudgetIsTight`. Harvest aid: `MLX_SERVE_RAW_DUMP_FILE=<abs path>` (with `--log-level debug`) writes the FULL pre-parse text of streamed tools requests — the inline debug dump caps at 4KB.
@@ -173,11 +194,11 @@ Sibling of the multipart-`model` bug above, same root cause: **model resolution 
 Third in the same family as the two stories above: **model resolution runs before dispatch**, and `GET /` sat on the far side of it. `handleStatusPage(allocator, stream, lm)` took a `*LoadedModel` and rendered 21 `std.fmt` slots off it — id, arch, quant bits/group, layers/hidden/heads/kv, head dim, vocab, context, model max, active + peak MB, capability pills. With no default model the arm was never reached and the root answered `503 {"error":"No default model configured"}`. That is the boot mode the app always uses, and since `mlx-serve serve` / bare `--serve` started discovering the shared models root and loading on demand, it is the default way the server starts at all — so the first page a person opens was an error object.
 - **The page also documented 22 of 31 endpoints.** The API reference is hand-written prose; the entire Ollama `/api/*` surface (chat, generate, tags, show, ps, pull, version, embed, embeddings) had never been added to it. Nothing could notice, because "is the reference complete?" was an inspection, not a test.
 - **Fix**: `GET /` moved up beside `/health` and `/v1/models`, above resolution, and `handleStatusPage` lost its `lm` parameter entirely. Everything model-shaped is now fetched client-side from `/v1/models` (which already returns id, capabilities, state, bytes, meta per entry) and `/props` (live memory). That is not just a workaround for the 503 — the page is now a model PICKER, so it has to render before anything is loaded by construction, and the picker follows loads and unloads without a refresh.
-- **The `std.fmt` trap that shapes the whole file layout.** `index.html` is `@embedFile`d as a FORMAT STRING, so every literal `{`/`}` inside it must be doubled — which is why a page with real CSS and JS cannot be one file. `metrics.js` already had the answer: inject it as a RUNTIME `{s}` argument, because std.fmt does not re-parse runtime args. `app.css` and `app.js` follow the same pattern, and the slot count dropped from 21 to 6. Do not inline CSS or JS back into `index.html`.
+- **The page is no longer a format string.** It was `@embedFile`d as a `std.fmt` template (every literal `{`/`}` doubled, CSS and JS injected as runtime `{s}` args, 21 slots down to 6). It is now ONE file built from `app-web/` and sent byte for byte, so there is no template to keep apart from its assets.
 - **Guards** (three layers, because the page has three failure modes):
-  - `the index page documents every endpoint the server serves` (server.zig) — every `ROUTE_PATHS` entry must appear in `@embedFile("html/index.html")`. Red today with the nine `/api/*` paths. Same shape as the `ROUTE_PATHS`↔dispatch-chain guard, and it makes "are we missing endpoints?" un-repeatable rather than re-inspectable.
-  - `tests/test_index_page.sh` — headless over an EMPTY `--model-dir` (no checkpoint, seconds): `GET /` → 200 `text/html`, the tab/control markup is present, every endpoint path is in the served bytes, and the `#mlx-metrics` mount appears with `--metrics` and not without. Red-on-revert: 1/20 with the arm moved back below resolution.
-  - `tests/html_console_test.mjs` — the pure decision layer (capability filtering per picker, SSE frame cutting across split chunks, request/form construction, auth passthrough), plus a static cross-check that every id `app.js` reaches for exists in `index.html` and every rendered control is read by `app.js`. That last one covers the class no HTTP assertion can see: a typo'd id makes `$('chat-sned')` return null, the listener is never attached, and the button is silently dead while the page still renders, still serves, and still passes every byte-level check.
+  - `the index page documents every endpoint the server serves` (server.zig) — every `ROUTE_PATHS` entry must appear in `@embedFile("html/index.html")` (CI has no Node, so this is the guard that runs there); `app-web/test/api-reference.test.ts` checks the exact rows both ways.
+  - `tests/test_index_page.sh` — headless over an EMPTY `--model-dir` (no checkpoint, seconds): `GET /` → 200 `text/html`, the bytes served ARE `src/html/index.html`, `/metrics.json` 503 without `--metrics` and 200 with. Red-on-revert: 1/20 with the arm moved back below resolution.
+  - `app-web/test/` (`npm test`) — the console's own suite: request/SSE logic, every pane against a mock server, a hostile-input corpus on every text surface. It covers the class no HTTP assertion can see: a control that never works while the page still renders, serves and passes every byte-level check.
 - **Note on media**: edit capability is not API-visible — both Mage-Flow-Turbo and Mage-Flow-Edit-Turbo report `capabilities: ["image"]`, ship byte-identical configs, and the server itself gates on the directory NAME (`mage_flow.dirIsEdit`). The console mirrors that rule client-side rather than inventing one. An explicit `image_edit` capability on `/v1/models` would replace both halves; it is a server API change, not console work.
 
 ### The console is a chat with tools, not a page of forms — and the live runs wrote the rules (2026-07-25)
@@ -188,8 +209,8 @@ Everything below was found by driving the real page in a real browser over CDP a
 - **A tool's `model` enum and its resolution must be the same list.** The edit tool enumerated every image model while resolution merely *preferred* an edit-capable one — and an explicit choice beats a preference, so the model picked `Mage-Flow-Turbo` straight out of the enum and the edit 400'd. Offering a choice that is guaranteed to fail is the same class as advertising a capability you don't have. `editableIds` is now one list feeding both, pinned by a test that resolves every id the enum offers and asserts it comes back unchanged.
 - **Rank candidates by how likely they are to WORK.** Two Qwen3-TTS checkpoints on disk, the bf16 one an incomplete download (config + tokenizer, no safetensors). It sorted first, so every "say this out loud" spent a load attempt on it — `NoWeightFiles`, "Model load failed" — before a retry found the sibling. The pre-load tell is in `/v1/models` already: discovery sums the checkpoint's `*.safetensors`, so `bytes_on_disk: null` means the shards are missing. `rankedIds` orders resident (free, and provably loadable) → sized → unsized → `error`, and a failed tool call refreshes the model list so a retry inside the same turn ranks past the entry the registry just marked. The picker deliberately does NOT reorder: it refreshes every 15 s and would shuffle under the cursor.
 - **Whatever the system prompt leaves out, the model invents.** With only paths and one-line descriptions in the prompt, "how do I edit an image?" produced `curl -X POST https://your-ollama-ip-address/api/v1/images/edits -F "ref1=<base64>"` — wrong host, wrong path prefix, invented field names. The prompt now carries `location.origin` and a short true list of real request fields. Listing accepted and rejected fields in one sentence was not enough either: the model presented `mask`, `n`, `response_format:"url"` as available options, so rejections are now a separate, explicitly-labelled clause. And "give me a curl for the edit endpoint" was answered by GENERATING A PICTURE until the prompt said in as many words that questions are answered in text with no tool call at all.
-- **The API reference has one source.** The prompt's endpoint list is scraped from the API tab's own rendered markup (`#tab-api .ep`), so the page and the assistant cannot disagree, and the Zig drift guard (every `ROUTE_PATHS` entry appears in `index.html`) covers both at once.
-- **Guards**: `tests/html_console_test.mjs` grew to 44 tests over `mediaTools` / `toolInvocation` / `accumulateToolCalls` / `systemPrompt` — each of the bullets above is a named regression test. `tests/test_index_page.sh` pins the tab set, that Monitor ships `class="panel active"` (what a visitor sees before any JS runs), that Images/Audio tabs are GONE, and that no user system-prompt box came back.
+- **The API reference has one source** (`apiReference` in `app-web/src/lib/core/console.ts`): the API pane and the chat's system prompt both read it, so the page and the assistant cannot disagree, and the drift guards above cover both at once.
+- **Current guards**: `app-web/test/` for the console's behavior; `tests/test_index_page.sh` for what the server serves.
 
 ### Third pass: a sidebar, persisted chats, and the metric a client cannot measure (2026-07-25)
 Layout moved to a sidebar — **New chat / Monitor / API**, plus **Recents** — and chat became the landing view: a greeting and a centred composer that turns into a transcript on the first send. It is ONE composer element in two layouts (`.panel.empty` flips it), because two composers is two sets of listeners and one of them always rots. Temperature and max-tokens went away; model choice and Extended thinking live in the composer's pill menu, both remembered in localStorage.
@@ -792,8 +813,9 @@ the TE stage is one forward over a few hundred prompt rows. A shared
 allocates — which, with the TE at 26.28 GiB, is exactly what kept the 8-bit pack
 refused even after the first two fixes.
 
-So: `max(te, max(dit_resident, vaes) + H3_ACTIVATION_BYTES)`, with the allowance
-at 6 GiB against a measured 4.0–5.0.
+So: `max(te, max(dit_resident, vaes) + allowance)`, the allowance first a flat
+6 GiB against a measured 4.0–5.0, now the smallest request's 1 GiB
+(`H3_REQUEST_BASE_BYTES`) since `handleVideoH3` prices each canvas (#764 below).
 
 `h3DitResidentBytes` takes `precompute` as a PARAMETER and the caller reads
 `minimax_h3.adalnPrecomputeOn()` — the same predicate `generate` branches on. A
@@ -2416,3 +2438,248 @@ reaches `ensureLoaded` and its named 500. An unregistered path is a 404. The LAN
 the same helper. Startup was already loud: a failed `--model` load exits 1.
 Guards: `resolveRequestModelId: a path names its own entry, never the default model`,
 `tests/test_load_failure_no_fallback.sh`.
+
+## A stop string spanning tokens leaked its first bytes on every stream
+
+Defect: `stop: [", 12"]` streamed `…11, 1` where the non-stream reply ended `…11`, on chat, completions, messages and responses. Cause: each streaming loop sent a token as it decoded and the cut could trim only the ARRIVING token, never bytes already sent. Fix: `StopStream` holds a tail that could still begin a stop string until the next token decides it, and flushes it as one last token when generation ends without a match. Guard: `StopStream` unit test (every token split of the text) + `tests/test_api_edges.sh` stream == non-stream on all four surfaces.
+
+## A media job held the inference thread for its whole life (2026-10-03)
+
+Defect: a pi session on GLM-5.3 showed "Operation aborted" on every turn for 10+ minutes while
+its own asset script ran a textured Hunyuan3D job on the same server. Cause: `runGenRequests`
+ran the job to completion on the inference thread, so no chat request was admitted, prefilled
+or decoded until it returned, CPU-only stages (marching cubes, xatlas, bake, PNG/GLB) included.
+Fix: the loop body is `chatPass(.main)`; every backend's per-step poll is `Progress.boundary()`,
+which runs `chatPass(.yield)` for as long as the step took (`GenYield`, equal share) before the
+cancel check; a pure-CPU stage runs on a worker via `gen_sse.offload` while the inference thread
+serves chat; the job's estimated peak is billed to chat admission (`gen_reserve_bytes`), since a
+chat prefill taking a later denoise step's memory is an uncatchable Metal OOM. Chat's decode clocks reset at
+each boundary and at job end (`invalidateDecodeClocks`), or a media step folds into the round-cost table
+as one slow spec round. Loads still run whole.
+Guard: `tests/test_gen_chat_interleave.sh` (chat before gen, same image bytes, `[gen-yield] engaged`,
+cancel frees the server, chat during the mesh job), `admissionFits`, the `offload`/`boundary` tests.
+
+## An image turn never reached the SSD tier, not even its text (#494)
+
+Defect: once a session carried an image, none of it was persisted. An idle unload or restart
+then restored an older text-only entry (123k of a 364k-token Qwen3.8-Flash-Next session) and
+prefilled the rest cold.
+
+Cause: restore already served the text before the first media item, but every disk writer
+skipped media entries outright: the SSD-first capture in `commitWithMediaState`, both
+`spillDeclinedToDisk` call sites, and the plain `flushPendingDisk`.
+
+Fix: the writers persist `HotPrefixCache.diskTokens`, the record cut at the first item (the KV
+extent follows `tokens.len`, checkpoints past it are skipped). No spec snapshot rides a media
+turn, since it covers rows past the cut. The disk key stays token-only and never holds an image row.
+A hybrid restores only from an SSM checkpoint, so its record stops at the last checkpoint below
+the item (`HotPrefixCache.hybrid`, set at load) and nothing is written when there is none.
+Guard: `an image turn persists the text before its first item to the SSD tier`.
+
+## A streamed Responses turn reported no prompt-cache hit
+
+Defect: the same 3,016-token prompt sent twice to `/v1/responses` reported
+`input_tokens_details.cached_tokens` 2985 non-streaming and 0 on the streamed
+`response.completed`, and the streamed `timings` read 0 ms, while the log showed the
+`[hot-cache]` reuse.
+
+Cause: the streaming arm rebuilt its `GenerationResult` by hand and copied only the token
+counts from the finalized stream; the non-streaming arm takes every field from the slot.
+
+Fix: `StreamingTokenStream.generationResult` builds the result from everything `finalize`
+snapshotted. Guards: `a streamed turn's result keeps the prompt-cache hit and timings the
+slot measured`, `tests/test_responses_streaming.sh` [F].
+
+## The console showed 0 models behind a proxy that mounts it under a path (#698)
+
+Defect: reached through a reverse proxy that mounts the server below its own root
+(`tailscale serve --set-path /mlx-serve http://127.0.0.1:8003`), the console opened and reported
+"0 models", no memory and a dead Monitor panel — on a server with everything loaded.
+
+Cause: every console request was root-absolute (`fetch('/v1/models')`), so it resolved against the
+PROXY's origin root, not the mount that served the page — the mount answers `/<prefix>/v1/models`
+(it strips the prefix on the way in, so the server never learns it) and 404s `/v1/models`. And
+silently: that 404 body is HTML, `res.json()` throws, the catch assigns `MODELS = []`.
+
+Fix: `apiPrefix(pathname)` (`app-web/src/lib/core/console.ts`) is that mount: a last segment holding a dot
+is a file, anything else a directory. Every fetch, the API reference's own links and the base URL the
+chat system prompt hands the model resolve through it.
+Guard: `console and Monitoring share the same resolution, without query keys`
+in `app-web/test/connection.test.ts`.
+
+## A GGUF picked by its file 404'd on the first chat (2026-10-06)
+
+Defect: on a fresh app start, the first message to a GGUF quant answered `404 No model is
+registered at that path`; picking the model restarted the server instead of hot-switching,
+and the pill then named the split's file stem ("…1 Of 00002").
+
+Cause: the app names a GGUF quant by its FILE path (a per-quant folder, a split's first
+shard) and loads it with `/v1/load-model` before the turn. `probeModelDir` took folders
+only, so the load 404'd, the app swallowed it, and the chat naming the path found no entry.
+
+Fix: `probeModelDir` accepts a `.gguf` file (refusing mmproj/tokenizer/MTP sidecars and
+embedding GGUFs), and `registerByPath` names it by its stem, as `--model` does; the pill
+counts that stem as the picked model. Guards: `registerByPath takes a .gguf file`,
+`tests/test_llama_gguf.sh` [8], `testAGgufQuantShowsItsOwnLabelNotTheFileStemTheServerNamesItBy`.
+
+## MiniMax-H3 admitted a canvas it could not hold and died mid-step (#764)
+
+Defect: on a 48 GB M5 Pro, a 1536x672 x 124-frame H3 run loaded the text encoder and the DiT,
+then failed on the first denoising step with an uncatchable Metal `Insufficient Memory`;
+960x544 at the same length ran fine. The preflight printed the same `media peak ~18.05 GB`
+for every request.
+
+Cause: the only gate was the per-model one, `h3PeakBytes`, which billed a flat
+6 GiB of activations measured at 768x448. The per-step working set grows with the packed
+sequence (measured ~384 KiB a row), and the default fast recipe keeps an attention output per
+block for the attention broadcast: `num_layers x hidden_size` bf16 a row, ~525 KiB. At
+~40k rows that is 46 GB against 32 GB free; `handleVideoH3` checked the prompt, the LoRAs, the
+/32 grid and the transport cap, never memory.
+
+Fix: `h3RequestRows` (latent frames x the 32-pixel grid + stereo audio + a frame per keyframe)
+and `h3ActivationBytes` (base + rows x per-row bytes, plus the broadcast term when `resolveSpeed`
+turns it on) bill the request before any stage loads. The same term prices the resident set in
+`h3ResidentFor`, so a warm engine yields to a canvas it cannot hold, and `handleVideoH3` refuses
+the staged plan by name, quoting the need and the free memory. The per-model gate then bills
+only the smallest request's base, and on CUDA the request's DiT is billed to RAM (managed
+memory pages to the host), its activations to the GPU (`h3CanvasBill`). Guards: `h3 request
+rows`, `h3 request bill`, `h3 residency is priced on the request's activations`, `h3CanvasBill`.
+
+## A loop-stop inside the thought ended the agent's turn (2026-10-09)
+
+Defect: Qwen3.8-Flash-Next sometimes fell into `?!?!?!` while thinking. The `exact_cycle` guard cut
+the request 138-807 tokens in with `finish_reason "stop"`, so omp saw a finished turn with no tool
+call and the agent stopped after garbage.
+
+Cause: the loop guard treated a loop in reasoning like a loop in the answer. The turn had produced
+no answer, and the cut was its end.
+
+Fix: when the convicted loop sits in an open think block and the request has not recovered yet,
+`loopRecoveryAction` commits the bound's early-stop line and closer (`commitForcedTick`, shared
+with the reasoning budget) and decoding continues. Requests without a budget now arm the bound at
+an unreachable limit (`thinkBoundBudget`). A second loop, an answer-side loop, or no room before
+`max_tokens` keeps the ordinary cut.
+Guard: `loop recovery:` tests in `scheduler.zig`, `thinkBoundBudget` test in `server.zig`.
+
+
+## Bytes past `Content-Length` corrupted the heap (2026-10-10)
+
+Defect: a body longer than its declared `Content-Length` (or a `Content-Length` near 2^64) made
+the server answer the wrong body, then crash minutes later on an unrelated request (a WebSocket
+frame was the first victim in the chaos run). ReleaseFast logs nothing.
+
+Cause: the head was read in 16 KB gulps and copied whole into a buffer sized `head + Content-Length`;
+any extra bytes in the gulp overran it, and `head + Content-Length` wrapped for a near-2^64 length.
+
+Fix: `readRequest` keeps only the declared bytes and adds saturating, so a wrapping length meets the
+413 cap. A `/v1/completions` prompt that encodes to no tokens was the second crash of that run:
+`Scheduler.submit` refuses an empty prompt by name for every surface.
+Guard: `readRequest: bytes past Content-Length are dropped, a wrapping Content-Length is a 413`
+(server.zig), `a streaming fault answers with the SAME mapped error` (`EmptyPrompt`).
+
+## A refused load failed the NEXT request (2026-10-10)
+
+Defect: after `/v1/load-model` on a pack with a corrupt `.safetensors`, or an image request whose
+`lora_paths` named a file that is not safetensors (`/etc/passwd`), the request itself got its error,
+and the next unrelated chat or vision request answered 500 "generation failed".
+
+Cause: MLX's error handler latches every failure; the load's catch and `lora.loadFile` returned the
+error without dropping the latch, so the next prefill's `checkError` found it.
+
+Fix: both sites drop the latch they raised (`dropLatchedErrorUnless(had_error)`), the rule every
+swallowed MLX failure already follows. Guard: `loadFile: a file that is not safetensors fails without
+leaving an MLX error for the next request` (lora.zig).
+
+A media or decision job had the same leak: its handler answered the failure (a 500 even for a Metal
+OOM) and left the latch for the next chat. `runGenJobs` drops what the job raised, and the handlers
+answer a memory failure 503 (`jobFailureStatus`). Guards: `runGenJobs: a latch the job raised is
+dropped…` (scheduler.zig), `jobFailureStatus…` (gen.zig).
+
+## Model churn: six models under a cap of three, and nameless "Model load failed" (2026-10-10)
+
+Defect: 16 clients spread over seven small models (cap 3) left six models resident, and a few
+requests a minute answered 500 "Model load failed" with no error name and nothing in the log.
+
+Cause: the eviction planner counted `.ready` models only, so concurrent cold loads each saw room
+for themselves. And a model that finished loading had refcount 0 until its requester woke and took
+the registry lock: in that gap another load's planner evicted it (or an explicit unload claimed it),
+and the requester read a non-ready entry as a failed load.
+
+Fix: the planner counts other `.loading` entries (`countLoadingLocked`); `ensureLoaded` takes the
+requester's reference when it claims the load (`pinned`, dropped on every error), and an explicit
+unload that wins the race is the 503 "not currently loaded". The refusal log names both caps.
+Guard: `planEvictions: another model still loading counts against the model cap` (model_registry.zig).
+
+## A Stop click mid-flush crashed the server (2026-10-10)
+
+Defect: eight agent clients on Qwen3.8 Flash Next (tools, thinking, random mid-stream disconnects)
+crashed the server within ten minutes: `POINTER_BEING_FREED_WAS_NOT_ALLOCATED` in
+`handleStreamingGeneration`. Small models ran 20-minute storms clean: the window needs several held
+tokens flushing at once while the client hangs up.
+
+Cause: the tools path buffers token texts in `token_texts`; the `.flush_text` arm freed each one with
+a per-iteration `defer` while sending it. A failed send (`WriteFailed`) returned from the handler with
+the list not cleared, and the handler's own defer freed every item again. `/v1/messages` had the same
+arm.
+
+Fix: both arms free and clear the whole list in one arm-scoped defer; the loop body only sends.
+Guard: live only — eight concurrent tool-using streams with random disconnects on Flash Next, 20
+minutes clean (it crashed in ten before the fix).
+
+## A load right after an unload was refused for memory it was about to get (2026-10-10)
+
+Defect: unload GLM-5.3 (174 GB), load it again at once: 503 "only 66 GB is available". A few
+seconds later the same load passed. Under model churn this refused a thousand loads in 15 minutes.
+
+Cause: the unload frees the weights and clears MLX's cache, but the OS unwires 150 GB of pages over
+one to two seconds after that (`vm_stat` wired: 151 GB at the 200, 36 GB a second later, 5 GB after
+two). The preflight read the OS figure once, mid-release. Waiting on the GPU stream does not help:
+the pages are already out of MLX's hands.
+
+Fix: `availForLoad` hands a too-low reading to `settledAvail`, which re-reads every 100 ms while the
+figure still climbs by more than 64 MB, up to 5 s; five flat readings keep the refusal.
+Guard: `settledAvail: a refused reading waits while freed memory still reaches the OS` (scheduler.zig).
+
+## A deeply nested tool schema overflowed a connection thread's stack (2026-10-10)
+
+Defect: a chat request whose tool `parameters` nested an object 50,000 levels deep killed the
+server (SIGBUS in a stack guard page). 10,000 levels answered, in 9 s.
+
+Cause: `std.json` parses with an explicit stack, but re-serializing the tool definitions for the
+template (`chat.fillOptionalToolDefKeys` → `Stringify`) recurses once per level, as do the schema
+walkers behind it, on a thread stack.
+
+Fix: every non-multipart body (and every Responses WebSocket frame) is scanned once for its deepest
+`[`/`{` outside strings (`jsonNestingDepth`) and refused past `MAX_JSON_DEPTH` (4096: above the
+3000-deep contract in `test_api_edges.sh`, far below the overflow).
+Guard: `jsonNestingDepth: brackets inside strings never count` (server.zig).
+
+## An idle media model got an agent turn refused (2026-10-11)
+
+Defect: a pi agent on GLM-5.3 (173 GB) generating its own assets got a 400 on a 36.7k-token turn
+("requires ~10558MB … only ~9466MB is available"), and pi ended the session. Krea (14.7 GB) sat
+idle beside it from the agent's image jobs a minute earlier.
+
+Cause: the connection thread's admission credited only the hot prefix cache as reclaimable. An idle
+resident model is memory too, but only a LOAD's eviction planner ever freed one.
+
+Fix: before refusing, `checkAttentionMemory` unloads idle resident models least recently used first
+(`Scheduler.idleModelToUnload` + `unloadModelIfIdle`, never the request's own model) and re-bills
+after each, via `fitAfterUnloadingIdle`.
+Guard: `a prompt that does not fit unloads idle models, oldest first, until it fits` (server.zig).
+
+## A 16 GB Mac advertised 870 tokens beside a big model (2026-10-11)
+
+Defect: on an M4 16 GB, Qwen3.5-9B (7.6 GB) auto-sized to 870 tokens, gemma-4-e4b 8-bit to 870 and
+gemma-3-12B to 45; v26.10.1 gave the 9B 10k. The prompt cache beside it kept 2 GB.
+
+Cause: the sizer billed the fixed 2 GB cache reserve before the context, and the honest available
+figure (#776, ~0.5 GB lower) took the last of the room. The 1024 floor applied only at exactly 0,
+so 53 tokens of room advertised 45.
+
+Fix: the reserve is at most half the room beside the weights and the prefill (`ctxCacheShare`, both
+sizer paths); the load-time clamp gives the cache the residual as before. Floor at < 1024.
+Guard: `context sizer: the prompt-cache reserve never takes more than half the room beside the weights`.
+
+### An agent started from a piped script got `/dev/tty`, which Bun agents and Grok cannot watch on macOS
+The served `/launch` script (the console's Code Launcher, `curl … | sh`) arrives on stdin, so its tail reopened `/dev/tty` for the agent. pi worked (Node; libuv falls back to `select()` for that device); Claude Code, oh-my-pi and OpenCode (Bun) died on `EINVAL: invalid argument, kqueue`, Grok exited at once, and omp's unanswered terminal queries landed in the user's shell as `1;2c1;2c…`. `/dev/tty` is its own device node, not the terminal it reaches (`tty` reads `/dev/tty`, not `/dev/ttys002`), and macOS kqueue refuses it. Fix: the agent's stdin is a dup of whichever of stderr/stdout is the terminal, `/dev/tty` only when neither is (`launch.remoteScript`), and the redirect rides the agent's `exec`: the served script is still being read from stdin, so a bare `exec 0<&2` made `sh` wait on the terminal for the rest of it; `website/agent.sh` writes the setup script to `~/.mlx-serve/launch-<agent>.sh` and execs it with the terminal as stdin, which also covers servers older than the fix. Guards: a fake agent records `tty` under `expect` (`tests/test_launch_script.sh` [6], `tests/test_website_agent_install.sh` [3]).

@@ -1320,7 +1320,7 @@ fn f0NtrainForward(
 /// channel. Returns `[1, 2F]` — the channel axis is squeezed out.
 fn f0NBranch(comp: *const ltx.Component, buf: []u8, stack: []const u8, proj: []const u8, h: mlx.mlx_array, style: mlx.mlx_array, s: S) !mlx.mlx_array {
     var x = retain(h);
-    errdefer _ = mlx.mlx_array_free(x);
+    defer _ = mlx.mlx_array_free(x);
     for (0..3) |i| {
         var pfx: [128]u8 = undefined;
         const p = try std.fmt.bufPrint(&pfx, "{s}.{d}", .{ stack, i });
@@ -1328,7 +1328,6 @@ fn f0NBranch(comp: *const ltx.Component, buf: []u8, stack: []const u8, proj: []c
         _ = mlx.mlx_array_free(x);
         x = y;
     }
-    defer _ = mlx.mlx_array_free(x);
 
     const projected = try ltxa.conv1d(
         x,
@@ -1625,7 +1624,7 @@ fn istft(allocator: std.mem.Allocator, mag: mlx.mlx_array, phase: mlx.mlx_array,
     defer _ = mlx.mlx_array_free(frames_arr);
     try mlx.check(mlx.mlx_fft_irfft(&frames_arr, cplx, @intCast(n_fft), 2, mlx.MLX_FFT_NORM_BACKWARD, s));
 
-    _ = mlx.mlx_array_eval(frames_arr);
+    try mlx.check(mlx.mlx_array_eval(frames_arr));
     const shape = mlx.getShape(frames_arr);
     const n_frames: usize = @intCast(shape[1]);
     const data = mlx.mlx_array_data_float32(frames_arr) orelse return error.KokoroIstftReadFailed;
@@ -1664,7 +1663,7 @@ fn generatorForward(
     );
     defer _ = mlx.mlx_array_free(har_wave);
 
-    _ = mlx.mlx_array_eval(har_wave);
+    try mlx.check(mlx.mlx_array_eval(har_wave));
     const har_len: usize = @intCast(mlx.getShape(har_wave)[1]);
     const har_data = mlx.mlx_array_data_float32(har_wave) orelse return error.KokoroSourceReadFailed;
 
@@ -1678,7 +1677,7 @@ fn generatorForward(
     defer _ = mlx.mlx_array_free(har);
 
     var x = retain(x_in);
-    errdefer _ = mlx.mlx_array_free(x);
+    defer _ = mlx.mlx_array_free(x);
 
     const n_up = cfg.upsample_rates.len;
     for (0..n_up) |i| {
@@ -1782,7 +1781,6 @@ fn generatorForward(
         _ = mlx.mlx_array_free(x);
         x = post;
     }
-    defer _ = mlx.mlx_array_free(x);
 
     // Channels split into magnitude (exp) and phase (sin).
     const bins: c_int = @intCast(n_fft / 2 + 1);
@@ -1915,7 +1913,7 @@ fn copyToHost(a: std.mem.Allocator, arr: mlx.mlx_array, s: S) ![]f32 {
     var f = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(f);
     try mlx.check(mlx.mlx_astype(&f, arr, .float32, s));
-    _ = mlx.mlx_array_eval(f);
+    try mlx.check(mlx.mlx_array_eval(f));
     var n: c_int = 1;
     for (mlx.getShape(arr)) |d| n *= d;
     const src = mlx.mlx_array_data_float32(f) orelse return error.KokoroReadFailed;
@@ -2109,7 +2107,7 @@ pub const Model = struct {
         };
         defer _ = mlx.mlx_array_free(dur_logits);
 
-        _ = mlx.mlx_array_eval(dur_logits);
+        try mlx.check(mlx.mlx_array_eval(dur_logits));
         const logit_data = mlx.mlx_array_data_float32(dur_logits) orelse return error.KokoroDurationReadFailed;
         const durations = try predictedDurations(a, logit_data[0 .. ids.len * self.cfg.max_dur], ids.len, self.cfg.max_dur, speed);
         defer a.free(durations);
@@ -2200,17 +2198,85 @@ pub const Engine = struct {
         defer a.free(phonemes);
         log.debug("[kokoro] \"{s}\" → {s}\n", .{ text, phonemes });
 
-        const samples = try self.model.synthesize(phonemes, voice, speed, seed);
-        defer a.free(samples);
-        return wav.encodePcm16Mono(a, samples, self.model.cfg.sample_rate);
+        // One forward reads at most the BERT context (two ids are boundary zeros), so longer
+        // input is spoken window by window, as the reference pipeline does.
+        var samples: std.ArrayList(f32) = .empty;
+        defer samples.deinit(a);
+        var rest = phonemes;
+        while (rest.len > 0) {
+            const cut = phonemeWindow(rest, self.model.cfg.bert_max_pos - 2);
+            const piece: ?[]f32 = if (!hasSpeakable(rest[0..cut])) null else self.model.synthesize(rest[0..cut], voice, speed, seed) catch |err| switch (err) {
+                error.EmptyKokoroInput => null, // a window of marks and spaces only
+                else => return err,
+            };
+            rest = rest[cut..];
+            if (piece) |p| {
+                defer a.free(p);
+                try samples.appendSlice(a, p);
+            }
+        }
+        if (samples.items.len == 0) return error.EmptyKokoroInput;
+        return wav.encodePcm16Mono(a, samples.items, self.model.cfg.sample_rate);
     }
 };
+
+/// Byte length of the longest prefix of `phonemes` within `max_cps` codepoints, cut after its
+/// last sentence mark, else clause mark, else space; a hard cut only when it has none.
+pub fn phonemeWindow(phonemes: []const u8, max_cps: usize) usize {
+    var i: usize = 0;
+    var cps: usize = 0;
+    var sentence: usize = 0;
+    var clause: usize = 0;
+    var space: usize = 0;
+    while (i < phonemes.len and cps < max_cps) : (cps += 1) {
+        const end = @min(i + (std.unicode.utf8ByteSequenceLength(phonemes[i]) catch 1), phonemes.len);
+        switch (phonemes[i]) {
+            '.', '!', '?' => sentence = end,
+            ',', ';', ':' => clause = end,
+            ' ' => space = end,
+            else => {},
+        }
+        i = end;
+    }
+    if (i == phonemes.len) return i;
+    return if (sentence > 0) sentence else if (clause > 0) clause else if (space > 0) space else i;
+}
 
 // ════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════
 
 const testing = std.testing;
+
+/// Whether `phonemes` holds a sound: the vocab encodes marks too, and a run of them alone
+/// synthesizes silence.
+fn hasSpeakable(phonemes: []const u8) bool {
+    const view = std.unicode.Utf8View.init(phonemes) catch return true;
+    var it = view.iterator();
+    while (it.nextCodepoint()) |cp| switch (cp) {
+        ' ', '.', ',', '!', '?', ';', ':', '"', '(', ')', '—', '…', '«', '»', '“', '”', '¡', '¿' => {},
+        else => return true,
+    };
+    return false;
+}
+
+test "kokoro: hasSpeakable is false for marks and spaces alone" {
+    try testing.expect(hasSpeakable("hˈɛloʊ."));
+    try testing.expect(hasSpeakable("ə"));
+    try testing.expect(!hasSpeakable("!!! ... ???"));
+    try testing.expect(!hasSpeakable("— … «» “” ¡¿ ;:,"));
+    try testing.expect(!hasSpeakable(""));
+}
+
+test "kokoro: phonemeWindow cuts long input at the last sentence, clause or word mark that fits" {
+    try testing.expectEqual(@as(usize, 6), phonemeWindow("hˈɛ.", 10)); // fits whole
+    try testing.expectEqual(@as(usize, 3), phonemeWindow("ab. cd, ef gh", 4)); // after "."
+    try testing.expectEqual(@as(usize, 6), phonemeWindow("ab cd, ef gh", 8)); // after ","
+    try testing.expectEqual(@as(usize, 6), phonemeWindow("ab cd ef gh", 7)); // after the space
+    try testing.expectEqual(@as(usize, 4), phonemeWindow("abcdefgh", 4)); // no mark: hard cut
+    // Counted in codepoints, never cut inside one: "ə" is two bytes.
+    try testing.expectEqual(@as(usize, 6), phonemeWindow("əəəəə", 3));
+}
 
 test "kokoro: config defaults survive an empty object and samplesPerFrame is 300" {
     const cfg = try parseConfig(testing.allocator, "{}");

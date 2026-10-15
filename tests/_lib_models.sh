@@ -40,15 +40,23 @@ find_model() {
 
 # On-disk size in whole GB, rounded up, following symlinked shards.
 model_gb() {
-    local kb
+    local kb ngram
     kb=$(du -skL "$1" 2>/dev/null | cut -f1)
+    # qwen4_exp's n-gram table is mmapped and read by row, never wired: it is not GPU weight.
+    ngram=$(du -skL "$1/ngram_table.bin" 2>/dev/null | cut -f1)
+    kb=$(( ${kb:-0} - ${ngram:-0} ))
     echo $(( (${kb:-0} + 1048575) / 1048576 ))
 }
 
 # Metal's working set: iogpu.wired_limit_mb when it is raised, else the macOS
-# default of about 3/4 of RAM.
+# default of about 3/4 of RAM. Linux: the first NVIDIA GPU's memory.
 gpu_budget_gb() {
     local mb
+    if [[ "$(uname)" == Linux ]]; then
+        mb=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
+        echo $(( ${mb:-0} / 1024 ))
+        return
+    fi
     mb=$(sysctl -n iogpu.wired_limit_mb 2>/dev/null)
     [[ "${mb:-0}" -gt 0 ]] || mb=$(( $(sysctl -n hw.memsize) / 1048576 * 3 / 4 ))
     echo $(( mb / 1024 ))

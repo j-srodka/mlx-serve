@@ -50,7 +50,7 @@ pub fn routeClass(method: []const u8, path: []const u8) RouteClass {
     const eql = std.mem.eql;
     if (eql(u8, method, "OPTIONS")) return .open; // CORS preflight
     if (eql(u8, method, "GET")) {
-        for ([_][]const u8{ "/health", "/v1/models", "/api/version" }) |p|
+        for ([_][]const u8{ "/health", "/v1/models", "/api/version", "/launch" }) |p|
             if (eql(u8, path, p)) return .open;
         return .denied;
     }
@@ -60,10 +60,11 @@ pub fn routeClass(method: []const u8, path: []const u8) RouteClass {
             "/v1/messages",           "/v1/responses",
             "/v1/embeddings",         "/v1/images/generations",
             "/v1/images/edits",       "/v1/audio/speech",
-            "/v1/audio/music-generations",
+            "/v1/audio/music-generations", "/v1/audio/sound-generations",
             "/v1/video/generations",  "/v1/video/refmods",  "/v1/3d/generations",
             "/api/chat",              "/api/generate",
             "/api/embed",             "/api/embeddings",
+            "/v1/audio/transcriptions",
         }) |p| if (eql(u8, path, p)) return .model_gated;
         return .denied;
     }
@@ -269,6 +270,8 @@ const ResolveReply = *const fn (DNSServiceRef, u32, u32, i32, ?[*:0]const u8, ?[
 const AddrInfoReply = *const fn (DNSServiceRef, u32, u32, i32, ?[*:0]const u8, ?*const std.posix.sockaddr, u32, ?*anyopaque) callconv(.c) void;
 
 extern "c" fn DNSServiceRegister(ref: *DNSServiceRef, flags: u32, interface: u32, name: ?[*:0]const u8, regtype: [*:0]const u8, domain: ?[*:0]const u8, host: ?[*:0]const u8, port_be: u16, txt_len: u16, txt: ?*const anyopaque, cb: ?*const anyopaque, ctx: ?*anyopaque) i32;
+/// Linux's dns_sd is Avahi's compat layer, which fails every call (-65537) when avahi-daemon is down.
+const daemon_hint = if (@import("builtin").os.tag == .linux) " (is avahi-daemon running? systemctl enable --now avahi-daemon)" else "";
 extern "c" fn DNSServiceBrowse(ref: *DNSServiceRef, flags: u32, interface: u32, regtype: [*:0]const u8, domain: ?[*:0]const u8, cb: BrowseReply, ctx: ?*anyopaque) i32;
 extern "c" fn DNSServiceResolve(ref: *DNSServiceRef, flags: u32, interface: u32, name: [*:0]const u8, regtype: [*:0]const u8, domain: [*:0]const u8, cb: ResolveReply, ctx: ?*anyopaque) i32;
 extern "c" fn DNSServiceGetAddrInfo(ref: *DNSServiceRef, flags: u32, interface: u32, protocol: u32, hostname: [*:0]const u8, cb: AddrInfoReply, ctx: ?*anyopaque) i32;
@@ -287,6 +290,8 @@ const Peer = struct {
     ip4: [4]u8,
     port: u16,
     models: []PeerModel,
+    /// The peer answered 401: it runs with --api-key and we hold no working key.
+    needs_key: bool = false,
 
     fn deinit(p: *Peer, alloc: std.mem.Allocator) void {
         freePeerModels(alloc, p.models);
@@ -329,6 +334,8 @@ pub const Options = struct {
     /// Advertised instance name; null → hostname (".local" stripped).
     name: ?[]const u8 = null,
     discover: bool = false,
+    /// `~/.mlx-serve/lan-keys.json`: the key each keyed peer requires.
+    keys_path: ?[]const u8 = null,
 };
 
 pub const Lan = struct {
@@ -336,6 +343,7 @@ pub const Lan = struct {
     port: u16,
     discover: bool,
     share: ?SharedSet = null,
+    keys_path: ?[:0]u8 = null,
     name_buf: [64]u8 = undefined,
     name: []const u8 = "",
     /// Random per-process token in the TXT record — how a browser recognizes
@@ -371,6 +379,8 @@ pub const Lan = struct {
             .peers = .init(alloc),
             .known = .init(alloc),
         };
+        if (opts.keys_path) |p| l.keys_path = try alloc.dupeSentinel(u8, p, 0);
+        errdefer if (l.keys_path) |p| alloc.free(p);
         var rnd: [8]u8 = undefined;
         std.c.arc4random_buf(&rnd, rnd.len);
         _ = std.fmt.bufPrint(&l.token_hex, "{x:0>16}", .{std.mem.readInt(u64, &rnd, .big)}) catch unreachable;
@@ -417,6 +427,7 @@ pub const Lan = struct {
         }
         l.known.deinit();
         if (l.share) |*s| s.deinit(l.alloc);
+        if (l.keys_path) |p| l.alloc.free(p);
         const alloc = l.alloc;
         alloc.destroy(l);
     }
@@ -448,6 +459,26 @@ pub const Lan = struct {
         for (p.models) |m|
             if (std.mem.eql(u8, m.id, rid.bare)) return .{ .found = .{ .ip4 = p.ip4, .port = p.port } };
         return if (p.models.len == 0) .peer_unknown else .model_unlisted;
+    }
+
+    /// The key `peer` requires (owned), read fresh so an edit applies at once.
+    pub fn peerKey(l: *const Lan, alloc: std.mem.Allocator, peer: []const u8) ?[]u8 {
+        const path = l.keys_path orelse return null;
+        const json = readSmallFile(alloc, path) orelse return null;
+        defer alloc.free(json);
+        return peerKeyFromJson(alloc, json, peer);
+    }
+
+    /// Append the names of peers that refused us for want of a key, as JSON
+    /// strings (sanitized names need no escaping).
+    pub fn appendPeersNeedingKey(l: *Lan, alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) !void {
+        _ = std.c.pthread_mutex_lock(&l.mu);
+        defer _ = std.c.pthread_mutex_unlock(&l.mu);
+        var it = l.peers.valueIterator();
+        while (it.next()) |p| if (p.needs_key) {
+            if (buf.items.len > 0) try buf.append(alloc, ',');
+            try buf.print(alloc, "\"{s}\"", .{p.display});
+        };
     }
 
     /// Ask the browser thread to re-attempt every known service NOW instead
@@ -489,7 +520,7 @@ pub const Lan = struct {
         name_z[l.name.len] = 0;
         const err = DNSServiceRegister(&l.reg_ref, 0, 0, @ptrCast(&name_z), SERVICE_TYPE, null, null, std.mem.nativeToBig(u16, l.port), @intCast(txt.len), txt.ptr, null, null);
         if (err != 0) {
-            log.warn("[lan] Bonjour registration failed ({d}); sharing not advertised\n", .{err});
+            log.warn("[lan] Bonjour registration failed ({d}); sharing not advertised{s}\n", .{ err, daemon_hint });
             l.reg_ref = null;
         } else {
             const n = if (l.share.?.all) "all models" else "selected models";
@@ -506,7 +537,7 @@ pub const Lan = struct {
         }
     }
 
-    fn installPeer(l: *Lan, display: []const u8, ip4: [4]u8, port: u16, models: []PeerModel) void {
+    fn installPeer(l: *Lan, display: []const u8, ip4: [4]u8, port: u16, models: []PeerModel, needs_key: bool) void {
         const owned = l.alloc.dupe(u8, display) catch {
             freePeerModels(l.alloc, models);
             return;
@@ -517,7 +548,7 @@ pub const Lan = struct {
             var old = kv.value;
             old.deinit(l.alloc);
         }
-        const p = Peer{ .display = owned, .ip4 = ip4, .port = port, .models = models };
+        const p = Peer{ .display = owned, .ip4 = ip4, .port = port, .models = models, .needs_key = needs_key };
         l.peers.put(p.display, p) catch {
             var tmp = p;
             tmp.deinit(l.alloc);
@@ -565,8 +596,11 @@ pub const Lan = struct {
         var ip4: [4]u8 = candidates[0];
         var models: ?[]PeerModel = null;
         var reachable = false;
+        var needs_key = false;
+        const key = l.peerKey(l.alloc, display);
+        defer if (key) |k| l.alloc.free(k);
         for (candidates) |cand| {
-            models = fetchPeerModels(l.alloc, cand, res.port, display, &l.token_hex) catch |err| switch (err) {
+            models = fetchPeerModels(l.alloc, cand, res.port, display, &l.token_hex, key) catch |err| switch (err) {
                 error.PeerUnreachable => {
                     log.debug("[lan] \"{s}\" unreachable at {d}.{d}.{d}.{d}:{d}\n", .{ display, cand[0], cand[1], cand[2], cand[3], res.port });
                     continue;
@@ -575,6 +609,11 @@ pub const Lan = struct {
                 // self — resolve-time TXT check can't see it). Forget the
                 // service; the real record, if any, re-registers via browse.
                 error.SelfFetch => return .self_ad,
+                error.Unauthorized => blk: {
+                    log.debug("[lan] \"{s}\" needs an API key (lan-keys.json)\n", .{display});
+                    needs_key = true;
+                    break :blk null;
+                },
                 else => blk: {
                     // Connected but no usable answer (booting, mid-restart):
                     // keep the peer listed empty; the next refresh heals it.
@@ -588,7 +627,7 @@ pub const Lan = struct {
         }
         if (!reachable) return .failed;
         const fetched = models orelse {
-            l.installPeer(display, ip4, res.port, &.{});
+            l.installPeer(display, ip4, res.port, &.{}, needs_key);
             return .installed;
         };
         const changed = blk: {
@@ -598,7 +637,7 @@ pub const Lan = struct {
             break :blk p.models.len != fetched.len;
         };
         const count = fetched.len;
-        l.installPeer(display, ip4, res.port, fetched);
+        l.installPeer(display, ip4, res.port, fetched, false);
         if (changed)
             log.info("[lan] peer \"{s}\" at {d}.{d}.{d}.{d}:{d} shares {d} models\n", .{ display, ip4[0], ip4[1], ip4[2], ip4[3], res.port, count });
         return .installed;
@@ -772,6 +811,7 @@ fn threadMain(l: *Lan) void {
     defer if (browse_ref != null) DNSServiceRefDeallocate(browse_ref);
 
     var last_refresh = monoMs();
+    var keys_stamp: i64 = if (l.keys_path) |p| fileStamp(p) else 0;
     // Dead refs are REVIVED, never left null forever: an mDNSResponder
     // restart (macOS update, daemon crash) or a sleep/wake cycle can
     // invalidate every dns_sd connection at once, and a permanently-dead
@@ -785,7 +825,7 @@ fn threadMain(l: *Lan) void {
             revive_at = now_ms + REVIVE_INTERVAL_MS;
             if (l.discover and browse_ref == null) {
                 if (DNSServiceBrowse(&browse_ref, 0, 0, SERVICE_TYPE, null, onBrowse, l) != 0) {
-                    log.warn("[lan] Bonjour browse failed to start; retrying in {d} s\n", .{@divTrunc(REVIVE_INTERVAL_MS, 1000)});
+                    log.warn("[lan] Bonjour browse failed to start; retrying in {d} s{s}\n", .{ @divTrunc(REVIVE_INTERVAL_MS, 1000), daemon_hint });
                     browse_ref = null;
                 } else {
                     log.info("[lan] discovering peers ({s})\n", .{SERVICE_TYPE});
@@ -851,13 +891,85 @@ fn threadMain(l: *Lan) void {
             l.attemptKnown(ev.name);
         }
         const now = monoMs();
-        const poked = l.refresh_asap.swap(false, .acq_rel);
+        var poked = l.refresh_asap.swap(false, .acq_rel);
+        // A saved key retries its peer now, not at the next refresh.
+        if (l.keys_path) |p| {
+            const stamp = fileStamp(p);
+            if (stamp != keys_stamp) poked = true;
+            keys_stamp = stamp;
+        }
         if (l.discover and (poked or now - last_refresh > 10_000)) {
             last_refresh = now;
             l.refreshKnown();
         }
     }
 }
+
+const FileStat = struct { mtime_ns: i64, regular: bool };
+
+/// `path` relative to the cwd, or the open `fd` itself when `path` is empty.
+/// `std.c.Stat` is Darwin-only in Zig 0.17, so Linux reads `statx`.
+fn statFile(fd: std.c.fd_t, path: [*:0]const u8) ?FileStat {
+    if (comptime @import("builtin").os.tag == .linux) {
+        const linux = std.os.linux;
+        var sx: linux.Statx = undefined;
+        const flags: u32 = if (path[0] == 0) linux.AT.EMPTY_PATH else 0;
+        if (linux.errno(linux.statx(fd, path, flags, .{ .TYPE = true, .MTIME = true }, &sx)) != .SUCCESS) return null;
+        return .{ .mtime_ns = sx.mtime.sec * 1_000_000_000 + sx.mtime.nsec, .regular = linux.S.ISREG(sx.mode) };
+    }
+    var st: std.c.Stat = undefined;
+    if ((if (path[0] == 0) std.c.fstat(fd, &st) else std.c.stat(path, &st)) != 0) return null;
+    const m = st.mtime();
+    return .{
+        .mtime_ns = @as(i64, @intCast(m.sec)) * 1_000_000_000 + @as(i64, @intCast(m.nsec)),
+        .regular = st.mode & std.c.S.IFMT == std.c.S.IFREG,
+    };
+}
+
+/// mtime in ns, 0 when the file is absent.
+fn fileStamp(path: [*:0]const u8) i64 {
+    const st = statFile(std.c.AT.FDCWD, path) orelse return 0;
+    return st.mtime_ns;
+}
+
+/// Regular files only, opened non-blocking: a FIFO at the path would park the
+/// browser thread in `open` until a writer came, and discovery with it.
+fn readSmallFile(alloc: std.mem.Allocator, path: [*:0]const u8) ?[]u8 {
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true }, @as(std.c.mode_t, 0));
+    if (fd < 0) return null;
+    defer _ = std.c.close(fd);
+    const st = statFile(fd, "") orelse return null;
+    if (!st.regular) return null;
+    var buf: std.ArrayList(u8) = .empty;
+    var chunk: [4096]u8 = undefined;
+    while (buf.items.len < 64 * 1024) {
+        const n = readFd(fd, &chunk) catch break;
+        if (n == 0) return buf.toOwnedSlice(alloc) catch break;
+        buf.appendSlice(alloc, chunk[0..n]) catch break;
+    }
+    buf.deinit(alloc);
+    return null;
+}
+
+/// `peer`'s key out of lan-keys.json (`{"<peer>": "<key>"}`, written by the
+/// app). Null when absent, or when it could break the header it rides in.
+pub fn peerKeyFromJson(alloc: std.mem.Allocator, json: []const u8, peer: []const u8) ?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, json, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const v = parsed.value.object.get(peer) orelse return null;
+    if (v != .string or v.string.len == 0) return null;
+    for (v.string) |c| if (c < 0x20 or c == 0x7f) return null;
+    return alloc.dupe(u8, v.string) catch null;
+}
+
+/// The `Authorization` header line for a keyed peer; nothing without a key.
+const AuthLine = struct {
+    key: ?[]const u8,
+    pub fn format(self: AuthLine, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (self.key) |k| try w.print("Authorization: Bearer {s}\r\n", .{k});
+    }
+};
 
 /// Monotonic milliseconds without an `Io` handle (this thread has none —
 /// same rationale as log.zig's raw-libc sink).
@@ -869,6 +981,7 @@ fn monoMs() i64 {
 
 /// One dns_sd ref pumped until its callback flips `done` or the deadline hits.
 fn pumpUntil(ref: DNSServiceRef, done: *const bool, timeout_ms: i64) bool {
+    if (done.*) return true; // answered synchronously (the Linux GetAddrInfo in ane_stub.c)
     const fd = DNSServiceRefSockFD(ref);
     if (fd < 0) return false;
     const deadline = monoMs() + timeout_ms;
@@ -954,19 +1067,22 @@ pub fn headerValueCI(head: []const u8, name_lower: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Discovery fetch: GET the peer's (shared-filtered) /v1/models.
+/// Discovery fetch: GET the peer's (shared-filtered) /v1/models, with its key
+/// when we hold one; `error.Unauthorized` when a keyed peer refuses us.
 /// `error.SelfFetch` when the response carries OUR OWN process token
 /// (`X-MLX-LAN-Token`): a stale Bonjour record of a former self — same name
 /// and port, different TXT token, so the resolve-time TXT check can't catch
 /// it — resolves back to this very server, and the loopback-first fetch
 /// would happily install our own models as a "peer" (live test_lan_share
 /// self-mirror after the peer-restart section, 2026-07-21).
-fn fetchPeerModels(alloc: std.mem.Allocator, ip4: [4]u8, port: u16, peer_display: []const u8, own_token: []const u8) ![]PeerModel {
+fn fetchPeerModels(alloc: std.mem.Allocator, ip4: [4]u8, port: u16, peer_display: []const u8, own_token: []const u8, key: ?[]const u8) ![]PeerModel {
     const fd = try connectTimeout(ip4, port, 3000);
     defer _ = std.c.close(fd);
     const tv = std.c.timeval{ .sec = 5, .usec = 0 };
     std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
-    try writeAllFd(fd, "GET /v1/models HTTP/1.1\r\nHost: mlx-serve\r\nConnection: close\r\nX-MLX-LAN: 1\r\n\r\n");
+    const req = try std.fmt.allocPrint(alloc, "GET /v1/models HTTP/1.1\r\nHost: mlx-serve\r\nConnection: close\r\nX-MLX-LAN: 1\r\n{f}\r\n", .{AuthLine{ .key = key }});
+    defer alloc.free(req);
+    try writeAllFd(fd, req);
     var resp: std.ArrayList(u8) = .empty;
     defer resp.deinit(alloc);
     var chunk: [16 * 1024]u8 = undefined;
@@ -977,6 +1093,7 @@ fn fetchPeerModels(alloc: std.mem.Allocator, ip4: [4]u8, port: u16, peer_display
     }
     const raw = resp.items;
     const line_end = std.mem.indexOf(u8, raw, "\r\n") orelse return error.BadPeerJson;
+    if (std.mem.indexOf(u8, raw[0..line_end], " 401") != null) return error.Unauthorized;
     if (std.mem.indexOf(u8, raw[0..line_end], " 200") == null) return error.BadPeerJson;
     const header_end = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.BadPeerJson;
     if (headerValueCI(raw[0..header_end], "x-mlx-lan-token")) |tok| {
@@ -993,14 +1110,14 @@ fn fetchPeerModels(alloc: std.mem.Allocator, ip4: [4]u8, port: u16, peer_display
 /// (the caller can still send a clean 502); any later failure just ends the
 /// stream — the client sees a closed socket, the peer sees a disconnect and
 /// cancels its slot.
-pub fn tunnel(remote: Remote, method: []const u8, raw_path: []const u8, body: []const u8, conn: anytype) error{PeerUnreachable}!void {
+pub fn tunnel(remote: Remote, method: []const u8, raw_path: []const u8, body: []const u8, key: ?[]const u8, conn: anytype) error{PeerUnreachable}!void {
     const fd = connectTimeout(remote.ip4, remote.port, 3000) catch return error.PeerUnreachable;
     defer _ = std.c.close(fd);
-    var head_buf: [1024]u8 = undefined;
+    var head_buf: [2048]u8 = undefined;
     const head = std.fmt.bufPrint(
         &head_buf,
-        "{s} {s} HTTP/1.1\r\nHost: {d}.{d}.{d}.{d}:{d}\r\nContent-Type: application/json\r\nAccept: */*\r\nConnection: close\r\nX-MLX-LAN: 1\r\nContent-Length: {d}\r\n\r\n",
-        .{ method, raw_path, remote.ip4[0], remote.ip4[1], remote.ip4[2], remote.ip4[3], remote.port, body.len },
+        "{s} {s} HTTP/1.1\r\nHost: {d}.{d}.{d}.{d}:{d}\r\nContent-Type: application/json\r\nAccept: */*\r\nConnection: close\r\nX-MLX-LAN: 1\r\n{f}Content-Length: {d}\r\n\r\n",
+        .{ method, raw_path, remote.ip4[0], remote.ip4[1], remote.ip4[2], remote.ip4[3], remote.port, AuthLine{ .key = key }, body.len },
     ) catch return error.PeerUnreachable;
     writeAllFd(fd, head) catch return error.PeerUnreachable;
     writeAllFd(fd, body) catch return error.PeerUnreachable;
@@ -1027,6 +1144,15 @@ pub fn tunnel(remote: Remote, method: []const u8, raw_path: []const u8, body: []
 // ─────────────────────────────────────────────────────────────────────────────
 
 const t = std.testing;
+
+test "lan: peer address lookup answers on Linux, where Avahi lacks GetAddrInfo" {
+    if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var addr: AddrOut = .{};
+    var aref: DNSServiceRef = null;
+    try std.testing.expectEqual(@as(i32, 0), DNSServiceGetAddrInfo(&aref, 0, 0, kDNSServiceProtocol_IPv4, "localhost", onAddr, &addr));
+    try std.testing.expect(pumpUntil(aref, &addr.done, 1000));
+    try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &addr.ip4s[0]);
+}
 
 test "lan: headerValueCI finds a header case-insensitively and trims the value" {
     const head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-MLX-LAN-Token: deadbeefcafef00d\r\n";
@@ -1075,16 +1201,18 @@ test "lan: routeClass allows exactly the shared inference surface" {
     try t.expectEqual(RouteClass.open, routeClass("GET", "/health"));
     try t.expectEqual(RouteClass.open, routeClass("GET", "/v1/models"));
     try t.expectEqual(RouteClass.open, routeClass("GET", "/api/version"));
+    try t.expectEqual(RouteClass.open, routeClass("GET", "/launch"));
     // Inference is model-gated on every surface, media included.
     for ([_][]const u8{
         "/v1/chat/completions",        "/v1/completions",
         "/v1/messages",                "/v1/responses",
         "/v1/embeddings",              "/v1/images/generations",
         "/v1/images/edits",            "/v1/audio/speech",
-        "/v1/audio/music-generations",
+        "/v1/audio/music-generations", "/v1/audio/sound-generations",
         "/v1/video/generations",       "/v1/video/refmods",       "/v1/3d/generations",
         "/api/chat",                   "/api/generate",
         "/api/embed",                  "/api/embeddings",
+        "/v1/audio/transcriptions",
     }) |p| try t.expectEqual(RouteClass.model_gated, routeClass("POST", p));
     // Admin/host-local stays denied.
     try t.expectEqual(RouteClass.denied, routeClass("POST", "/v1/load-model"));
@@ -1226,7 +1354,7 @@ test "lan: lookupRemote distinguishes found / unlisted / unknown" {
 
     const models = try a.alloc(PeerModel, 1);
     models[0] = .{ .id = try a.dupe(u8, "gemma"), .entry_json = try a.dupe(u8, "{}") };
-    l.installPeer("studio", .{ 127, 0, 0, 1 }, 1234, models);
+    l.installPeer("studio", .{ 127, 0, 0, 1 }, 1234, models, false);
     try t.expect(l.lookupRemote("gemma@studio") == .found);
     // The peer answered recently and does NOT offer this model — definitive,
     // fail fast (probes/typos must not burn the wait).
@@ -1234,8 +1362,63 @@ test "lan: lookupRemote distinguishes found / unlisted / unknown" {
 
     // A mid-boot empty install (peer reachable, models not served yet)
     // counts as unknown so the wait covers it too.
-    l.installPeer("booting", .{ 127, 0, 0, 1 }, 1235, &.{});
+    l.installPeer("booting", .{ 127, 0, 0, 1 }, 1235, &.{}, false);
     try t.expect(l.lookupRemote("anything@booting") == .peer_unknown);
+}
+
+test "lan: peerKeyFromJson reads one peer's key and refuses header-breaking values" {
+    const a = t.allocator;
+    const json = "{\"Studio\":\"s3cret\",\"Empty\":\"\",\"Num\":5,\"Evil\":\"a\\r\\nX-Injected: 1\"}";
+    const k = peerKeyFromJson(a, json, "Studio").?;
+    defer a.free(k);
+    try t.expectEqualStrings("s3cret", k);
+    try t.expect(peerKeyFromJson(a, json, "Missing") == null);
+    try t.expect(peerKeyFromJson(a, json, "Empty") == null);
+    try t.expect(peerKeyFromJson(a, json, "Num") == null);
+    try t.expect(peerKeyFromJson(a, json, "Evil") == null);
+    try t.expect(peerKeyFromJson(a, "not json", "Studio") == null);
+}
+
+test "lan: a keys path that is not a regular file reads as absent without blocking" {
+    var buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&buf, "/tmp/mlx-serve-lan-fifo-{d}", .{std.c.getpid()}, 0);
+    const C = struct {
+        extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+    };
+    _ = std.c.unlink(path);
+    try t.expect(C.mkfifo(path, 0o600) == 0);
+    defer _ = std.c.unlink(path);
+    try t.expect(readSmallFile(t.allocator, path) == null);
+    try t.expect(readSmallFile(t.allocator, "/tmp") == null);
+}
+
+test "lan: fileStamp is a file's mtime, and 0 when it is absent" {
+    var buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&buf, "/tmp/mlx-serve-lan-stamp-{d}", .{std.c.getpid()}, 0);
+    _ = std.c.unlink(path);
+    try t.expectEqual(@as(i64, 0), fileStamp(path));
+    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true }, @as(std.c.mode_t, 0o600));
+    try t.expect(fd >= 0);
+    _ = std.c.close(fd);
+    defer _ = std.c.unlink(path);
+    try t.expect(fileStamp(path) > 0);
+}
+
+test "lan: a peer that answered 401 is listed as needing a key" {
+    const a = t.allocator;
+    var l = Lan{ .alloc = a, .port = 0, .discover = true, .peers = .init(a), .known = .init(a) };
+    defer {
+        var it = l.peers.valueIterator();
+        while (it.next()) |p| p.deinit(a);
+        l.peers.deinit();
+        l.known.deinit();
+    }
+    l.installPeer("open", .{ 127, 0, 0, 1 }, 1, &.{}, false);
+    l.installPeer("locked", .{ 127, 0, 0, 1 }, 2, &.{}, true);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try l.appendPeersNeedingKey(a, &buf);
+    try t.expectEqualStrings("\"locked\"", buf.items);
 }
 
 /// Duck-typed stand-in for server.Conn in tunnel tests.
@@ -1287,10 +1470,11 @@ test "lan: tunnel forwards the rewritten request and pumps a chunked streaming r
                 got += n;
                 if (std.mem.indexOf(u8, req[0..got], "\"messages\":[]}") != null) break;
             }
-            // The peer must see the BARE id and no trace of the @peer suffix.
+            // The peer must see the BARE id, no trace of the @peer suffix, and its key.
             const rewritten = std.mem.indexOf(u8, req[0..got], "\"model\":\"bare-model\"") != null and
                 std.mem.indexOf(u8, req[0..got], "@Studio") == null and
-                std.mem.indexOf(u8, req[0..got], "POST /v1/chat/completions HTTP/1.1") != null;
+                std.mem.indexOf(u8, req[0..got], "POST /v1/chat/completions HTTP/1.1") != null and
+                std.mem.indexOf(u8, req[0..got], "\r\nAuthorization: Bearer s3cret\r\n") != null;
             say(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
             say(c, if (rewritten) "data: ok\n\n" else "data: WRONG-REQUEST\n\n");
             const ts = std.c.timespec{ .sec = 0, .nsec = 20_000_000 };
@@ -1308,7 +1492,7 @@ test "lan: tunnel forwards the rewritten request and pumps a chunked streaming r
 
     var sink = TestSink{ .alloc = a };
     defer sink.buf.deinit(a);
-    try tunnel(.{ .ip4 = .{ 127, 0, 0, 1 }, .port = port }, "POST", "/v1/chat/completions", rewritten, &sink);
+    try tunnel(.{ .ip4 = .{ 127, 0, 0, 1 }, .port = port }, "POST", "/v1/chat/completions", rewritten, "s3cret", &sink);
 
     try t.expect(std.mem.indexOf(u8, sink.buf.items, "HTTP/1.1 200 OK") != null);
     try t.expect(std.mem.indexOf(u8, sink.buf.items, "data: ok") != null);
@@ -1324,6 +1508,44 @@ test "lan: tunnel to a dead peer fails before writing anything to the client" {
 
     var sink = TestSink{ .alloc = a };
     defer sink.buf.deinit(a);
-    try t.expectError(error.PeerUnreachable, tunnel(.{ .ip4 = .{ 127, 0, 0, 1 }, .port = port }, "POST", "/v1/messages", "{}", &sink));
+    try t.expectError(error.PeerUnreachable, tunnel(.{ .ip4 = .{ 127, 0, 0, 1 }, .port = port }, "POST", "/v1/messages", "{}", null, &sink));
     try t.expectEqual(@as(usize, 0), sink.buf.items.len);
+}
+
+test "lan: discovery sends the peer's key, and a keyed peer's 401 reads as Unauthorized" {
+    const a = t.allocator;
+    var port: u16 = 0;
+    const lst = try testListener(&port);
+    defer _ = std.c.close(lst);
+
+    const KeyedPeer = struct {
+        fn run(listener: fd_t) void {
+            for (0..2) |_| {
+                const c = std.c.accept(listener, null, null);
+                if (c < 0) return;
+                defer _ = std.c.close(c);
+                var req: [4096]u8 = undefined;
+                var got: usize = 0;
+                while (got < req.len) {
+                    const n = readFd(c, req[got..]) catch return;
+                    if (n == 0) break;
+                    got += n;
+                    if (std.mem.indexOf(u8, req[0..got], "\r\n\r\n") != null) break;
+                }
+                const reply = if (std.mem.indexOf(u8, req[0..got], "\r\nAuthorization: Bearer s3cret\r\n") != null)
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"object\":\"list\",\"data\":[{\"id\":\"gemma\"}]}"
+                else
+                    "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n{}";
+                _ = std.c.write(c, reply.ptr, reply.len);
+            }
+        }
+    };
+    const th = try std.Thread.spawn(.{}, KeyedPeer.run, .{lst});
+    defer th.join();
+
+    try t.expectError(error.Unauthorized, fetchPeerModels(a, .{ 127, 0, 0, 1 }, port, "Studio", "own-token", null));
+    const models = try fetchPeerModels(a, .{ 127, 0, 0, 1 }, port, "Studio", "own-token", "s3cret");
+    defer freePeerModels(a, models);
+    try t.expectEqual(@as(usize, 1), models.len);
+    try t.expectEqualStrings("gemma", models[0].id);
 }

@@ -1,7 +1,7 @@
 .zig-cache/
 zig-out/
 
-# Pinned Zig nightly, staged at build time by scripts/fetch-zig.sh (not vendored)
+# Pinned Zig release, staged at build time by scripts/fetch-zig.sh (not vendored)
 /.zig-toolchain
 # .claude stays private (settings.local.json, locks) EXCEPT checked-in project skills
 .claude/*
@@ -28,7 +28,11 @@ zig-out/
 /lib/.mlx-build/
 # Linux counterpart staging work dir (scripts/build-mlx-linux.sh)
 /.work-mlx-linux/
+/.work-mlx-linux-cuda/
+/.work-mlx-linux-cpu/
 /lib/jinja_cpp/libjinja-linux.a
+# ds4 CUDA library (scripts/build-ds4-linux.sh)
+/lib/ds4-linux/
 
 # Swift / app build. No leading slash, so it also catches the stray root
 # .build/ SwiftPM drops when a swift command is run from the repo root.
@@ -104,3 +108,9 @@ tests/soak_log.csv
 /:memory:.ses
 /.h3-review/
 1necho
+
+runs/*
+data
+
+# Studio web console (app-web/): dev tooling output only
+app-web/node_modules/

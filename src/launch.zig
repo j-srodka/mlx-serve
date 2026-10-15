@@ -13,7 +13,7 @@
 //! `/v1/models`, derive each model's budget from its ADVERTISED context
 //! (AgentBudget's formula: output = clamp(ctx/2, 1024, 65536) — never a
 //! hardcoded window), write the agent's config, and exec it through a login
-//! zsh so the user's PATH (nvm, Homebrew, ~/.local/bin) resolves.
+//! shell (`loginShell`) so the user's PATH (nvm, Homebrew, ~/.local/bin) resolves.
 
 const std = @import("std");
 const log = @import("log.zig");
@@ -56,6 +56,9 @@ pub const AgentKind = enum {
     codex,
     hermes,
     aider,
+    fx,
+    grok,
+    zcode,
 
     pub fn fromName(name: []const u8) ?AgentKind {
         // The codex rebrand: issue #188 asks for `mlx-serve launch chatgpt`.
@@ -66,7 +69,7 @@ pub const AgentKind = enum {
         return null;
     }
 
-    pub const names = "claude, pi, omp, opencode, opencode2, codex, hermes, aider";
+    pub const names = "claude, pi, omp, opencode, opencode2, codex, hermes, aider, fx, grok, zcode";
 };
 
 // ── Config builders (pure — unit-tested below) ──────────────────────────
@@ -97,7 +100,7 @@ pub fn piModelsJson(allocator: std.mem.Allocator, base_url: []const u8, entries:
             \\{s}
             \\        {{"id": "{s}", "name": "{s} (mlx-serve)", "input": [{s}],
             \\         "contextWindow": {d}, "maxTokens": {d}, "reasoning": true,
-            \\         "thinkingLevelMap": {{"off": "none"}}}}
+            \\         "thinkingLevelMap": {{"off": "none", "xhigh": "xhigh", "max": "max"}}}}
         , .{
             if (i == 0) "" else ",",
             e.id,
@@ -135,7 +138,8 @@ pub fn ompModelsYml(allocator: std.mem.Allocator, base_url: []const u8, entries:
         \\      supportsDeveloperRole: false
         \\      supportsReasoningEffort: true
         \\      maxTokensField: max_tokens
-        \\      thinkingFormat: qwen
+        \\      thinkingFormat: openai
+        \\      reasoningDisableMode: none-effort
         \\    models:
         \\
     , .{base_url});
@@ -144,6 +148,9 @@ pub fn ompModelsYml(allocator: std.mem.Allocator, base_url: []const u8, entries:
             \\      - id: "{s}"
             \\        name: "{s} (mlx-serve)"
             \\        reasoning: true
+            \\        thinking:
+            \\          mode: effort
+            \\          efforts: [minimal, low, medium, high, xhigh]
             \\        input: [{s}]
             \\        cost:
             \\          input: 0
@@ -165,8 +172,7 @@ const opencode_reasoning =
 ;
 
 /// opencode config — carried inline via OPENCODE_CONFIG_CONTENT (merges over
-/// the user's own config, no file writes). Single-quoted in the script, so
-/// the JSON must stay single-quote-free.
+/// the user's own config, no file writes); the script shell-quotes it (`appendQuoted`).
 /// `pin_model` writes a top-level `"model"` — opencode 2's TUI has no
 /// `--model` flag, so the config is the only place to select one.
 /// `limit.output` is the room opencode keeps free before compacting (it
@@ -177,7 +183,11 @@ pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, entries:
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "{\"$schema\": \"https://opencode.ai/config.json\", ");
-    if (pin_model) |m| try out.print(allocator, "\"model\": \"mlx/{s}\", ", .{m});
+    if (pin_model) |m| {
+        const v = try std.fmt.allocPrint(allocator, "mlx/{s}", .{m});
+        defer allocator.free(v);
+        try out.print(allocator, "\"model\": {f}, ", .{std.json.fmt(v, .{})});
+    }
     if (compaction) {
         var ctx: u64 = FALLBACK_BUDGET.context;
         for (entries) |e| {
@@ -194,10 +204,12 @@ pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, entries:
         \\"provider": {{"mlx": {{"npm": "@ai-sdk/openai-compatible", "name": "MLX Serve (local)", "options": {{"baseURL": "{s}/v1"}}, "models": {{
     , .{base_url});
     for (entries, 0..) |e, i| {
-        try out.print(allocator, "{s}\"{s}\": {{\"name\": \"{s} (mlx-serve)\",{s} \"limit\": {{\"context\": {d}, \"output\": {d}}}, {s}}}", .{
+        const name = try std.fmt.allocPrint(allocator, "{s} (mlx-serve)", .{e.id});
+        defer allocator.free(name);
+        try out.print(allocator, "{s}{f}: {{\"name\": {f},{s} \"limit\": {{\"context\": {d}, \"output\": {d}}}, {s}}}", .{
             if (i == 0) "" else ", ",
-            e.id,
-            e.id,
+            std.json.fmt(e.id, .{}),
+            std.json.fmt(name, .{}),
             if (e.vision) " \"attachment\": true," else "",
             e.budget.context,
             compactionReserve(e.budget.context),
@@ -331,23 +343,116 @@ pub fn mergePiSettingsJson(allocator: std.mem.Allocator, existing: []const u8, c
     return try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
 }
 
-/// codex `config.toml` — Responses wire API only (codex-rs `WireApi` has one
-/// variant), pointing at our /v1/responses. Keyless: no `env_key` and
-/// `requires_openai_auth` unset means codex skips login; the loopback server
-/// ignores keys anyway.
-pub fn codexConfigToml(allocator: std.mem.Allocator, base_url: []const u8, model: []const u8, budget: Budget) ![]u8 {
-    return std.fmt.allocPrint(allocator,
-        \\# written by mlx-serve — dedicated CODEX_HOME, regenerated at each launch.
-        \\model = "{s}"
-        \\model_provider = "mlx"
-        \\model_context_window = {d}
+/// fx keeps custom providers only in `~/.fx/settings.json` (no config-dir
+/// override), so the launcher owns ONE key there, `providers.mlx-serve`, and
+/// selects it per launch with FX_PROVIDER/FX_MODEL: the user's default
+/// provider and every other setting stay as found. fx rejects unknown keys.
+pub const fx_provider = "mlx-serve";
+
+/// The user's fx `settings.json` with our provider set. A file that is not a
+/// JSON object is an error, never replaced.
+pub fn mergeFxSettingsJson(allocator: std.mem.Allocator, existing: []const u8, base_url: []const u8, entries: []const Entry) ![]u8 {
+    const trimmed = std.mem.trim(u8, existing, " \t\r\n");
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, if (trimmed.len == 0) "{}" else existing, .{}) catch
+        return error.UnreadableFxSettings;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.UnreadableFxSettings;
+    const a = parsed.arena.allocator();
+
+    var metadata: std.json.ObjectMap = .empty;
+    for (entries) |e| {
+        var m: std.json.ObjectMap = .empty;
+        try m.put(a, "context_window", .{ .integer = @intCast(e.budget.context) });
+        try m.put(a, "max_output_tokens", .{ .integer = @intCast(e.budget.output) });
+        try m.put(a, "supports_tool_use", .{ .bool = true });
+        try m.put(a, "supports_vision", .{ .bool = e.vision });
+        try metadata.put(a, e.id, .{ .object = m });
+    }
+    var auth: std.json.ObjectMap = .empty;
+    try auth.put(a, "type", .{ .string = "none" });
+    var provider: std.json.ObjectMap = .empty;
+    try provider.put(a, "protocol", .{ .string = "openai-chat-completions" });
+    try provider.put(a, "base_url", .{ .string = try std.fmt.allocPrint(a, "{s}/v1", .{base_url}) });
+    try provider.put(a, "auth", .{ .object = auth });
+    try provider.put(a, "model_metadata", .{ .object = metadata });
+
+    var providers: std.json.ObjectMap = .empty;
+    if (parsed.value.object.get("providers")) |p| {
+        if (p == .object) providers = p.object;
+    }
+    try providers.put(a, fx_provider, .{ .object = provider });
+    try parsed.value.object.put(a, "providers", .{ .object = providers });
+    return std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
+}
+
+/// One `-c key="value"` arg: codex parses the value as a TOML string, then
+/// the whole arg is shell-quoted.
+fn appendCodexOverride(out: *std.ArrayList(u8), allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+    var arg = std.ArrayList(u8).empty;
+    defer arg.deinit(allocator);
+    try arg.appendSlice(allocator, key);
+    try arg.appendSlice(allocator, "=\"");
+    for (value) |c| {
+        if (c == '"' or c == '\\') try arg.append(allocator, '\\');
+        try arg.append(allocator, c);
+    }
+    try arg.append(allocator, '"');
+    if (out.items.len != 0) try out.append(allocator, ' ');
+    try out.appendSlice(allocator, "-c ");
+    try appendQuoted(out, allocator, arg.items);
+}
+
+/// codex launch-line overrides, merged over the user's own config.toml so
+/// nothing is written into their Codex home. Responses wire API only; keyless
+/// (no `env_key`). A zero advertised context leaves codex's own default.
+pub fn codexConfigOverrides(allocator: std.mem.Allocator, base_url: []const u8, model: []const u8, budget: Budget) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    const url = try std.fmt.allocPrint(allocator, "{s}/v1", .{base_url});
+    defer allocator.free(url);
+    try appendCodexOverride(&out, allocator, "model", model);
+    try appendCodexOverride(&out, allocator, "model_provider", "mlx");
+    if (budget.context > 0) try out.print(allocator, " -c model_context_window={d}", .{budget.context});
+    try appendCodexOverride(&out, allocator, "model_providers.mlx.name", "MLX Serve (local)");
+    try appendCodexOverride(&out, allocator, "model_providers.mlx.base_url", url);
+    try appendCodexOverride(&out, allocator, "model_providers.mlx.wire_api", "responses");
+    return out.toOwnedSlice(allocator);
+}
+
+/// grok `config.toml` under a dedicated GROK_HOME. A dummy XAI_API_KEY fails
+/// grok's key probe against xAI, so the credential is each model's `api_key`.
+/// Helper calls (titles, image descriptions, suggestions) default to xAI model
+/// ids, which would reach our server and load its default model: they are
+/// pinned to the launched one.
+pub fn grokConfigToml(allocator: std.mem.Allocator, base_url: []const u8, model: []const u8, entries: []const Entry) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.print(allocator,
+        \\# written by mlx-serve — dedicated GROK_HOME, regenerated at each launch.
+        \\[models]
+        \\default = "{s}"
+        \\session_summary = "{s}"
+        \\image_description = "{s}"
+        \\prompt_suggestion = "{s}"
         \\
-        \\[model_providers.mlx]
-        \\name = "MLX Serve (local)"
-        \\base_url = "{s}/v1"
-        \\wire_api = "responses"
-        \\
-    , .{ model, budget.context, base_url });
+    , .{ model, model, model, model });
+    for (entries) |e| {
+        try out.print(allocator,
+            \\
+            \\[model."{s}"]
+            \\model = "{s}"
+            \\base_url = "{s}/v1"
+            \\name = "{s} (mlx-serve)"
+            \\api_key = "mlx-serve"
+            \\context_window = {d}
+            \\max_completion_tokens = {d}
+            \\supports_reasoning_effort = true
+            \\reasoning_efforts = ["none", "low", "medium", "high"]
+            \\inference_idle_timeout_secs = 1800
+            \\
+        , .{ e.id, e.id, base_url, e.id, e.budget.context, e.budget.output });
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 /// hermes `config.yaml` — mirrors what `hermes setup`'s custom-endpoint flow
@@ -416,6 +521,177 @@ pub fn aiderMetadataJson(allocator: std.mem.Allocator, entries: []const Entry) !
     return out.toOwnedSlice(allocator);
 }
 
+/// ZCode personal provider config (`ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`,
+/// schema 1): one rule per chat model so ZCode never guesses limits from the id.
+pub fn zcodeConfigJson(allocator: std.mem.Allocator, base_url: []const u8, model: []const u8, entries: []const Entry) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.print(allocator,
+        \\{{"schemaVersion":1,"config":{{
+        \\"providerOrder":["mlx"],
+        \\"defaultModelSelection":{{"providerId":"mlx","modelId":{f},"options":{{"reasoningLevel":"medium"}}}},
+        \\"providerConfigRules":{{"providerRules":[{{"providerId":"mlx","providerName":"mlx-serve","enabled":true,"config":{{
+        \\"group":"standard-personal","access":{{"type":"api-key","apiKey":"mlx-serve"}},
+        \\"api":{{"type":"openai-chat-completions","baseUrl":"{s}/v1"}},"personalModelIds":[
+    , .{ std.json.fmt(model, .{}), base_url });
+    for (entries, 0..) |e, i| {
+        try out.print(allocator, "{s}{f}", .{ if (i == 0) "" else ",", std.json.fmt(e.id, .{}) });
+    }
+    try out.appendSlice(allocator, "]}}]},\"modelConfigRules\":{\"manualProviderModelRules\":[],\"providerModelRules\":[");
+    for (entries, 0..) |e, i| {
+        try out.print(allocator,
+            \\{s}{{"providerId":"mlx","modelId":{f},"config":{{"enabled":true,
+            \\"properties":{{"contextWindow":{d},"requiresMfjsToolSchema":false,
+            \\"inputFormat":{{"supportsText":true,"supportsImage":{},"supportsVideo":false,"supportsAudio":false,"supportsPdf":false}},
+            \\"outputFormat":{{"supportsText":true}},"supportsToolCall":true,"supportsJsonSchemaOutput":false,
+            \\"supportsNativeWebSearch":false,"supportsMidConversationSystem":false}},
+            \\"optionSpecs":{{"reasoningLevel":{{"values":["none","low","medium","high"],"map":"{{\"reasoning_effort\": reasoningLevel}}"}},
+            \\"maxOutputTokens":{{"max":{d},"map":"{{\"max_tokens\": maxOutputTokens}}"}}}}}}}}
+        , .{ if (i == 0) "" else ",", std.json.fmt(e.id, .{}), e.budget.context, e.vision, e.budget.output });
+    }
+    try out.appendSlice(allocator, "]}}}\n");
+    return out.toOwnedSlice(allocator);
+}
+
+// ── OpenCode version detection ──────────────────────────────────────────
+
+/// The integration profile a detected OpenCode major selects. The binary
+/// name no longer says the generation (Homebrew v2 ships as `opencode`),
+/// so the version output is the only source of truth.
+pub const OpenCodeGeneration = enum { v1, v2 };
+
+pub const OpenCodeVersion = struct {
+    generation: OpenCodeGeneration,
+    /// The version token exactly as detected — the detection notice quotes
+    /// the real string, a 3.0.0 is never displayed as a 2.x.
+    version: []const u8,
+};
+
+/// Reads the first version token (optional `v` prefix, `digits.digits…`) out
+/// of `opencode --version` output: major 1 → v1, major >= 2 → the newest
+/// profile we ship. No token, major 0, or junk like `dev` is undecided.
+pub fn parseOpencodeVersion(output: []const u8) ?OpenCodeVersion {
+    var i: usize = 0;
+    while (i < output.len) : (i += 1) {
+        var start = i;
+        if (output[i] == 'v' or output[i] == 'V') {
+            if (i + 1 >= output.len or !std.ascii.isDigit(output[i + 1])) continue;
+            start = i + 1;
+        } else if (!std.ascii.isDigit(output[i])) continue;
+        var j = start;
+        while (j < output.len and std.ascii.isDigit(output[j])) j += 1;
+        if (j >= output.len or output[j] != '.') continue;
+        const major = std.fmt.parseInt(u32, output[start..j], 10) catch continue;
+        if (major < 1) return null;
+        var k = j;
+        while (k < output.len and (std.ascii.isDigit(output[k]) or output[k] == '.')) k += 1;
+        const version = std.mem.trim(u8, output[start..k], ".");
+        return .{
+            .generation = if (major == 1) .v1 else .v2,
+            .version = version,
+        };
+    }
+    return null;
+}
+
+/// The `launch opencode2` compatibility alias forces the v2 profile: the
+/// canonical `opencode` name when it resolves to major >= 2, else the
+/// legacy standalone binary — a v1 install never starts under it.
+fn resolveOpencode2Bin(detected: ?OpenCodeVersion, legacy_installed: ?bool) ?[]const u8 {
+    if (detected) |d| {
+        if (d.generation == .v2) return "opencode";
+    }
+    if (legacy_installed == true) return "opencode2";
+    return null;
+}
+
+/// The login shell the agent runs under (a login shell = the user's real PATH): the
+/// user's own `$SHELL` binary when it speaks POSIX sh, as the script body does. Otherwise
+/// (fish, nushell) /bin/zsh on macOS, whose ~/.zprofile is where Homebrew's PATH lives,
+/// and bash, else sh, on Linux, which may have no zsh at all.
+pub fn loginShellFor(shell_env: ?[]const u8, macos: bool, has_bash: bool) []const u8 {
+    if (shell_env) |sh| {
+        const base = std.fs.path.basename(sh);
+        if (std.mem.eql(u8, base, "zsh") or std.mem.eql(u8, base, "bash")) return sh;
+    }
+    if (macos) return "/bin/zsh";
+    return if (has_bash) "bash" else "sh";
+}
+
+fn loginShell() []const u8 {
+    const env: ?[]const u8 = if (std.c.getenv("SHELL")) |p| std.mem.span(p) else null;
+    const has_bash = std.c.access("/bin/bash", std.c.X_OK) == 0 or std.c.access("/usr/bin/bash", std.c.X_OK) == 0;
+    return loginShellFor(env, @import("builtin").os.tag == .macos, has_bash);
+}
+
+/// Run one command through the same login shell the real launch execs
+/// through, so PATH resolution (nvm, Homebrew) is identical for detection
+/// and launch. Captured stdout comes back owned by the caller.
+fn runLoginShell(allocator: std.mem.Allocator, io: std.Io, cmd: []const u8) !struct { ok: bool, out: []u8 } {
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ loginShell(), "-l", "-c", cmd },
+        .stdout_limit = .limited(64 * 1024),
+    }) catch return error.LoginShellFailed;
+    allocator.free(result.stderr);
+    return .{
+        .ok = switch (result.term) {
+            .exited => |code| code == 0,
+            else => false,
+        },
+        .out = result.stdout,
+    };
+}
+
+/// Rc files print banners to stdout, so the version runs in a marked subshell
+/// and only the marker's payload parses (keyed output, like Swift's
+/// `detectInstalled`). Twin of OpenCodeVersion.swift's marker constants.
+const version_marker = "MLXOCV=";
+const version_probe_cmd = "if ! command -v opencode >/dev/null 2>&1; then printf 'MLXOCV=missing\\n'; else out=$(opencode --version 2>&1); rc=$?; printf 'MLXOCV=%s %s\\n' $rc \"$out\"; fi";
+
+const MarkedVersion = struct { rc: u8, out: []const u8 };
+
+/// The version subshell's exit code and output from a login-shell capture:
+/// everything after the LAST `MLXOCV=<rc> ` token, so rc banners sitting
+/// before it can never pose as the version. Null = it never answered.
+fn extractMarkedVersion(captured: []const u8) ?MarkedVersion {
+    const pos = std.mem.lastIndexOf(u8, captured, version_marker) orelse return null;
+    const after = captured[pos + version_marker.len ..];
+    const sp = std.mem.indexOfScalar(u8, after, ' ') orelse return null;
+    const rc = std.fmt.parseInt(u8, after[0..sp], 10) catch return null;
+    return .{ .rc = rc, .out = after[sp + 1 ..] };
+}
+
+const OpenCodeProbe = union(enum) {
+    missing,
+    version_failed: []const u8,
+    unparsed: []const u8,
+    ok: OpenCodeVersion,
+};
+
+/// Returned strings borrow from captured and remain valid only while it lives.
+fn classifyOpenCodeProbe(captured: []const u8, shell_ok: bool) OpenCodeProbe {
+    if (!shell_ok) return .{ .version_failed = captured };
+    const pos = std.mem.lastIndexOf(u8, captured, version_marker) orelse return .{ .version_failed = captured };
+    const payload = captured[pos + version_marker.len ..];
+    if (std.mem.eql(u8, std.mem.trim(u8, payload, " \t\r\n"), "missing")) return .missing;
+    const marked = extractMarkedVersion(captured) orelse return .{ .version_failed = captured };
+    if (marked.rc != 0) return .{ .version_failed = marked.out };
+    const parsed = parseOpencodeVersion(marked.out) orelse return .{ .unparsed = marked.out };
+    return .{ .ok = parsed };
+}
+
+/// Returned version or failure output is owned by the caller and must be freed.
+fn probeOpenCode(allocator: std.mem.Allocator, io: std.Io) !OpenCodeProbe {
+    const run = try runLoginShell(allocator, io, version_probe_cmd);
+    defer allocator.free(run.out);
+    return switch (classifyOpenCodeProbe(run.out, run.ok)) {
+        .missing => .missing,
+        .version_failed => |out| .{ .version_failed = try allocator.dupe(u8, out) },
+        .unparsed => |out| .{ .unparsed = try allocator.dupe(u8, out) },
+        .ok => |parsed| .{ .ok = .{ .generation = parsed.generation, .version = try allocator.dupe(u8, parsed.version) } },
+    };
+}
+
 // ── Launch script assembly ──────────────────────────────────────────────
 
 /// Shell-quote one extra passthrough arg (single quotes, '\'' escape).
@@ -434,7 +710,26 @@ fn appendExtras(out: *std.ArrayList(u8), allocator: std.mem.Allocator, extras: [
     }
 }
 
-/// The script body run through `/bin/zsh -l -c` (login shell = the user's
+fn needsShellQuoting(arg: []const u8) bool {
+    for (arg) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, ".-_/+:@=", c) != null)) return true;
+    }
+    return arg.len == 0;
+}
+
+/// An agent argument derived from a model id: quoted only when it carries
+/// shell-significant bytes, so ordinary ids keep the exact script bytes.
+fn appendModelArg(out: *std.ArrayList(u8), allocator: std.mem.Allocator, arg: []const u8) !void {
+    try out.append(allocator, ' ');
+    return appendModelValue(out, allocator, arg);
+}
+
+fn appendModelValue(out: *std.ArrayList(u8), allocator: std.mem.Allocator, arg: []const u8) !void {
+    if (needsShellQuoting(arg)) return appendQuoted(out, allocator, arg);
+    return out.appendSlice(allocator, arg);
+}
+
+/// The script body run through `<loginShell()> -l -c` (login shell = the user's
 /// real PATH). Configs are written by `writeConfigs` BEFORE this runs; the
 /// script only exports env and execs the agent — same split as the app's
 /// prepareConfig / scriptBody.
@@ -449,7 +744,9 @@ pub fn contextFloor(kind: AgentKind) u64 {
     };
 }
 
-pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []const u8, model: []const u8, budget: Budget, opencode_config: ?[]const u8, extras: []const []const u8) ![]u8 {
+pub const OpenCodeLaunch = struct { config: []const u8, bin: []const u8 };
+
+pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []const u8, model: []const u8, budget: Budget, opencode_launch: ?OpenCodeLaunch, extras: []const []const u8) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     if (budget.context > 0 and budget.context < contextFloor(kind)) {
@@ -463,10 +760,14 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
                 \\export ANTHROPIC_API_KEY=
                 \\export ANTHROPIC_AUTH_TOKEN=mlx-serve
                 \\export CLAUDE_CODE_ATTRIBUTION_HEADER=0
-                \\export ANTHROPIC_DEFAULT_OPUS_MODEL={s}
-                \\export ANTHROPIC_DEFAULT_SONNET_MODEL={s}
-                \\export ANTHROPIC_DEFAULT_HAIKU_MODEL={s}
-                \\export CLAUDE_CODE_SUBAGENT_MODEL={s}
+                \\
+            , .{base_url});
+            for ([_][]const u8{ "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL" }) |name| {
+                try out.print(allocator, "export {s}=", .{name});
+                try appendModelValue(&out, allocator, model);
+                try out.append(allocator, '\n');
+            }
+            try out.print(allocator,
                 \\export CLAUDE_CODE_MAX_OUTPUT_TOKENS={d}
                 \\export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1
                 \\export API_TIMEOUT_MS=3600000
@@ -474,43 +775,57 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
                 \\export CLAUDE_STREAM_IDLE_TIMEOUT_MS=1800000
                 \\export CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=1800000
                 \\
-            , .{ base_url, model, model, model, model, budget.output });
+            , .{budget.output});
             // A long prefill and a long think on a local model outlast Claude Code's stream watchdogs; a fallback
             // re-sends the whole prompt as a non-stream request, which then times out and retries.
             // Claude Code assumes 200k for a model outside its catalog; declare the advertised context verbatim.
             if (budget.context > 0) {
                 try out.print(allocator, "export CLAUDE_CODE_MAX_CONTEXT_TOKENS={d}\n", .{budget.context});
             }
-            try out.print(allocator, "claude --plugin-dir \"$HOME/.mlx-serve/{s}\" --model {s}", .{ claude_plugin_dir, model });
+            try out.print(allocator, "claude --plugin-dir \"$HOME/.mlx-serve/{s}\" --model", .{claude_plugin_dir});
+            try appendModelArg(&out, allocator, model);
         },
         .pi => {
-            try out.print(allocator,
+            try out.appendSlice(allocator,
                 \\export PI_CODING_AGENT_DIR="$HOME/.mlx-serve/pi"
-                \\pi --provider mlx --model {s}
-            , .{model});
+                \\pi --provider mlx --model
+            );
+            try appendModelArg(&out, allocator, model);
         },
         .omp => {
             // omp still reads pi's env spelling (measured on v17 — the OMP_
             // rename reached only its help text); export both.
-            try out.print(allocator,
+            try out.appendSlice(allocator,
                 \\export PI_CODING_AGENT_DIR="$HOME/.mlx-serve/omp"
                 \\export OMP_CODING_AGENT_DIR="$HOME/.mlx-serve/omp"
-                \\omp --model mlx/{s}
-            , .{model});
+                \\omp --model
+            );
+            const omp_model = try std.fmt.allocPrint(allocator, "mlx/{s}", .{model});
+            defer allocator.free(omp_model);
+            try appendModelArg(&out, allocator, omp_model);
         },
         .opencode => {
+            try out.appendSlice(allocator, "export OPENCODE_CONFIG_CONTENT=");
+            try appendQuoted(&out, allocator, opencode_launch.?.config);
             try out.print(allocator,
-                \\export OPENCODE_CONFIG_CONTENT='{s}'
-                \\opencode --model mlx/{s}
-            , .{ opencode_config.?, model });
+                \\
+                \\{s} --model
+            , .{opencode_launch.?.bin});
+            const oc_model = try std.fmt.allocPrint(allocator, "mlx/{s}", .{model});
+            defer allocator.free(oc_model);
+            try appendModelArg(&out, allocator, oc_model);
         },
         .opencode2 => {
+            // The binary is the version-detected resolution, not a fixed
+            // name: Homebrew ships v2 as `opencode`, `opencode2` is legacy.
+            try out.appendSlice(allocator, "export OPENCODE_CONFIG_CONTENT=");
+            try appendQuoted(&out, allocator, opencode_launch.?.config);
             try out.print(allocator,
-                \\export OPENCODE_CONFIG_CONTENT='{s}'
+                \\
                 \\export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
-                \\if ! command -v opencode2 >/dev/null 2>&1; then echo "opencode2 is not installed: npm install -g @opencode/cli"; exit 127; fi
-                \\opencode2 --standalone
-            , .{opencode_config.?});
+                \\if ! command -v {s} >/dev/null 2>&1; then echo "{s} is not installed"; exit 127; fi
+                \\{s} --standalone
+            , .{ opencode_launch.?.bin, opencode_launch.?.bin, opencode_launch.?.bin });
         },
         .codex => {
             // PATH first, then the CLI the desktop app bundles (codex's
@@ -519,7 +834,6 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
             // desktop-app-only user has no codex on PATH. Mirrors the Swift
             // AgentConfigs.codexBinResolver.
             try out.appendSlice(allocator,
-                \\export CODEX_HOME="$HOME/.mlx-serve/codex"
                 \\CODEX_BIN="$(command -v codex)"
                 \\if [ -z "$CODEX_BIN" ]; then
                 \\  for app in "/Applications/ChatGPT.app" "/Applications/Codex.app" "$HOME/Applications/ChatGPT.app" "$HOME/Applications/Codex.app"; do
@@ -527,8 +841,10 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
                 \\  done
                 \\fi
                 \\if [ -z "$CODEX_BIN" ]; then echo "codex is not installed: npm install -g @openai/codex, or install the ChatGPT app"; exit 127; fi
-                \\"$CODEX_BIN"
             );
+            const overrides = try codexConfigOverrides(allocator, base_url, model, budget);
+            defer allocator.free(overrides);
+            try out.print(allocator, "\n\"$CODEX_BIN\" {s}", .{overrides});
         },
         .hermes => {
             try out.appendSlice(allocator,
@@ -536,12 +852,40 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
                 \\hermes
             );
         },
+        .zcode => {
+            try out.appendSlice(allocator,
+                \\export ZCODE_DATA_BASE_DIR="$HOME/.mlx-serve/zcode"
+                \\export ZCODE_STORAGE_DIR="$HOME/.mlx-serve/zcode/storage"
+                \\export ZCODE_PERSONAL_PROVIDER_CONFIG_FILE="$HOME/.mlx-serve/zcode/provider_config.json"
+                \\if ! command -v zcode >/dev/null 2>&1; then echo "zcode is not installed: build or install ZCode (https://github.com/zai-org/ZCode)" >&2; exit 127; fi
+                \\zcode
+            );
+        },
         .aider => {
             try out.print(allocator,
                 \\export OPENAI_API_BASE='{s}/v1'
                 \\export OPENAI_API_KEY=mlx-serve
-                \\aider --model openai/{s} --weak-model openai/{s} --model-metadata-file ~/.mlx-serve/aider/model-metadata.json
-            , .{ base_url, model, model });
+                \\aider --model
+            , .{base_url});
+            const aider_model = try std.fmt.allocPrint(allocator, "openai/{s}", .{model});
+            defer allocator.free(aider_model);
+            try appendModelArg(&out, allocator, aider_model);
+            try out.appendSlice(allocator, " --weak-model");
+            try appendModelArg(&out, allocator, aider_model);
+            try out.appendSlice(allocator, " --model-metadata-file ~/.mlx-serve/aider/model-metadata.json");
+        },
+        .fx => {
+            try out.print(allocator,
+                \\export FX_PROVIDER={s}
+                \\export FX_MODEL={s}
+                \\fx
+            , .{ fx_provider, model });
+        },
+        .grok => {
+            try out.appendSlice(allocator,
+                \\export GROK_HOME="$HOME/.mlx-serve/grok"
+                \\grok
+            );
         },
     }
     try appendExtras(&out, allocator, extras);
@@ -606,25 +950,40 @@ fn tryStartApp(allocator: std.mem.Allocator, io: std.Io) bool {
     };
 }
 
-const Models = struct {
+pub const Models = struct {
     arena: std.heap.ArenaAllocator,
     entries: []Entry,
 
-    fn deinit(self: *Models) void {
+    pub fn deinit(self: *Models) void {
         self.arena.deinit();
     }
 };
 
-/// Parse /v1/models into the chat-capable entries (media/embedding models
-/// never enter a coding agent's picker — same rule as the app's
-/// AgentModelEntry.chatEntries). Context comes from meta.context_length,
-/// falling back to the top-level twin.
 fn fetchChatEntries(allocator: std.mem.Allocator, io: std.Io, base_url: []const u8) !Models {
     const url = try std.fmt.allocPrint(allocator, "{s}/v1/models", .{base_url});
     defer allocator.free(url);
     const body = try curlGet(allocator, io, url);
     defer allocator.free(body);
+    return parseChatEntries(allocator, body);
+}
 
+/// The model a launch serves: `want` when it is a chat row (null when it is
+/// not), else the first loaded row, else the first (/v1/models lists the
+/// default first).
+pub fn pickEntry(entries: []const Entry, want: ?[]const u8) ?Entry {
+    if (want) |w| {
+        for (entries) |e| if (std.mem.eql(u8, e.id, w)) return e;
+        return null;
+    }
+    for (entries) |e| if (e.loaded) return e;
+    return if (entries.len > 0) entries[0] else null;
+}
+
+/// Parse /v1/models into the chat-capable entries (media/embedding models
+/// never enter a coding agent's picker — same rule as the app's
+/// AgentModelEntry.chatEntries). Context comes from meta.context_length,
+/// falling back to the top-level twin.
+pub fn parseChatEntries(allocator: std.mem.Allocator, body: []const u8) !Models {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -687,15 +1046,6 @@ fn fetchChatEntries(allocator: std.mem.Allocator, io: std.Io, base_url: []const 
 
 // ── Config writes ───────────────────────────────────────────────────────
 
-fn writeAgentFile(allocator: std.mem.Allocator, io: std.Io, subdir: []const u8, name: []const u8, content: []const u8) !void {
-    const dir_path = try std.fmt.allocPrint(allocator, "{s}/.mlx-serve/{s}", .{ homeDir(), subdir });
-    defer allocator.free(dir_path);
-    try std.Io.Dir.cwd().createDirPath(io, dir_path);
-    var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{});
-    defer dir.close(io);
-    try dir.writeFile(io, .{ .sub_path = name, .data = content });
-}
-
 fn userOpencodeCliPath(allocator: std.mem.Allocator) ![]u8 {
     if (std.c.getenv("XDG_CONFIG_HOME")) |xdg| {
         const dir = std.mem.span(xdg);
@@ -708,17 +1058,21 @@ fn userOpencodeCliPath(allocator: std.mem.Allocator) ![]u8 {
 /// that carries it (Claude has no skills dir we own; `--plugin-dir` loads it).
 const skill_dir = "skills/" ++ agent_skills.name;
 const claude_plugin_dir = "claude/plugin";
+const claude_plugin_json_path = claude_plugin_dir ++ "/.claude-plugin/plugin.json";
+const claude_plugin_json = "{\"name\": \"mlx-serve\", \"description\": \"Skills for the local mlx-serve server\"}\n";
 
 /// Where each agent discovers skills inside its dedicated config dir; opencode
 /// reads `skills.paths` from its inline config instead, aider has no skills.
+/// Codex gets none: it has no dedicated dir and no `-c` key for a skills root,
+/// and a link in the user's own home would reach every codex session.
 fn agentSkillLink(kind: AgentKind) ?[]const u8 {
     return switch (kind) {
         .pi => "pi/skills/" ++ agent_skills.name,
         .omp => "omp/skills/" ++ agent_skills.name,
-        .codex => "codex/skills/" ++ agent_skills.name,
         .hermes => "hermes/skills/" ++ agent_skills.name,
+        .grok => "grok/skills/" ++ agent_skills.name,
         .claude => claude_plugin_dir ++ "/skills/" ++ agent_skills.name,
-        .opencode, .opencode2, .aider => null,
+        .codex, .opencode, .opencode2, .aider, .fx, .zcode => null,
     };
 }
 
@@ -741,8 +1095,8 @@ pub fn installSkill(allocator: std.mem.Allocator, io: std.Io, root: []const u8, 
     if (kind == .claude) {
         try dir.createDirPath(io, claude_plugin_dir ++ "/.claude-plugin");
         dir.writeFile(io, .{
-            .sub_path = claude_plugin_dir ++ "/.claude-plugin/plugin.json",
-            .data = "{\"name\": \"mlx-serve\", \"description\": \"Skills for the local mlx-serve server\"}\n",
+            .sub_path = claude_plugin_json_path,
+            .data = claude_plugin_json,
             .flags = .{ .exclusive = true },
         }) catch |err| switch (err) {
             error.PathAlreadyExists => {},
@@ -758,64 +1112,133 @@ pub fn installSkill(allocator: std.mem.Allocator, io: std.Io, root: []const u8, 
     };
 }
 
-/// Write the agent's config files (the app's prepareConfig twin). opencode
-/// carries its config inline and writes nothing.
+/// One file an agent reads, at `path` under $HOME.
+/// `merged`: the data merges onto the file's own contents, which a served script
+/// cannot read, so it writes the file only where there is none.
+pub const ConfigFile = struct { path: []const u8, data: []const u8, private: bool = false, merged: bool = false };
+
+/// What a merge keeps: the file's bytes, `{}` when it is missing or when
+/// there is no `io` (a script served to another machine keeps nothing).
+fn existingOrEmpty(a: std.mem.Allocator, io: ?std.Io, rel_or_abs: []const u8) ![]const u8 {
+    const i = io orelse return "{}";
+    const path = if (std.fs.path.isAbsolute(rel_or_abs)) rel_or_abs else try std.fmt.allocPrint(a, "{s}/{s}", .{ homeDir(), rel_or_abs });
+    return std.Io.Dir.cwd().readFileAlloc(i, path, a, .limited(1 << 20)) catch |err| switch (err) {
+        error.FileNotFound => "{}",
+        else => err,
+    };
+}
+
+/// The agent's config files (the app's prepareConfig twin), allocated in `a`
+/// (an arena). opencode carries its config inline, codex on the launch line.
+fn configFiles(a: std.mem.Allocator, io: ?std.Io, kind: AgentKind, base_url: []const u8, model: []const u8, budget: Budget, entries: []const Entry) ![]ConfigFile {
+    var files = std.ArrayList(ConfigFile).empty;
+    switch (kind) {
+        .claude, .opencode, .codex => {},
+        .opencode2 => {
+            const existing = try existingOrEmpty(a, io, try userOpencodeCliPath(a));
+            try files.append(a, .{ .path = ".mlx-serve/opencode2/opencode/cli.json", .data = try mergeOpencode2CliJson(a, existing, base_url, null) });
+            inline for (opencode2_plugin.files) |f| {
+                try files.append(a, .{ .path = ".mlx-serve/opencode2/opencode/plugins/mlx-serve/" ++ f.name, .data = f.bytes });
+            }
+        },
+        .pi => {
+            try files.append(a, .{ .path = ".mlx-serve/pi/models.json", .data = try piModelsJson(a, base_url, entries) });
+            const existing = try existingOrEmpty(a, io, ".mlx-serve/pi/settings.json");
+            try files.append(a, .{ .path = ".mlx-serve/pi/settings.json", .data = try mergePiSettingsJson(a, existing, budget.context), .merged = true });
+        },
+        .omp => try files.append(a, .{ .path = ".mlx-serve/omp/models.yml", .data = try ompModelsYml(a, base_url, entries) }),
+        .hermes => {
+            try files.append(a, .{ .path = ".mlx-serve/hermes/config.yaml", .data = try hermesConfigYaml(a, base_url, model, entries) });
+            try files.append(a, .{ .path = ".mlx-serve/hermes/.env", .data = try hermesEnvFile(a, base_url) });
+        },
+        .zcode => try files.append(a, .{ .path = ".mlx-serve/zcode/provider_config.json", .data = try zcodeConfigJson(a, base_url, model, entries) }),
+        .aider => try files.append(a, .{ .path = ".mlx-serve/aider/model-metadata.json", .data = try aiderMetadataJson(a, entries) }),
+        .fx => {
+            const existing = try existingOrEmpty(a, io, ".fx/settings.json");
+            try files.append(a, .{ .path = ".fx/settings.json", .data = try mergeFxSettingsJson(a, existing, base_url, entries), .private = true, .merged = true });
+        },
+        .grok => try files.append(a, .{ .path = ".mlx-serve/grok/config.toml", .data = try grokConfigToml(a, base_url, model, entries) }),
+    }
+    return files.items;
+}
+
 fn writeConfigs(allocator: std.mem.Allocator, io: std.Io, kind: AgentKind, base_url: []const u8, model: []const u8, budget: Budget, entries: []const Entry) !void {
     const root = try std.fmt.allocPrint(allocator, "{s}/.mlx-serve", .{homeDir()});
     defer allocator.free(root);
     try installSkill(allocator, io, root, kind);
-    switch (kind) {
-        .claude, .opencode => {},
-        .opencode2 => {
-            const user_path = try userOpencodeCliPath(allocator);
-            defer allocator.free(user_path);
-            const existing = std.Io.Dir.cwd().readFileAlloc(io, user_path, allocator, .limited(1 << 20)) catch
-                try allocator.dupe(u8, "{}");
-            defer allocator.free(existing);
-            const json = try mergeOpencode2CliJson(allocator, existing, base_url, null);
-            defer allocator.free(json);
-            try writeAgentFile(allocator, io, "opencode2/opencode", "cli.json", json);
-            inline for (opencode2_plugin.files) |f| {
-                try writeAgentFile(allocator, io, "opencode2/opencode/plugins/mlx-serve", f.name, f.bytes);
-            }
-        },
-        .pi => {
-            const json = try piModelsJson(allocator, base_url, entries);
-            defer allocator.free(json);
-            try writeAgentFile(allocator, io, "pi", "models.json", json);
-            const settings_path = try std.fmt.allocPrint(allocator, "{s}/.mlx-serve/pi/settings.json", .{homeDir()});
-            defer allocator.free(settings_path);
-            const existing = std.Io.Dir.cwd().readFileAlloc(io, settings_path, allocator, .limited(1 << 20)) catch
-                try allocator.dupe(u8, "{}");
-            defer allocator.free(existing);
-            const settings = try mergePiSettingsJson(allocator, existing, budget.context);
-            defer allocator.free(settings);
-            try writeAgentFile(allocator, io, "pi", "settings.json", settings);
-        },
-        .omp => {
-            const yml = try ompModelsYml(allocator, base_url, entries);
-            defer allocator.free(yml);
-            try writeAgentFile(allocator, io, "omp", "models.yml", yml);
-        },
-        .codex => {
-            const toml = try codexConfigToml(allocator, base_url, model, budget);
-            defer allocator.free(toml);
-            try writeAgentFile(allocator, io, "codex", "config.toml", toml);
-        },
-        .hermes => {
-            const yaml = try hermesConfigYaml(allocator, base_url, model, entries);
-            defer allocator.free(yaml);
-            try writeAgentFile(allocator, io, "hermes", "config.yaml", yaml);
-            const env = try hermesEnvFile(allocator, base_url);
-            defer allocator.free(env);
-            try writeAgentFile(allocator, io, "hermes", ".env", env);
-        },
-        .aider => {
-            const json = try aiderMetadataJson(allocator, entries);
-            defer allocator.free(json);
-            try writeAgentFile(allocator, io, "aider", "model-metadata.json", json);
-        },
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var home = try std.Io.Dir.cwd().createDirPathOpen(io, homeDir(), .{});
+    defer home.close(io);
+    for (try configFiles(arena.allocator(), io, kind, base_url, model, budget, entries)) |f| {
+        try home.createDirPath(io, std.fs.path.dirname(f.path).?);
+        try home.writeFile(io, .{ .sub_path = f.path, .data = f.data, .flags = if (f.private) .{ .permissions = .fromMode(0o600) } else .{} });
     }
+}
+
+// ── Served launch script (`GET /launch`) ────────────────────────────────
+
+/// Agents the web console offers. opencode2's merge base is the user's own
+/// opencode cli.json, which a served script cannot read: it starts from `{}`.
+pub fn webLaunchable(kind: AgentKind) bool {
+    return switch (kind) {
+        .claude, .pi, .omp, .opencode2, .grok => true,
+        else => false,
+    };
+}
+
+const heredoc_end = "MLX_SERVE_EOF";
+
+fn appendHeredoc(out: *std.ArrayList(u8), a: std.mem.Allocator, path: []const u8, data: []const u8, keep_existing: bool) !void {
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |line| if (std.mem.eql(u8, line, heredoc_end)) return error.HeredocCollision;
+    try out.print(a, "mkdir -p \"$HOME/{s}\"\n", .{std.fs.path.dirname(path).?});
+    if (keep_existing) try out.print(a, "[ -e \"$HOME/{s}\" ] || ", .{path});
+    try out.print(a, "cat > \"$HOME/{s}\" <<'" ++ heredoc_end ++ "'\n{s}{s}" ++ heredoc_end ++ "\n", .{
+        path, data, if (std.mem.endsWith(u8, data, "\n")) "" else "\n",
+    });
+}
+
+/// A v2 `opencode` first, else the legacy binary (`resolveOpencode2Bin`).
+const opencode2_bin_probe =
+    \\OC_BIN=opencode2
+    \\case "$(opencode --version 2>/dev/null)" in [2-9].*|v[2-9].*|[1-9][0-9].*|v[1-9][0-9].*) OC_BIN=opencode ;; esac
+    \\
+;
+
+/// A POSIX sh script that configures `kind` for `base_url` and starts it, for a
+/// machine that may not have mlx-serve (`curl -fsSL <server>/launch?agent=… | sh`):
+/// the files `launch` writes, then its launch script through a login shell on
+/// the terminal (stdin is the pipe).
+pub fn remoteScript(allocator: std.mem.Allocator, kind: AgentKind, base_url: []const u8, model: []const u8, budget: Budget, entries: []const Entry) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var out = std.ArrayList(u8).empty;
+    try out.print(a, "#!/bin/sh\n# mlx-serve: {s} via {s}\nset -e\n", .{ @tagName(kind), base_url });
+    for (agent_skills.files) |f| {
+        try appendHeredoc(&out, a, try std.fmt.allocPrint(a, ".mlx-serve/" ++ skill_dir ++ "/{s}", .{f.name}), f.bytes, true);
+    }
+    if (kind == .claude) try appendHeredoc(&out, a, ".mlx-serve/" ++ claude_plugin_json_path, claude_plugin_json, true);
+    if (agentSkillLink(kind)) |link| {
+        try out.print(a, "mkdir -p \"$HOME/.mlx-serve/{s}\"\n[ -e \"$HOME/.mlx-serve/{s}\" ] || [ -L \"$HOME/.mlx-serve/{s}\" ] || ln -s \"$HOME/.mlx-serve/" ++ skill_dir ++ "\" \"$HOME/.mlx-serve/{s}\"\n", .{ std.fs.path.dirname(link).?, link, link, link });
+    }
+    for (try configFiles(a, null, kind, base_url, model, budget, entries)) |f| try appendHeredoc(&out, a, f.path, f.data, f.merged);
+
+    const oc: ?OpenCodeLaunch = if (kind == .opencode2) .{ .config = try opencodeJson(a, base_url, entries, model, true), .bin = "$OC_BIN" } else null;
+    const run = try std.mem.concat(a, u8, &.{ if (kind == .opencode2) opencode2_bin_probe else "", try scriptFor(a, kind, base_url, model, budget, oc, &.{}) });
+    try out.appendSlice(a, "login=$(command -v zsh || command -v bash || echo sh)\ns=");
+    try appendQuoted(&out, a, run);
+    // The agent's stdin is the terminal the output goes to, /dev/tty only as a last resort: agents
+    // built on Bun (Claude Code, oh-my-pi, OpenCode) and Grok cannot watch a reopened /dev/tty on macOS.
+    // The redirect rides the exec, because sh is still reading this script from stdin.
+    try out.appendSlice(a,
+        \\
+        \\if [ ! -t 0 ]; then if [ -t 2 ]; then exec "$login" -l -c "$s" 0<&2; elif [ -t 1 ]; then exec "$login" -l -c "$s" 0<&1; elif (: </dev/tty) 2>/dev/null; then exec "$login" -l -c "$s" </dev/tty; fi; fi
+        \\exec "$login" -l -c "$s"
+        \\
+    );
+    return allocator.dupe(u8, out.items);
 }
 
 // ── Command entry ───────────────────────────────────────────────────────
@@ -937,44 +1360,99 @@ pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     }
     defer models.deinit();
 
-    // Pick: --model must exist on the server; default = first loaded chat
-    // row (/v1/models sorts the default first), else the first chat row.
-    var pick: ?Entry = null;
-    if (parsed.model) |want| {
-        for (models.entries) |e| {
-            if (std.mem.eql(u8, e.id, want)) pick = e;
-        }
-        if (pick == null) {
-            log.err("model '{s}' is not on {s} — available:\n", .{ want, base_url });
-            for (models.entries) |e| log.err("  {s}\n", .{e.id});
-            std.process.exit(1);
-        }
-    } else {
-        for (models.entries) |e| {
-            if (e.loaded) {
-                pick = e;
-                break;
-            }
-        }
-        if (pick == null) pick = models.entries[0];
-    }
-    const chosen = pick.?;
-
-    writeConfigs(allocator, io, parsed.kind, base_url, chosen.id, chosen.budget, models.entries) catch |err| {
-        log.err("could not write the {s} config: {s}\n", .{ @tagName(parsed.kind), @errorName(err) });
+    const chosen = pickEntry(models.entries, parsed.model) orelse {
+        log.err("model '{s}' is not on {s} — available:\n", .{ parsed.model.?, base_url });
+        for (models.entries) |e| log.err("  {s}\n", .{e.id});
         std.process.exit(1);
     };
 
-    const oc_config: ?[]u8 = if (parsed.kind == .opencode or parsed.kind == .opencode2)
-        try opencodeJson(allocator, base_url, models.entries, if (parsed.kind == .opencode2) chosen.id else null, parsed.kind == .opencode2)
+    // Detect the OpenCode generation before anything is written: the v2
+    // profile ships different config files (cli.json + monitor plugin), so
+    // the routing decision cannot live inside the launch script.
+    var oc_kind: AgentKind = parsed.kind;
+    var oc_bin: []const u8 = "opencode";
+    if (parsed.kind == .opencode) {
+        const probe = probeOpenCode(allocator, io) catch {
+            log.err("could not run the login shell to detect the OpenCode version; retry, or use `mlx-serve launch opencode2` to force the v2 integration.\n", .{});
+            std.process.exit(1);
+        };
+        switch (probe) {
+            .missing => {
+                log.err("OpenCode is not installed or is not available on PATH.\n", .{});
+                log.err("install OpenCode and make sure `opencode` is on PATH, then rerun.\n", .{});
+                std.process.exit(1);
+            },
+            .version_failed, .unparsed => |out| {
+                log.err("could not determine the installed OpenCode version from `opencode --version`.\n", .{});
+                log.err("Output:\n{s}\n", .{out});
+                log.err("mlx-serve currently supports OpenCode 1.x (the v1 integration) and 2.x or newer (the v2 integration).\n", .{});
+                allocator.free(out);
+                std.process.exit(1);
+            },
+            .ok => |v| {
+                oc_kind = if (v.generation == .v1) .opencode else .opencode2;
+                log.info("detected OpenCode {s}; using the {s} integration.\n", .{
+                    v.version, if (v.generation == .v1) "v1" else "v2",
+                });
+                allocator.free(v.version);
+            },
+        }
+    } else if (parsed.kind == .opencode2) {
+        // Compatibility alias forcing the v2 profile; a v1 `opencode` must
+        // never start under it, so only a major >= 2 resolution counts.
+        const probe = probeOpenCode(allocator, io) catch .missing;
+        var detected: ?OpenCodeVersion = null;
+        switch (probe) {
+            .ok => |v| {
+                if (v.generation == .v2) detected = v;
+                if (v.generation != .v2) allocator.free(v.version);
+            },
+            .version_failed, .unparsed => |out| allocator.free(out),
+            .missing => {},
+        }
+        var legacy_ok: ?bool = null;
+        if (detected == null) {
+            if (runLoginShell(allocator, io, "if command -v opencode2 >/dev/null 2>&1; then printf 'MLXOCL=1\\n'; else printf 'MLXOCL=0\\n'; fi")) |legacy| {
+                defer allocator.free(legacy.out);
+                if (legacy.ok) {
+                    if (std.mem.lastIndexOf(u8, legacy.out, "MLXOCL=")) |pos| {
+                        const payload = std.mem.trim(u8, legacy.out[pos + "MLXOCL=".len ..], " \t\r\n");
+                        if (std.mem.eql(u8, payload, "1")) legacy_ok = true;
+                        if (std.mem.eql(u8, payload, "0")) legacy_ok = false;
+                    }
+                }
+            } else |_| {}
+            if (legacy_ok == null) {
+                log.err("could not check the legacy OpenCode binary through the login shell; check your shell startup files and retry.\n", .{});
+                std.process.exit(1);
+            }
+        }
+        oc_bin = resolveOpencode2Bin(detected, legacy_ok) orelse {
+            log.err("no OpenCode v2 binary found: `launch opencode2` needs an `opencode` 2.x+ or the legacy `opencode2` on PATH.\n", .{});
+            log.err("install OpenCode (https://opencode.ai/docs) and rerun, or use `mlx-serve launch opencode`.\n", .{});
+            std.process.exit(1);
+        };
+        if (detected) |v| {
+            log.info("detected OpenCode {s}; using the v2 integration.\n", .{v.version});
+            allocator.free(v.version);
+        }
+    }
+
+    writeConfigs(allocator, io, oc_kind, base_url, chosen.id, chosen.budget, models.entries) catch |err| {
+        log.err("could not write the {s} config: {s}\n", .{ @tagName(oc_kind), @errorName(err) });
+        std.process.exit(1);
+    };
+
+    const oc_config: ?[]u8 = if (oc_kind == .opencode or oc_kind == .opencode2)
+        try opencodeJson(allocator, base_url, models.entries, if (oc_kind == .opencode2) chosen.id else null, oc_kind == .opencode2)
     else
         null;
     defer if (oc_config) |c| allocator.free(c);
 
-    const script = try scriptFor(allocator, parsed.kind, base_url, chosen.id, chosen.budget, oc_config, parsed.extras);
+    const script = try scriptFor(allocator, oc_kind, base_url, chosen.id, chosen.budget, if (oc_config) |config| .{ .config = config, .bin = oc_bin } else null, parsed.extras);
     defer allocator.free(script);
 
-    if (parsed.kind == .opencode2) {
+    if (oc_kind == .opencode2) {
         // The plugin's whole data source is /metrics.json; say so now rather
         // than leave an empty panel to explain itself.
         if (metricsStatus(allocator, io, base_url)) |status| {
@@ -993,13 +1471,14 @@ pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     log.info("launching {s} with {s} ({d}K context) via {s}\n", .{
         @tagName(parsed.kind), chosen.id, chosen.budget.context / 1024, base_url,
     });
+    const shell = loginShell();
     var child = std.process.spawn(io, .{
-        .argv = &.{ "/bin/zsh", "-l", "-c", script },
+        .argv = &.{ shell, "-l", "-c", script },
         .stdin = .inherit,
         .stdout = .inherit,
         .stderr = .inherit,
     }) catch {
-        log.err("could not start /bin/zsh\n", .{});
+        log.err("could not start {s}\n", .{shell});
         std.process.exit(1);
     };
     const term = child.wait(io) catch std.process.exit(1);
@@ -1024,7 +1503,7 @@ test "budgetForContext mirrors AgentBudget: ctx/2 clamped to [1024, 65536], 0 = 
     try t.expectEqual(Budget{ .context = 1048576, .output = 65536 }, budgetForContext(1048576));
 }
 
-test "omp models.yml: static per-model entries, no discovery, pi-compat vocabulary" {
+test "omp models.yml: static per-model entries, no discovery, thinking level as reasoning_effort" {
     const entries = [_]Entry{
         .{ .id = "m1", .budget = .{ .context = 4096, .output = 1024 }, .vision = false, .loaded = true },
         .{ .id = "m2", .budget = .{ .context = 262144, .output = 65536 }, .vision = true, .loaded = false },
@@ -1036,16 +1515,58 @@ test "omp models.yml: static per-model entries, no discovery, pi-compat vocabula
     try t.expect(std.mem.indexOf(u8, yml, "contextWindow: 4096") != null);
     try t.expect(std.mem.indexOf(u8, yml, "contextWindow: 262144") != null);
     try t.expect(std.mem.indexOf(u8, yml, "input: [text, image]") != null);
-    try t.expect(std.mem.indexOf(u8, yml, "thinkingFormat: qwen") != null);
+    // thinkingFormat qwen sent only enable_thinking: every omp level ran the server default.
+    try t.expect(std.mem.indexOf(u8, yml, "thinkingFormat: openai") != null);
+    try t.expect(std.mem.indexOf(u8, yml, "reasoningDisableMode: none-effort") != null);
+    try t.expect(std.mem.indexOf(u8, yml, "efforts: [minimal, low, medium, high, xhigh]") != null);
 }
 
-test "codex config: responses wire API, keyless, context at the root" {
-    const toml = try codexConfigToml(t.allocator, "http://127.0.0.1:11234", "m1", .{ .context = 90112, .output = 22528 });
-    defer t.allocator.free(toml);
-    try t.expect(std.mem.indexOf(u8, toml, "wire_api = \"responses\"") != null);
-    try t.expect(std.mem.indexOf(u8, toml, "model_context_window = 90112") != null);
-    try t.expect(std.mem.indexOf(u8, toml, "base_url = \"http://127.0.0.1:11234/v1\"") != null);
-    try t.expect(std.mem.indexOf(u8, toml, "env_key") == null);
+test "codex overrides: responses wire API, keyless, advertised context" {
+    const ov = try codexConfigOverrides(t.allocator, "http://127.0.0.1:11234", "m1", .{ .context = 90112, .output = 45056 });
+    defer t.allocator.free(ov);
+    try t.expectEqualStrings(
+        "-c 'model=\"m1\"' -c 'model_provider=\"mlx\"' -c model_context_window=90112" ++
+            " -c 'model_providers.mlx.name=\"MLX Serve (local)\"'" ++
+            " -c 'model_providers.mlx.base_url=\"http://127.0.0.1:11234/v1\"'" ++
+            " -c 'model_providers.mlx.wire_api=\"responses\"'",
+        ov,
+    );
+}
+
+test "codex overrides: a zero advertised context omits model_context_window" {
+    const ov = try codexConfigOverrides(t.allocator, "http://x:1", "m1", .{ .context = 0, .output = 0 });
+    defer t.allocator.free(ov);
+    try t.expect(std.mem.indexOf(u8, ov, "model_context_window") == null);
+    try t.expect(std.mem.indexOf(u8, ov, "-c 'model_providers.mlx.base_url=\"http://x:1/v1\"'") != null);
+}
+
+test "codex overrides escape a model id for TOML, then for the shell" {
+    const ov = try codexConfigOverrides(t.allocator, "http://x:1", "o'ne\"il\\m", .{ .context = 0, .output = 0 });
+    defer t.allocator.free(ov);
+    try t.expect(std.mem.startsWith(u8, ov, "-c 'model=\"o'\\''ne\\\"il\\\\m\"' -c 'model_provider=\"mlx\"'"));
+}
+
+test "codex gets no skill link and no dedicated dir" {
+    try t.expect(agentSkillLink(.codex) == null);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    try installSkill(t.allocator, io, root, .codex);
+    try t.expect(tmp.dir.access(io, "codex", .{}) == error.FileNotFound);
+}
+
+test "model args ride the invocation quoted only when they need it" {
+    const odd = try scriptFor(t.allocator, .claude, "http://x:1", "a b'c", .{ .context = 65536, .output = 32768 }, null, &.{});
+    defer t.allocator.free(odd);
+    try t.expect(std.mem.indexOf(u8, odd, "--model 'a b'\\''c'") != null);
+    const plain = try scriptFor(t.allocator, .omp, "http://x:1", "ok/m1", .{ .context = 65536, .output = 32768 }, null, &.{});
+    defer t.allocator.free(plain);
+    try t.expect(std.mem.indexOf(u8, plain, "omp --model mlx/ok/m1\n") != null);
+    const oc = try scriptFor(t.allocator, .opencode, "http://x:1", "a b", .{ .context = 65536, .output = 32768 }, .{ .config = "{}", .bin = "opencode" }, &.{});
+    defer t.allocator.free(oc);
+    try t.expect(std.mem.indexOf(u8, oc, "\nopencode --model 'mlx/a b'\n") != null);
 }
 
 test "pi models.json and opencode config parse as JSON and stay single-quote-free" {
@@ -1076,7 +1597,11 @@ test "pi models.json sends the thinking level as reasoning_effort, off as none" 
     const mlx_p = parsed.value.object.get("providers").?.object.get("mlx").?.object;
     try t.expect(mlx_p.get("compat").?.object.get("thinkingFormat") == null);
     const m = mlx_p.get("models").?.array.items[0].object;
-    try t.expectEqualStrings("none", m.get("thinkingLevelMap").?.object.get("off").?.string);
+    const levels = m.get("thinkingLevelMap").?.object;
+    try t.expectEqualStrings("none", levels.get("off").?.string);
+    // pi offers xhigh/max only when the map names them, else clamps max to high.
+    try t.expectEqualStrings("xhigh", levels.get("xhigh").?.string);
+    try t.expectEqualStrings("max", levels.get("max").?.string);
 }
 
 test "compactionReserve: a quarter of the window, capped where the agents' own defaults take over" {
@@ -1113,6 +1638,85 @@ test "pi settings.json merge scales compaction to the window and keeps the rest"
     const bc = bp.value.object.get("compaction").?.object;
     try t.expectEqual(@as(i64, 16384), bc.get("reserveTokens").?.integer);
     try t.expectEqual(@as(i64, 20000), bc.get("keepRecentTokens").?.integer);
+}
+
+test "fx settings merge owns providers.mlx-serve and keeps everything else" {
+    const existing =
+        \\{"provider":"gateway","models":{"gateway":"x/y"},"providers":{"other":{"protocol":"openai-chat-completions","base_url":"https://o/v1","auth":{"type":"none"}},"mlx-serve":{"base_url":"stale"}}}
+    ;
+    const entries = [_]Entry{
+        .{ .id = "org/m1", .budget = .{ .context = 32768, .output = 16384 }, .vision = false, .loaded = true },
+        .{ .id = "org/m2", .budget = .{ .context = 262144, .output = 65536 }, .vision = true, .loaded = false },
+    };
+    const json = try mergeFxSettingsJson(t.allocator, existing, "http://127.0.0.1:11234", &entries);
+    defer t.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    // The user's default provider and model stay theirs: a launch selects ours by env.
+    try t.expectEqualStrings("gateway", obj.get("provider").?.string);
+    try t.expectEqualStrings("x/y", obj.get("models").?.object.get("gateway").?.string);
+    const providers = obj.get("providers").?.object;
+    try t.expectEqualStrings("https://o/v1", providers.get("other").?.object.get("base_url").?.string);
+    const ours = providers.get(fx_provider).?.object;
+    try t.expectEqualStrings("openai-chat-completions", ours.get("protocol").?.string);
+    try t.expectEqualStrings("http://127.0.0.1:11234/v1", ours.get("base_url").?.string);
+    try t.expectEqualStrings("none", ours.get("auth").?.object.get("type").?.string);
+    const m2 = ours.get("model_metadata").?.object.get("org/m2").?.object;
+    try t.expectEqual(@as(i64, 262144), m2.get("context_window").?.integer);
+    try t.expectEqual(@as(i64, 65536), m2.get("max_output_tokens").?.integer);
+    try t.expectEqual(true, m2.get("supports_tool_use").?.bool);
+    try t.expectEqual(true, m2.get("supports_vision").?.bool);
+    try t.expectEqual(false, ours.get("model_metadata").?.object.get("org/m1").?.object.get("supports_vision").?.bool);
+}
+
+test "fx settings merge starts a missing file and never replaces one it cannot read" {
+    const entries = [_]Entry{.{ .id = "m1", .budget = FALLBACK_BUDGET, .vision = false, .loaded = true }};
+    const fresh = try mergeFxSettingsJson(t.allocator, " \n", "http://x:1", &entries);
+    defer t.allocator.free(fresh);
+    try t.expect(std.mem.indexOf(u8, fresh, "\"mlx-serve\"") != null);
+    try t.expectError(error.UnreadableFxSettings, mergeFxSettingsJson(t.allocator, "{\"provider\": ", "http://x:1", &entries));
+    try t.expectError(error.UnreadableFxSettings, mergeFxSettingsJson(t.allocator, "[]", "http://x:1", &entries));
+}
+
+test "fx script selects our provider and model by env, never by a saved default" {
+    try t.expectEqual(AgentKind.fx, AgentKind.fromName("fx").?);
+    const script = try scriptFor(t.allocator, .fx, "http://x:1", "org/m1", FALLBACK_BUDGET, null, &.{"ask"});
+    defer t.allocator.free(script);
+    try t.expect(std.mem.indexOf(u8, script, "export FX_PROVIDER=mlx-serve\nexport FX_MODEL=org/m1\nfx 'ask'\n") != null);
+}
+
+test "grok config: every chat model keyed by its id, helpers pinned to the launched model" {
+    const entries = [_]Entry{
+        .{ .id = "org/m1", .budget = .{ .context = 32768, .output = 16384 }, .vision = false, .loaded = true },
+        .{ .id = "org/m2", .budget = .{ .context = 262144, .output = 65536 }, .vision = true, .loaded = false },
+    };
+    const toml = try grokConfigToml(t.allocator, "http://127.0.0.1:11234", "org/m2", &entries);
+    defer t.allocator.free(toml);
+    // An unknown helper model (grok-4.6) would reach the server and load its default.
+    for ([_][]const u8{ "default", "session_summary", "image_description", "prompt_suggestion" }) |key| {
+        const line = try std.fmt.allocPrint(t.allocator, "{s} = \"org/m2\"\n", .{key});
+        defer t.allocator.free(line);
+        try t.expect(std.mem.indexOf(u8, toml, line) != null);
+    }
+    try t.expect(std.mem.indexOf(u8, toml,
+        \\[model."org/m1"]
+        \\model = "org/m1"
+        \\base_url = "http://127.0.0.1:11234/v1"
+        \\name = "org/m1 (mlx-serve)"
+        \\api_key = "mlx-serve"
+        \\context_window = 32768
+        \\max_completion_tokens = 16384
+        \\supports_reasoning_effort = true
+    ) != null);
+    try t.expect(std.mem.indexOf(u8, toml, "context_window = 262144\nmax_completion_tokens = 65536\n") != null);
+}
+
+test "grok script rides a dedicated GROK_HOME" {
+    try t.expectEqual(AgentKind.grok, AgentKind.fromName("grok").?);
+    const script = try scriptFor(t.allocator, .grok, "http://x:1", "m1", FALLBACK_BUDGET, null, &.{"-c"});
+    defer t.allocator.free(script);
+    try t.expect(std.mem.indexOf(u8, script, "export GROK_HOME=\"$HOME/.mlx-serve/grok\"\ngrok '-c'\n") != null);
 }
 
 test "opencode config: limit.output is the compaction reserve, opencode2 gets a scaled compaction block" {
@@ -1172,8 +1776,9 @@ test "launch args: passthrough after --, unknown agent named, url trailing slash
 test "script assembly: extras are shell-quoted onto the invocation line" {
     const script = try scriptFor(t.allocator, .codex, "http://x:1", "m1", .{ .context = 4096, .output = 1024 }, null, &.{ "resume", "it's" });
     defer t.allocator.free(script);
-    try t.expect(std.mem.indexOf(u8, script, "\"$CODEX_BIN\" 'resume' 'it'\\''s'") != null);
-    try t.expect(std.mem.indexOf(u8, script, "export CODEX_HOME=\"$HOME/.mlx-serve/codex\"") != null);
+    try t.expect(std.mem.indexOf(u8, script, "\"$CODEX_BIN\" -c 'model=\"m1\"'") != null);
+    try t.expect(std.mem.indexOf(u8, script, "-c 'model_providers.mlx.wire_api=\"responses\"' 'resume' 'it'\\''s'") != null);
+    try t.expect(std.mem.indexOf(u8, script, "CODEX_HOME") == null);
 }
 
 test "codex script falls back to the desktop app's bundled CLI (ChatGPT.app rebrand)" {
@@ -1283,7 +1888,7 @@ test "opencode2 feed note: 200 is silent, 503 names --metrics, 401 names the key
 
 test "opencode2 script exports XDG_CONFIG_HOME, OPENCODE_CONFIG_CONTENT, and invokes opencode2" {
     const cfg = "{\"provider\":{}}";
-    const script = try scriptFor(t.allocator, .opencode2, "http://127.0.0.1:11234", "m1", .{ .context = 4096, .output = 1024 }, cfg, &.{ "resume", "it's" });
+    const script = try scriptFor(t.allocator, .opencode2, "http://127.0.0.1:11234", "m1", .{ .context = 4096, .output = 1024 }, .{ .config = cfg, .bin = "opencode2" }, &.{ "resume", "it's" });
     defer t.allocator.free(script);
     try t.expect(std.mem.indexOf(u8, script, "export XDG_CONFIG_HOME=\"$HOME/.mlx-serve/opencode2\"") != null);
     try t.expect(std.mem.indexOf(u8, script, "export OPENCODE_CONFIG_CONTENT='{\"provider\":{}}'") != null);
@@ -1291,9 +1896,95 @@ test "opencode2 script exports XDG_CONFIG_HOME, OPENCODE_CONFIG_CONTENT, and inv
     // service that never sees our env: --standalone, model pinned in the config.
     try t.expect(std.mem.indexOf(u8, script, "opencode2 --standalone") != null);
     try t.expect(std.mem.indexOf(u8, script, "--model") == null);
-    try t.expect(std.mem.indexOf(u8, script, "npm install -g @opencode/cli") != null);
+    try t.expect(std.mem.indexOf(u8, script, "opencode2 is not installed") != null);
     try t.expect(std.mem.indexOf(u8, script, "exit 127") != null);
     try t.expect(std.mem.indexOf(u8, script, "'resume' 'it'\\''s'") != null);
+}
+
+test "opencode version parser: major 1 = v1, major >= 2 = the newest profile, else undecided" {
+    for ([_][]const u8{ "1.18.34", "v1.18.34", "opencode 1.18.34\n" }) |input| {
+        const got = parseOpencodeVersion(input).?;
+        try t.expectEqual(OpenCodeGeneration.v1, got.generation);
+        try t.expectEqualStrings("1.18.34", got.version);
+    }
+    // Major >= 2 routes to the newest profile with its real version quoted verbatim.
+    const later = [_]struct { in: []const u8, version: []const u8 }{
+        .{ .in = "2.0.20", .version = "2.0.20" },
+        .{ .in = "v2.0.20", .version = "2.0.20" },
+        .{ .in = "opencode v2.0.20", .version = "2.0.20" },
+        .{ .in = "3.0.0", .version = "3.0.0" },
+        .{ .in = "2.0.20-nightly", .version = "2.0.20" },
+    };
+    for (later) |c| {
+        const got = parseOpencodeVersion(c.in).?;
+        try t.expectEqual(OpenCodeGeneration.v2, got.generation);
+        try t.expectEqualStrings(c.version, got.version);
+    }
+    // No token, a non-numeric tag, or a pre-1 major is undecided.
+    for ([_][]const u8{ "", "dev", "0.14.0", "OpenCode — canary build" }) |input|
+        try t.expect(parseOpencodeVersion(input) == null);
+}
+
+test "marked version output survives login-shell rc banners" {
+    // An rc file's own banner must not pose as the version (keyed output).
+    const m = extractMarkedVersion("Welcome! node 18.2.0\nMLXOCV=0 opencode v2.0.20\n").?;
+    try t.expectEqual(0, m.rc);
+    const v = parseOpencodeVersion(m.out).?;
+    try t.expectEqual(OpenCodeGeneration.v2, v.generation);
+    try t.expectEqualStrings("2.0.20", v.version);
+    // A nonzero rc is the --version failure itself; the tail is its message.
+    try t.expectEqual(127, extractMarkedVersion("MLXOCV=127 opencode: boom\n").?.rc);
+    // A multiline version output keeps its tail after the marker line.
+    try t.expect(std.mem.indexOf(u8, extractMarkedVersion("b\nMLXOCV=0 open 2.0.20\nbuild x\n").?.out, "build x") != null);
+    // No marker, no rc token, or a junk rc = the subshell never answered.
+    try t.expect(extractMarkedVersion("opencode v2.0.20") == null);
+    try t.expect(extractMarkedVersion("MLXOCV=0") == null);
+    try t.expect(extractMarkedVersion("MLXOCV=x out") == null);
+}
+
+test "launch opencode2 resolves the v2 `opencode` first, then the legacy binary" {
+    const v2 = OpenCodeVersion{ .generation = .v2, .version = "2.0.20" };
+    const v3 = OpenCodeVersion{ .generation = .v2, .version = "3.0.0" };
+    const v1 = OpenCodeVersion{ .generation = .v1, .version = "1.18.34" };
+    try t.expectEqualStrings("opencode", resolveOpencode2Bin(v2, true).?);
+    try t.expectEqualStrings("opencode", resolveOpencode2Bin(v3, false).?);
+    try t.expectEqualStrings("opencode2", resolveOpencode2Bin(v1, true).?);
+    try t.expectEqualStrings("opencode2", resolveOpencode2Bin(null, true).?);
+    try t.expect(resolveOpencode2Bin(v1, false) == null);
+    try t.expect(resolveOpencode2Bin(null, false) == null);
+}
+
+test "opencode launch routing: the detected generation picks the script, config, and binary" {
+    const b = Budget{ .context = 65536, .output = 8192 };
+    const entries = [_]Entry{.{ .id = "m1", .budget = b, .vision = false, .loaded = true }};
+    // A Homebrew migration under ONE command: a v1 install gets the inline
+    // config + --model arm and nothing under the v2 config dir.
+    const v1_cfg = try opencodeJson(t.allocator, "http://x:1", &entries, null, false);
+    defer t.allocator.free(v1_cfg);
+    const before = try scriptFor(t.allocator, .opencode, "http://x:1", "m1", b, .{ .config = v1_cfg, .bin = "opencode" }, &.{});
+    defer t.allocator.free(before);
+    try t.expect(std.mem.indexOf(u8, before, "opencode --model mlx/m1") != null);
+    try t.expect(std.mem.indexOf(u8, before, "XDG_CONFIG_HOME") == null);
+    try t.expect(std.mem.indexOf(u8, v1_cfg, "\"model\"") == null);
+
+    // After the same `opencode` name upgrades to 2.x, the SAME launch routes
+    // to the v2 arm: standalone invocation under the RESOLVED binary name,
+    // the dedicated XDG dir, and the model pinned in the config.
+    const v2_cfg = try opencodeJson(t.allocator, "http://x:1", &entries, "m1", true);
+    defer t.allocator.free(v2_cfg);
+    const after = try scriptFor(t.allocator, .opencode2, "http://x:1", "m1", b, .{ .config = v2_cfg, .bin = "opencode" }, &.{});
+    defer t.allocator.free(after);
+    try t.expect(std.mem.indexOf(u8, after, "\nopencode --standalone") != null);
+    try t.expect(std.mem.indexOf(u8, after, "command -v opencode ") != null);
+    try t.expect(std.mem.indexOf(u8, after, "opencode2 --standalone") == null);
+    try t.expect(std.mem.indexOf(u8, after, "XDG_CONFIG_HOME=\"$HOME/.mlx-serve/opencode2\"") != null);
+    try t.expect(std.mem.indexOf(u8, v2_cfg, "\"model\": \"mlx/m1\"") != null);
+    try t.expect(std.mem.indexOf(u8, v2_cfg, "\"compaction\"") != null);
+
+    // The legacy alias resolves the standalone opencode2 binary instead.
+    const legacy = try scriptFor(t.allocator, .opencode2, "http://x:1", "m1", b, .{ .config = v2_cfg, .bin = "opencode2" }, &.{});
+    defer t.allocator.free(legacy);
+    try t.expect(std.mem.indexOf(u8, legacy, "\nopencode2 --standalone") != null);
 }
 
 test "opencodeJson pins the default model only when asked" {
@@ -1367,4 +2058,136 @@ test "launch scripts point every agent at the skill and export MLX_SERVE_URL" {
     const oc = try opencodeJson(t.allocator, "http://x:1", &entries, null, false);
     defer t.allocator.free(oc);
     try t.expect(std.mem.indexOf(u8, oc, "\"skills\": {\"paths\": [\"~/.mlx-serve/skills/mlx-serve\"]}") != null);
+}
+
+test "opencode probe status distinguishes missing from executable failure" {
+    const cases = [_]struct { capture: []const u8, shell_ok: bool = true, expected: std.meta.Tag(OpenCodeProbe) }{
+        .{ .capture = "MLXOCV=missing\n", .expected = .missing },
+        .{ .capture = "banner 18.2.0\nMLXOCV=missing\n", .expected = .missing },
+        .{ .capture = "MLXOCV=127 \n", .expected = .version_failed },
+        .{ .capture = "MLXOCV=1 failed\n", .expected = .version_failed },
+        .{ .capture = "2.0.20", .expected = .version_failed },
+        .{ .capture = "MLXOCV=0", .expected = .version_failed },
+        .{ .capture = "MLXOCV=x out", .expected = .version_failed },
+        .{ .capture = "MLXOCV=0 dev\n", .expected = .unparsed },
+        .{ .capture = "MLXOCV=0 2.0.20\n", .shell_ok = false, .expected = .version_failed },
+        .{ .capture = "MLXOCV=missing\n", .shell_ok = false, .expected = .version_failed },
+        .{ .capture = "MLXOCV=missing\nMLXOCV=0 2.0.20\n", .expected = .ok },
+        .{ .capture = "MLXOCV=0 2.0.20\nMLXOCV=missing\n", .expected = .missing },
+    };
+    for (cases) |case| try t.expectEqual(case.expected, std.meta.activeTag(classifyOpenCodeProbe(case.capture, case.shell_ok)));
+    for ([_][]const u8{ "1.18.34", "2.0.20", "3.0.0", "10.2.0" }) |version| {
+        const captured = try std.fmt.allocPrint(t.allocator, "banner node 18.2.0\nMLXOCV=0 opencode v{s}\nbuild x\n", .{version});
+        defer t.allocator.free(captured);
+        const result = classifyOpenCodeProbe(captured, true).ok;
+        try t.expectEqualStrings(version, result.version);
+        try t.expectEqual(if (version[0] == '1' and version[1] == '.') OpenCodeGeneration.v1 else .v2, result.generation);
+    }
+}
+
+test "zcode config escapes arbitrary model ids and declares server budgets and wire maps" {
+    const entries = [_]Entry{
+        .{ .id = "org/model\"quoted", .budget = .{ .context = 98304, .output = 49152 }, .vision = true, .loaded = false },
+        .{ .id = "glm-native", .budget = FALLBACK_BUDGET, .vision = false, .loaded = true },
+    };
+    const json = try zcodeConfigJson(t.allocator, "http://127.0.0.1:11234", entries[0].id, &entries);
+    defer t.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
+    defer parsed.deinit();
+    const config = parsed.value.object.get("config").?.object;
+    try t.expectEqualStrings(entries[0].id, config.get("defaultModelSelection").?.object.get("modelId").?.string);
+    const provider = config.get("providerConfigRules").?.object.get("providerRules").?.array.items[0].object;
+    try t.expectEqualStrings("mlx-serve", provider.get("providerName").?.string);
+    try t.expectEqualStrings("http://127.0.0.1:11234/v1", provider.get("config").?.object.get("api").?.object.get("baseUrl").?.string);
+    const rules = config.get("modelConfigRules").?.object.get("providerModelRules").?.array.items;
+    try t.expectEqual(@as(usize, 2), rules.len);
+    const m = rules[0].object.get("config").?.object;
+    try t.expectEqual(@as(i64, 98304), m.get("properties").?.object.get("contextWindow").?.integer);
+    try t.expectEqualStrings("{\"max_tokens\": maxOutputTokens}", m.get("optionSpecs").?.object.get("maxOutputTokens").?.object.get("map").?.string);
+    const script = try scriptFor(t.allocator, .zcode, "http://127.0.0.1:11234", entries[0].id, entries[0].budget, null, &.{ "--prompt", "it's a prompt" });
+    defer t.allocator.free(script);
+    try t.expect(std.mem.indexOf(u8, script, "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE") != null);
+    try t.expect(std.mem.indexOf(u8, script, "zcode '--prompt' 'it'\\''s a prompt'") != null);
+}
+
+test "pickEntry: the asked model or nothing, else the first loaded row, else the first" {
+    const b = FALLBACK_BUDGET;
+    const entries = [_]Entry{
+        .{ .id = "a", .budget = b, .vision = false, .loaded = false },
+        .{ .id = "b", .budget = b, .vision = false, .loaded = true },
+    };
+    try t.expectEqualStrings("a", pickEntry(&entries, "a").?.id);
+    try t.expect(pickEntry(&entries, "zz") == null);
+    try t.expectEqualStrings("b", pickEntry(&entries, null).?.id);
+    try t.expectEqualStrings("a", pickEntry(entries[0..1], null).?.id);
+    try t.expect(pickEntry(&.{}, null) == null);
+}
+
+test "served launch script writes the agent's files, keeps an edited skill, and runs on the terminal" {
+    const b = Budget{ .context = 65536, .output = 8192 };
+    const entries = [_]Entry{.{ .id = "m1", .budget = b, .vision = false, .loaded = true }};
+    const s = try remoteScript(t.allocator, .pi, "http://h:1", "m1", b, &entries);
+    defer t.allocator.free(s);
+    try t.expect(std.mem.startsWith(u8, s, "#!/bin/sh\n"));
+    try t.expect(std.mem.indexOf(u8, s, "[ -e \"$HOME/.mlx-serve/skills/mlx-serve/SKILL.md\" ] || cat > \"$HOME/.mlx-serve/skills/mlx-serve/SKILL.md\" <<'MLX_SERVE_EOF'\n") != null);
+    try t.expect(std.mem.indexOf(u8, s, "ln -s \"$HOME/.mlx-serve/skills/mlx-serve\" \"$HOME/.mlx-serve/pi/skills/mlx-serve\"\n") != null);
+    try t.expect(std.mem.indexOf(u8, s, "\ncat > \"$HOME/.mlx-serve/pi/models.json\" <<'MLX_SERVE_EOF'\n") != null);
+    try t.expect(std.mem.indexOf(u8, s, "\"baseUrl\": \"http://h:1/v1\"") != null);
+    // The served script cannot read the settings it would merge into: an existing file is kept.
+    try t.expect(std.mem.indexOf(u8, s, "\n[ -e \"$HOME/.mlx-serve/pi/settings.json\" ] || cat > \"$HOME/.mlx-serve/pi/settings.json\"") != null);
+    try t.expect(std.mem.indexOf(u8, s, "pi --provider mlx --model m1") != null);
+    try t.expect(std.mem.endsWith(u8, s, "then exec \"$login\" -l -c \"$s\" 0<&2; elif [ -t 1 ]; then exec \"$login\" -l -c \"$s\" 0<&1; elif (: </dev/tty) 2>/dev/null; then exec \"$login\" -l -c \"$s\" </dev/tty; fi; fi\nexec \"$login\" -l -c \"$s\"\n"));
+}
+
+test "served opencode2 script resolves its binary in the login shell and pins the model" {
+    const b = Budget{ .context = 65536, .output = 8192 };
+    const entries = [_]Entry{.{ .id = "m1", .budget = b, .vision = false, .loaded = true }};
+    const s = try remoteScript(t.allocator, .opencode2, "http://h:1", "m1", b, &entries);
+    defer t.allocator.free(s);
+    try t.expect(std.mem.indexOf(u8, s, "s='OC_BIN=opencode2\ncase \"$(opencode --version") != null);
+    try t.expect(std.mem.indexOf(u8, s, "$OC_BIN --standalone") != null);
+    try t.expect(std.mem.indexOf(u8, s, "\"model\": \"mlx/m1\"") != null);
+    try t.expect(std.mem.indexOf(u8, s, "cat > \"$HOME/.mlx-serve/opencode2/opencode/plugins/mlx-serve/tui.tsx\"") != null);
+    try t.expect(std.mem.indexOf(u8, s, "\"metricsUrl\":\"http://h:1/metrics.json\"") != null);
+}
+
+test "a model id with shell or JSON bytes stays one value in the claude and opencode scripts" {
+    const id = "x'\"$(touch p)";
+    const b = Budget{ .context = 65536, .output = 8192 };
+    const entries = [_]Entry{.{ .id = id, .budget = b, .vision = false, .loaded = true }};
+    const claude = try scriptFor(t.allocator, .claude, "http://h:1", id, b, null, &.{});
+    defer t.allocator.free(claude);
+    try t.expect(std.mem.indexOf(u8, claude, "export ANTHROPIC_DEFAULT_OPUS_MODEL='x'\\''\"$(touch p)'\n") != null);
+    try t.expect(std.mem.indexOf(u8, claude, "export CLAUDE_CODE_SUBAGENT_MODEL='x'\\''\"$(touch p)'\n") != null);
+
+    const json = try opencodeJson(t.allocator, "http://h:1", &entries, id, true);
+    defer t.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
+    defer parsed.deinit();
+    try t.expectEqualStrings("mlx/" ++ id, parsed.value.object.get("model").?.string);
+    try t.expect(parsed.value.object.get("provider").?.object.get("mlx").?.object.get("models").?.object.get(id) != null);
+
+    const oc = try scriptFor(t.allocator, .opencode2, "http://h:1", id, b, .{ .config = json, .bin = "opencode" }, &.{});
+    defer t.allocator.free(oc);
+    try t.expect(std.mem.indexOf(u8, oc, "\"model\": \"mlx/x'\\''\\\"$(touch p)\"") != null);
+}
+
+test "served launch script refuses a file that would end its heredoc" {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(t.allocator);
+    try t.expectError(error.HeredocCollision, appendHeredoc(&out, t.allocator, "x/y", "a\nMLX_SERVE_EOF\nb", false));
+}
+
+test "only the console's agents are web-launchable" {
+    for ([_]AgentKind{ .claude, .pi, .omp, .opencode2, .grok }) |k| try t.expect(webLaunchable(k));
+    for ([_]AgentKind{ .opencode, .codex, .hermes, .aider, .fx, .zcode }) |k| try t.expect(!webLaunchable(k));
+}
+
+test "loginShellFor: the user's own POSIX shell binary, else zsh on macOS, else bash, else sh" {
+    try std.testing.expectEqualStrings("/opt/homebrew/bin/bash", loginShellFor("/opt/homebrew/bin/bash", true, true));
+    try std.testing.expectEqualStrings("/bin/zsh", loginShellFor("/bin/zsh", false, false));
+    // fish and nushell cannot parse the POSIX script body: macOS keeps zsh (~/.zprofile's PATH).
+    try std.testing.expectEqualStrings("/bin/zsh", loginShellFor("/opt/homebrew/bin/fish", true, true));
+    try std.testing.expectEqualStrings("bash", loginShellFor("/usr/bin/fish", false, true));
+    try std.testing.expectEqualStrings("sh", loginShellFor(null, false, false));
 }

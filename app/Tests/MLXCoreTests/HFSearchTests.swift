@@ -660,6 +660,20 @@ final class HFModelQuantGateTests: XCTestCase {
         XCTAssertTrue(supportedModelTypes.contains("laguna"))
     }
 
+    func testMiniCPMV47IsSupportedArchitecture() {
+        // MiniCPM-V 4.7 (model_type minicpmv4_7): a Qwen3.5 trunk behind a SigLIP2 tower.
+        let m = mlx(id: "mlx-community/MiniCPM-V-4.7-35B-A3B-4bit",
+                    tags: ["mlx", "safetensors", "minicpmv4_7", "image-text-to-text",
+                           "minicpm-v", "multimodal", "moe", "conversational", "4-bit"])
+        XCTAssertTrue(m.isSupportedArchitecture)
+        XCTAssertNil(m.incompatibleReason)
+        XCTAssertTrue(supportedModelTypes.contains("minicpmv4_7"))
+        // Only 4.7 is served; earlier MiniCPM-V generations are a different trunk.
+        let older = mlx(id: "mlx-community/MiniCPM-V-4.6-4bit",
+                        tags: ["mlx", "safetensors", "minicpmv4_6", "image-text-to-text"])
+        XCTAssertFalse(older.isSupportedArchitecture)
+    }
+
     func testMuseGlimmerIsSupportedArchitecture() {
         // meta-models Muse-Glimmer-30B (config.json model_type=muse_glimmer) is
         // served by the MLX engine — same class as hy_v3/laguna: the model_type
@@ -716,6 +730,29 @@ final class HFModelQuantGateTests: XCTestCase {
         XCTAssertTrue(m.isSupportedArchitecture,
                       "gpt_oss tags should be treated as supported architecture")
         XCTAssertNil(m.incompatibleReason)
+    }
+
+    func testGlm5NextIsSupportedButOtherGlmIsNot() {
+        // GLM-5.3-Flash packs carry model_type glm5_next (text config glm5_next_text).
+        for type in ["glm5_next", "glm5_next_text"] {
+            XCTAssertTrue(supportedModelTypes.contains(type))
+            XCTAssertTrue(mlx(id: "TensorFold/GLM-5.3-Flash-MLX-oQ4-MTP",
+                              tags: ["mlx", "safetensors", type, "glm", "text-generation"]).isSupportedArchitecture)
+        }
+        // GLM-5 (glm_moe_dsa) and GLM-4 MoE are other architectures we do not serve.
+        XCTAssertFalse(mlx(id: "mlx-community/GLM-5-4bit", tags: ["mlx", "safetensors", "glm_moe_dsa", "glm"]).isSupportedArchitecture)
+        XCTAssertFalse(mlx(id: "mlx-community/GLM-4.6-4bit", tags: ["mlx", "safetensors", "glm4_moe", "glm"]).isSupportedArchitecture)
+    }
+
+    func testMimoV2IsSupportedButMimoV1IsNot() {
+        // MiMo-V2.6-Flash packs carry model_type mimo_v2 (TensorFold/Vontra: mimo_v2_flash).
+        for type in ["mimo_v2", "mimo_v2_flash"] {
+            XCTAssertTrue(supportedModelTypes.contains(type))
+            XCTAssertTrue(mlx(id: "mlx-community/MiMo-V2.6-Flash-mxfp4-q8",
+                              tags: ["mlx", "safetensors", type, "text-generation"]).isSupportedArchitecture)
+        }
+        // The MiMo-7B family (model_type mimo) is a different architecture we do not serve.
+        XCTAssertFalse(mlx(id: "XiaomiMiMo/MiMo-7B-RL", tags: ["safetensors", "mimo", "text-generation"]).isSupportedArchitecture)
     }
 
     /// HF tags a repo with its config.json model_type, so a served model_type

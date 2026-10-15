@@ -906,7 +906,7 @@ pub const Engine = struct {
         // 4. Euler denoise. text mask is all-valid ⇒ null (no additive mask).
         // Update in f32, store back in the latent (bf16) dtype — `_mage_flow_euler_step`.
         for (0..n_steps) |i| {
-            if (progress) |p| if (p.cancelled()) return error.Cancelled;
+            if (progress) |p| if (p.boundary()) return error.Cancelled;
             const v = try self.dit.forward(img, txt, sigmas[i], 1, lat_h, lat_w, null);
             defer _ = mlx.mlx_array_free(v);
             const img_f = try astype(img, .float32, s);
@@ -1080,7 +1080,7 @@ fn denoiseEditLoop(dit: *const Dit, txt: mlx.mlx_array, noise: mlx.mlx_array, re
     try mlx.check(mlx.mlx_array_set(&target, noise));
     errdefer _ = mlx.mlx_array_free(target);
     for (0..sigmas.len - 1) |i| {
-        if (progress) |p| if (p.cancelled()) return error.Cancelled;
+        if (progress) |p| if (p.boundary()) return error.Cancelled;
         const model_input = try concat(&.{ target, ref_latents }, 1, s); // [1, n_images*HW, 128]
         defer _ = mlx.mlx_array_free(model_input);
         const v_full = try dit.forward(model_input, txt, sigmas[i], n_images, lat_h, lat_w, null);
@@ -2730,13 +2730,29 @@ fn jointAttn(aw: *const DitAttnW, img_in: mlx.mlx_array, txt_in: mlx.mlx_array, 
     const v = try concatHeadsFirst(tvh, ivh, s);
     defer _ = mlx.mlx_array_free(v);
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(DIT_HEAD_DIM)));
+    // The f32 q/k norms promote q/k to f32. cuDNN's fused attention takes only
+    // bf16/f16, and MLX's CUDA fallback materializes the [seq x seq] scores
+    // (46 GB for a 2048x1360 edit), so CUDA attends in bf16. Metal keeps f32.
+    const to_bf16 = mlx.cudaAvailable() and mlx.mlx_array_dtype(q) == .float32;
+    const qa = if (to_bf16) try astype(q, .bfloat16, s) else q;
+    defer if (to_bf16) {
+        _ = mlx.mlx_array_free(qa);
+    };
+    const ka = if (to_bf16) try astype(k, .bfloat16, s) else k;
+    defer if (to_bf16) {
+        _ = mlx.mlx_array_free(ka);
+    };
+    const va = if (to_bf16) try astype(v, .bfloat16, s) else v;
+    defer if (to_bf16) {
+        _ = mlx.mlx_array_free(va);
+    };
     var attn = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(attn);
     const null_a = mlx.mlx_array{ .ctx = null };
     if (mask) |m| {
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, q, k, v, scale, "array", m, null_a, false, s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qa, ka, va, scale, "array", m, null_a, false, s));
     } else {
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, q, k, v, scale, "", null_a, null_a, false, s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qa, ka, va, scale, "", null_a, null_a, false, s));
     }
     // [B,H,seq,128] → [B,seq,3072]
     const at = try transpose(attn, &[_]c_int{ 0, 2, 1, 3 }, s);

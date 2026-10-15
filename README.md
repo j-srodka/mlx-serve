@@ -1,4 +1,4 @@
-![mlx-serve — the unified AI powerhouse on Apple Silicon: chat, coding agents, image, video, music, voice clone, 3D](website/assets/mlx-serve-header.png)
+![mlx-serve — the unified AI powerhouse on Apple Silicon: chat, coding agents, image, video, music, voice clone, 3D](website/assets/mlx-serve-header.jpg)
 
 # mlx-serve — run any LLM on your Mac
 
@@ -15,7 +15,7 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 
-**[mlxserve.com](https://mlxserve.com/)** · [Download MLX-Serve.app](https://github.com/ddalcu/mlx-serve/releases/latest) · [Docs](#docs) · [Changelog](CHANGELOG.md)
+**[mlxserve.com](https://mlxserve.com/)** · [Download MLX-Serve.app](https://github.com/ddalcu/mlx-serve/releases/latest) · [Docs](#docs) · [Changelog](CHANGELOG.md) · **[MLX-Serve official chat (our Discord)](https://x.com/i/chat/group_join/g2108335256541741397/K38XS6aGRh)**
 
 mlx-serve is a native Zig server that runs **any LLM on Apple Silicon** — MLX-format models *and* every GGUF on HuggingFace (Qwen, Llama, Mistral, Gemma, DeepSeek V4 Flash, thousands more). It exposes **OpenAI-compatible** *and* **Anthropic-compatible** HTTP APIs out of the box, so the same `http://localhost:11234` works with Claude Code, the OpenAI SDK, Continue, Cursor, Open WebUI, and anything else that speaks one of those wires. Beyond text, the same server generates **images, video, music, speech (with voice cloning), and 3D models** — all natively on MLX. Ships with **MLX Core**, a macOS menu-bar app with chat, agent mode, MCP tool calling, and model management.
 
@@ -33,9 +33,22 @@ Needs macOS 26.2+ on Apple Silicon.
 
 ```bash
 brew tap ddalcu/mlx-serve https://github.com/ddalcu/mlx-serve
-brew install --cask mlx-core   # the app (recommended)
+brew trust ddalcu/mlx-serve
+brew install --cask mlx-serve  # the app (recommended)
 brew install mlx-serve         # CLI + server only, no GUI
 ```
+
+To upgrade, name the package (the app also updates itself from its menu):
+
+```bash
+brew update
+brew upgrade --cask mlx-serve  # the app
+brew upgrade mlx-serve         # the CLI
+```
+
+### Linux (NVIDIA)
+
+Every release attaches `mlx-serve-linux-x64-cuda13.tar.gz` (RTX 20–50 series) and `mlx-serve-linux-arm64-cuda13.tar.gz` (GH200, Jetson Thor, DGX Spark). They need an NVIDIA driver ≥ 580, the CUDA 13 toolkit, cuDNN 9, OpenBLAS/LAPACKE, libwebp and the Avahi dns_sd compat library. Unpack into an empty folder (the tarball has no top-level directory) and run `zig-out/bin/mlx-serve`; it finds its libraries next to itself.
 
 ### Prefer the terminal?
 
@@ -106,9 +119,9 @@ Numbers and charts in [Performance](#performance).
 - **Any model:** every supported MLX architecture plus the entire GGUF universe via embedded llama.cpp; DeepSeek V4 Flash through the dedicated [antirez/ds4](https://github.com/antirez/ds4) engine.
 - **Four API surfaces on one port:** OpenAI chat/completions and Responses (with a WebSocket transport), Anthropic Messages, and the Ollama API. Full reference in [docs/api.md](docs/api.md).
 - **The whole modern serving surface:** streaming, tools with schema-driven auto-repair, JSON-schema constrained decoding, logprobs, vision, thinking as `reasoning_content`.
-- **Works with your coding agent:** Claude Code, pi, oh-my-pi, OpenCode, OpenCode 2, Codex, hermes, aider, and editors like Zed. One-click from the app or `mlx-serve launch <agent>` in the terminal, both preconfigured with the server's real context window. Setup for every tool in [docs/integrations.md](docs/integrations.md).
+- **Works with your coding agent:** Claude Code, pi, oh-my-pi, OpenCode, OpenCode 2, Codex, hermes, aider, fx, Grok, and editors like Zed. One-click from the app or `mlx-serve launch <agent>` in the terminal, both preconfigured with the server's real context window. Setup for every tool in [docs/integrations.md](docs/integrations.md).
 - **Fast:** speculative decoding four ways (PLD, model-shipped draft companions, the Gemma 4 drafter, native Qwen MTP), custom Metal kernels, continuous batching, KV-cache quantization, prefix and tokenize caches. Numbers in [docs/performance.md](docs/performance.md).
-- **Built-in web console:** open `http://localhost:11234` in a browser for a chat playground, live monitor, image and audio tools, and the API reference.
+- **Built-in web console:** open `http://localhost:11234` in a browser for chat, image, audio and video generation, a Library of your results, live monitoring and the API reference.
 - **LAN model sharing:** use another Mac's models over Bonjour with zero config; even Claude Code pointed at `localhost` can run on the Studio's 27B.
 - **Media generation:** image, video, music, speech with voice cloning, and 3D, natively on MLX, from the same server.
 - **No Python:** a single ~7 MB Zig binary. The app ships everything signed and notarized.
@@ -143,7 +156,7 @@ The full feature list is in [docs/app.md](docs/app.md).
 
 ## Supported models
 
-Native MLX dispatch for Gemma 3/4, DiffusionGemma, Qwen 3 / 3.5 / 3.6 / 3.8 / 3-Next, Meta's Muse-Glimmer-30B, inclusionAI Ling 3.0, DeepSeek V4 Flash (284B), Tencent Hunyuan 3 (295B), Thinking Machines Inkling Small (276B), poolside Laguna, Llama 3.x, Mistral, Nemotron-H, LFM2/2.5 (including the VL vision builds), plus embedding models (BERT, EmbeddingGemma, Qwen3-Embedding) and Laya typed-decision models (`POST /v1/decisions`). Anything else runs as GGUF through the embedded llama.cpp, auto-routed by format. The full table with `model_type`s, chat formats and vision support is in [docs/models.md](docs/models.md).
+Native MLX dispatch for Gemma 3/4, DiffusionGemma, Qwen 3 / 3.5 / 3.6 / 3.8 / 3-Next, Meta's Muse-Glimmer-30B, OpenBMB MiniCPM-V 4.7, inclusionAI Ling 3.0, DeepSeek V4 Flash (284B), Tencent Hunyuan 3 (295B), Thinking Machines Inkling Small (276B), poolside Laguna, Llama 3.x, Mistral, Nemotron-H, LFM2/2.5 (including the VL vision builds), plus embedding models (BERT, EmbeddingGemma, Qwen3-Embedding) and Laya typed-decision models (`POST /v1/decisions`). Anything else runs as GGUF through the embedded llama.cpp, auto-routed by format. The full table with `model_type`s, chat formats and vision support is in [docs/models.md](docs/models.md).
 
 ## Performance
 
@@ -159,7 +172,7 @@ Speculative decoding comes in four flavors (PLD, model-shipped draft companions,
 
 - [docs/cli.md](docs/cli.md) — CLI commands and every server flag
 - [docs/api.md](docs/api.md) — full HTTP API reference: OpenAI, Anthropic, Ollama, media endpoints
-- [docs/integrations.md](docs/integrations.md) — connect coding agents and editors: Claude Code, pi, oh-my-pi, OpenCode, Codex, hermes, aider, Zed, OpenClaw
+- [docs/integrations.md](docs/integrations.md) — connect coding agents and editors: Claude Code, pi, oh-my-pi, OpenCode, Codex, hermes, aider, fx, Grok, Zed, OpenClaw
 - [docs/models.md](docs/models.md) — supported model architectures
 - [docs/app.md](docs/app.md) — everything the MLX Core app does, including the media generation tour
 - [docs/performance.md](docs/performance.md) — benchmarks, speculative decoding, tuning knobs

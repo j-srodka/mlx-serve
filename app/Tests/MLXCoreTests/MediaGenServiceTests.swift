@@ -209,6 +209,14 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertTrue(VideoModelPreset.all.contains { $0.id == VideoModelPreset.minimaxH3Ref2VA.id })
     }
 
+    func testTurboStepsStayInsideTheDistillationsTrainedRange() {
+        // Bar: Turbo offers 4-8 on every pack that has it; anything else keeps its own range.
+        XCTAssertEqual(VideoModelPreset.minimaxH3.stepsRange(turbo: true), 4...8)
+        XCTAssertEqual(VideoModelPreset.minimaxH3Q4.stepsRange(turbo: true), 4...8)
+        XCTAssertEqual(VideoModelPreset.minimaxH3.stepsRange(turbo: false), VideoModelPreset.minimaxH3.stepsRange)
+        XCTAssertEqual(VideoModelPreset.minimaxH3Ref2VA.stepsRange(turbo: true), VideoModelPreset.minimaxH3Ref2VA.stepsRange)
+    }
+
     func testTurboAndChainingAreFl2vaOnlyAndGateTheirFields() {
         // Capability side: both ride fl2va machinery (the LoRA is untested on
         // the REF2VA DiT; a reference has no keyframe row to chain through),
@@ -1115,6 +1123,28 @@ final class MediaGenServiceTests: XCTestCase {
             }
             XCTAssertTrue(ImageModelPreset.all.contains(p))
             XCTAssertTrue(p.bundle.components[0].readyMarkers.contains("processor"))
+        }
+    }
+
+    /// Turbo ships its own 8-sigma grid and the server runs it whatever `steps`
+    /// says, so the pane must offer no step count at all.
+    func testQwenImageTurboPresetsRunTheCheckpointsOwnSchedule() {
+        for p in [ImageModelPreset.qwenImage21Turbo_8bit, .qwenImage21Turbo_4bit] {
+            XCTAssertTrue(p.stepsAreFixed, "\(p.id): distilled 8-step grid")
+            XCTAssertTrue(p.stepsSetByCheckpoint, "\(p.id): the server ignores steps")
+            XCTAssertEqual(p.fixedSteps, 8)
+            for q in QualityPreset.allCases { XCTAssertEqual(p.settings(q).steps, 8) }
+            XCTAssertTrue(p.supportsImg2Img)
+            XCTAssertFalse(p.supportsLoRA)
+            XCTAssertEqual(p.condWeightCount, 0)
+            XCTAssertEqual(p.resolutionGrid.alignment, 16)
+            XCTAssertEqual(p.configName, "qwen_image21")
+            XCTAssertTrue(p.repo.hasPrefix("ddalcu/Qwen-Image-2.1-Turbo-"))
+            XCTAssertTrue(ImageModelPreset.all.contains(p))
+            XCTAssertTrue(p.bundle.components[0].readyMarkers.contains("processor"))
+        }
+        for p in [ImageModelPreset.qwenImage21_8bit, .qwenImage21_4bit, .mageFlowTurbo] {
+            XCTAssertFalse(p.stepsSetByCheckpoint, "\(p.id): steps reach the server")
         }
     }
 

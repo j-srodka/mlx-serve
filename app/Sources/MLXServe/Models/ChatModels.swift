@@ -24,12 +24,12 @@ struct ChatSession: Identifiable, Codable {
     var attachedFolderPath: String?
     /// Non-nil marks this session as the transient vehicle for an unattended task
     /// run (see TaskScheduler). Such sessions are filtered out of the chat sidebar
-    /// and never persisted to chat-history.json — their transcript lives under
+    /// and never persisted by `ChatStore` — their transcript lives under
     /// ~/.mlx-serve/tasks/<taskId>/<runId>/transcript.json instead.
     var taskRunId: UUID?
     /// True marks this as a transient vehicle for an external messaging bridge
     /// (e.g. the Telegram bot). Like task-run sessions these are kept out of the
-    /// chat sidebar and never persisted to chat-history.json — the conversation
+    /// chat sidebar and never persisted by `ChatStore` — the conversation
     /// lives on the messaging platform, not in the app's chat list.
     var isExternalBridge: Bool
     /// Per-session toolbar toggles. Persisted here (not as view `@State` or the
@@ -50,6 +50,9 @@ struct ChatSession: Identifiable, Codable {
     var agentId: UUID?
     /// Tools this chat has switched OFF in the Tools menu, by wire name.
     var disabledTools: [String]
+    /// Its sidebar group (nil = the root) and dragged position (`SidebarChatRows.Placement`).
+    var groupId: UUID?
+    var sidebarPosition: Int?
 
     init(title: String = "New Chat") {
         self.id = UUID()
@@ -67,6 +70,8 @@ struct ChatSession: Identifiable, Codable {
         self.useMCP = false
         self.agentId = nil
         self.disabledTools = []
+        self.groupId = nil
+        self.sidebarPosition = nil
     }
 
     /// Resolve stored names to tools, silently dropping any this build no longer
@@ -75,10 +80,11 @@ struct ChatSession: Identifiable, Codable {
         Set(names.compactMap(AgentToolKind.init(rawValue:)))
     }
 
-    enum CodingKeys: String, CodingKey {
+    enum CodingKeys: String, CodingKey, CaseIterable {
         case id, title, messages, createdAt, updatedAt, mode, workingDirectory, attachedFolderPath, taskRunId, isExternalBridge, enableThinking, useMCP, agentId
         case disabledTools
         case reasoningEffort
+        case groupId, sidebarPosition
     }
 
     init(from decoder: Decoder) throws {
@@ -111,6 +117,8 @@ struct ChatSession: Identifiable, Codable {
         // Absent (every session saved before the Tools menu) → nothing disabled,
         // i.e. exactly the behaviour that build had.
         disabledTools = try c.decodeIfPresent([String].self, forKey: .disabledTools) ?? []
+        groupId = try c.decodeIfPresent(UUID.self, forKey: .groupId)
+        sidebarPosition = try c.decodeIfPresent(Int.self, forKey: .sidebarPosition)
     }
 
     /// Shared default cwd for all chat sessions — a SETTING since 2026-07-20
@@ -178,8 +186,7 @@ struct ChatImage: Identifiable, Codable, Equatable {
     /// Optional so a history written before attachments moved to disk still
     /// DECODES: its `data` key is simply unknown here and `path` is absent, so
     /// the record survives and only its picture is gone. A required field would
-    /// throw instead, and `loadChatHistory`'s `?? []` turns one throw into an
-    /// EMPTY history — the whole file, not one image.
+    /// throw instead, and `ChatStore` would leave the whole message out.
     ///
     /// Also nil for bytes that were never meant to outlive the turn: a Telegram
     /// photo, whose session is never persisted at all, and a `browse`
@@ -293,12 +300,25 @@ struct ChatAudio: Identifiable, Codable, Equatable {
 struct ChatVideo: Identifiable, Codable, Equatable {
     let id: UUID
     let name: String // original filename, for the attachment chip
-    let frames: [Data] // JPEG bytes, one per sampled frame
+    /// The folder of frame JPEGs under `~/.mlx-serve/attachments/`, when there is one.
+    var path: String?
+    var frames: [Data] // JPEG bytes, one per sampled frame; empty when the folder is gone
 
-    init(name: String, frames: [Data]) {
+    enum CodingKeys: String, CodingKey { case id, name, path }
+
+    init(name: String, frames: [Data], path: String? = nil) {
         self.id = UUID()
         self.name = name
         self.frames = frames
+        self.path = path
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        path = try c.decodeIfPresent(String.self, forKey: .path)
+        frames = path.map { AttachmentStore.videoFrames(at: $0) } ?? []
     }
 
     var frameCount: Int { frames.count }
@@ -728,13 +748,9 @@ struct SpecCostInfo: Equatable {
 struct MemoryInfo {
     var activeBytes: Int64
     var peakBytes: Int64
-    /// RAM available for a new allocation, computed server-side with the SAME
-    /// formula as the model-load pre-flight (`status.getAvailableMemBytes` =
-    /// total − wired − compressor). This is reclaimable-available, not unused:
-    /// it counts file cache and pageable memory that macOS evicts under
-    /// allocation pressure, so it's typically much larger than "free". 0 when the
-    /// server build predates the field — the tray hides the line then. Distinct
-    /// axis from `activeBytes` (the MLX GPU-allocator footprint).
+    /// RAM available for a new allocation — the server's pre-flight number
+    /// (`status.getAvailableMemBytes`): reclaimable, not "free". 0 on older
+    /// server builds (tray hides the line); distinct axis from `activeBytes`.
     var availableBytes: Int64
     var maxSafeContext: Int
     /// MLX's reclaimable buffer pool — memory the server process HOLDS but is
@@ -1080,14 +1096,14 @@ struct LocalModel: Identifiable, Hashable {
     /// a base checkpoint whose architecture serves chat completions. Excludes
     /// drafters, media models (LTX "AudioVideo", FLUX/Krea, Qwen3-TTS,
     /// Hunyuan3D, AceStep), image classifiers ("vit"), and
-    /// embeddings-only "bert" encoders — those live under ~/.mlx-serve/models
+    /// embeddings-only "bert" and "embedding_gemma2" encoders — those live under ~/.mlx-serve/models
     /// as gen-pane / doc-RAG dependencies and load by path, never as the
     /// tray's primary model. The Model Browser's Downloaded tab still lists
     /// them (size + delete) and, since they ARE supported architectures,
     /// no longer flags them "Unsupported".
     var isChatPickable: Bool {
         guard defect == nil, !isDownloading else { return false }
-        return kind == .base && isSupportedArchitecture && modelType != "bert" && !isMediaModelType(modelType)
+        return kind == .base && isSupportedArchitecture && modelType != "bert" && modelType != "embedding_gemma2" && modelType != "qwen3_asr" && modelType != "qwen3_forced_aligner" && !isMediaModelType(modelType)
     }
 
     /// Likely tool/function-calling support (name heuristic, shared with the
@@ -1277,6 +1293,15 @@ let gemmaModelOptions: [GemmaModelOption] = [
         displayName: "DeepSeek-V4-Flash (iQ-MLX 3.3 bpw)",
         repoId: "ddalcu/DeepSeek-V4-Flash-0731-iQ-MLX-3.3bpw",
         sizeEstimate: "~130 GB, needs 128 GB RAM",
+        minHostRamBytes: 128 * (UInt64(1) << 30)
+    ),
+    // DeepSeek-V4.1-Flash (deepseek_v41) on mlx-stream: the trunk loads once, the EXL3
+    // experts stream from SSD and the Engram tables (~200 GB) stay on disk.
+    GemmaModelOption(
+        id: "deepseek-v41-flash-exl3",
+        displayName: "DeepSeek-V4.1-Flash (streaming repack, EXL3 3.0 bpw)",
+        repoId: "OpensourceWTF/DeepSeek-V4.1-Flash-streaming-repack-exl3-3.0bpw",
+        sizeEstimate: "~426 GB on disk (experts stream from SSD), needs 128 GB RAM",
         minHostRamBytes: 128 * (UInt64(1) << 30)
     ),
     // Tencent Hunyuan 3 (hy_v3): 295B-A21B MoE, 256K context, Apache 2.0.

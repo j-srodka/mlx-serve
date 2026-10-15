@@ -138,6 +138,7 @@ struct MLXCoreApp: App {
                 .environmentObject(appState.videoGen)
                 .environmentObject(appState.audioGen)
                 .environmentObject(appState.musicGen)
+                .environmentObject(appState.soundGen)
                 .environmentObject(appState.model3dGen)
                 // Settings, Tasks and Agents render here as modes too, so their
                 // objects ride this scene (`ChatWorkspace`).
@@ -195,8 +196,8 @@ struct MLXCoreApp: App {
         }
         .defaultSize(width: 1040, height: 680)
 
-        Window("Decisions", id: "layaDecisions") {
-            LayaDecisionsWindow()
+        Window("Decisions", id: "decisions") {
+            DecisionsWindow()
                 .environmentObject(appState)
                 .environmentObject(appState.server)
                 .appAppearance()
@@ -414,10 +415,12 @@ private struct MenuBarLabel: View {
     @ObservedObject var server: ServerManager
     @ObservedObject var voice: VoiceModeController
     @ObservedObject var browser: BrowserManager
+    /// A transcript can start by itself (camera on), so the icon says when one is recording.
+    @ObservedObject var transcript = TrayTranscript.shared
     let open: (String) -> Void
 
     var body: some View {
-        Image(nsImage: voice.isActive ? activeIcon : MLXCoreApp.menuBarIcon(for: server.status))
+        Image(nsImage: voice.isActive || transcript.isRecording ? activeIcon : MLXCoreApp.menuBarIcon(for: server.status))
             // A tapped task notification: the Tasks pane is part of the chat
             // window, so this brings that window up on it and TaskListPane
             // consumes the id in .onAppear/.onChange.

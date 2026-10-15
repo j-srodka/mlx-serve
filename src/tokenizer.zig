@@ -63,7 +63,12 @@ pub fn reservedOutputIds(
 }
 
 /// BPE tokenizer supporting both SentencePiece (Gemma) and byte-level (GPT-2/Qwen3) modes.
+/// `.llama3` is Muse-Glimmer's CASED Llama-3 variant; the plain Llama-3 regex is `.gpt2`.
 pub const PretokStyle = enum { gpt2, llama3 };
+
+/// Runs that a tokenizer.json Split entry of their own isolates before the main regex runs (DeepSeek-V4,
+/// Hunyuan, Spark-X2.5): `digits` = `\p{N}{1,3}`, `cjk` = their CJK class, U+4E00-9FA5 and U+3040-30FF.
+pub const IsolatedRuns = struct { digits: bool = false, cjk: bool = false };
 
 pub const Tokenizer = struct {
     /// Token string -> id
@@ -85,6 +90,7 @@ pub const Tokenizer = struct {
     /// (?i) contractions, {1,3} digit groups, `/` in the punct tail).
     /// Parsed from the tokenizer.json Split regex.
     pretok_style: PretokStyle = .gpt2,
+    isolated_runs: IsolatedRuns = .{},
     /// HF `Metaspace` pre-tokenizer (mmBERT / Gemma-2 class tokenizer.json):
     /// a leading ▁ is prepended when the text does not already start with
     /// one (`prepend_scheme`; `first` = only text at offset 0, never after a
@@ -97,6 +103,8 @@ pub const Tokenizer = struct {
     /// consecutive unks fuse when `fuse_unk`. Gemma / mmBERT class.
     byte_fallback: bool = false,
     fuse_unk: bool = false,
+    /// HF BPE `ignore_merges`: a word the vocab holds whole is that one token, before any merge.
+    ignore_merges: bool = false,
     unk_id: ?u32 = null,
     /// tokenizer.json decoder carries `ByteFallback`: runs of `<0xNN>`
     /// tokens decode as the bytes they spell (U+FFFD per byte when the run
@@ -520,7 +528,7 @@ pub const Tokenizer = struct {
             words.deinit(allocator);
         }
         switch (self.pretok_style) {
-            .gpt2 => try gpt2PreTokenize(allocator, text, self.digit_group, &words),
+            .gpt2 => try isolatedRunsPreTokenize(allocator, text, self.digit_group, self.isolated_runs, &words),
             .llama3 => try llama3PreTokenize(allocator, text, &words),
         }
 
@@ -739,6 +747,11 @@ pub const Tokenizer = struct {
     /// with no pre-tokenization, so the previous rescan-all-pairs loop was
     /// O(n²) and cost seconds on agent-sized (tens-of-KB) system prompts.
     fn bpeMerge(self: *const Tokenizer, allocator: std.mem.Allocator, input: []const u8) ![]u32 {
+        if (self.ignore_merges) if (self.vocab.get(input)) |id| {
+            const out = try allocator.alloc(u32, 1);
+            out[0] = id;
+            return out;
+        };
         // Split into individual UTF-8 characters.
         var nodes: std.ArrayList(BpeNode) = .empty;
         defer nodes.deinit(allocator);
@@ -835,6 +848,25 @@ pub const Tokenizer = struct {
         try ids.append(allocator, unk);
     }
 };
+
+/// HF applies the isolating Splits first and the main regex to each piece alone, so no
+/// pre-token crosses a run's edge: `"x  1"` keeps `"  "`, which Llama-3's combined regex splits.
+fn isolatedRunsPreTokenize(allocator: std.mem.Allocator, text: []const u8, digit_group: u8, runs: IsolatedRuns, words: *std.ArrayList([]const u8)) !void {
+    if (!runs.digits and !runs.cjk) return gpt2PreTokenize(allocator, text, digit_group, words);
+    var start: usize = 0;
+    var prev: u2 = 0;
+    var i: usize = 0;
+    while (decodeCodepoint(text, i)) |c| : (i += c.len) {
+        const cjk = (c.cp >= 0x4E00 and c.cp <= 0x9FA5) or (c.cp >= 0x3040 and c.cp <= 0x30FF);
+        const kind: u2 = if (runs.digits and isDigit(c.cp)) 1 else if (runs.cjk and cjk) 2 else 0;
+        if (kind != prev and i > start) {
+            try gpt2PreTokenize(allocator, text[start..i], digit_group, words);
+            start = i;
+        }
+        prev = kind;
+    }
+    if (start < text.len) try gpt2PreTokenize(allocator, text[start..], digit_group, words);
+}
 
 /// GPT-2 pre-tokenization: splits text following the Qwen / Llama-3 / GPT-2
 /// pre-tokenizer regex as a hand-rolled state machine. Each iteration picks
@@ -942,8 +974,8 @@ fn gpt2PreTokenize(allocator: std.mem.Allocator, text: []const u8, digit_group: 
         }
 
         // ── Pattern 7: `\s+` — fallback whitespace ──
-        if (i < text.len and isWhitespace(text[i])) {
-            while (i < text.len and isWhitespace(text[i])) i += 1;
+        if (matchWhitespaceRun(text, i)) |new_i| {
+            i = new_i;
             try words.append(allocator, try allocator.dupe(u8, text[start..i]));
             continue;
         }
@@ -1016,8 +1048,8 @@ fn llama3PreTokenize(allocator: std.mem.Allocator, text: []const u8, words: *std
             try words.append(allocator, try allocator.dupe(u8, text[start..i]));
             continue;
         }
-        if (i < text.len and isWhitespace(text[i])) {
-            while (i < text.len and isWhitespace(text[i])) i += 1;
+        if (matchWhitespaceRun(text, i)) |new_i| {
+            i = new_i;
             try words.append(allocator, try allocator.dupe(u8, text[start..i]));
             continue;
         }
@@ -1164,36 +1196,59 @@ fn matchOptionalSpaceAndPunct(text: []const u8, start: usize) ?usize {
     return i;
 }
 
-/// Pattern 5: `\s*[\r\n]+`. Returns end position, or null if no \r\n found
-/// after consuming \s*.
+/// Pattern 5: `\s*[\r\n]+`. The greedy `\s*` backtracks to the whitespace
+/// run's LAST \r or \n, so the match ends right after it ("\n    \n" is one
+/// pre-token). Returns null if the run holds no \r or \n.
 fn matchWhitespaceWithNewline(text: []const u8, start: usize) ?usize {
     var i: usize = start;
-    while (i < text.len and isWhitespace(text[i]) and text[i] != '\r' and text[i] != '\n') i += 1;
-    if (i >= text.len or (text[i] != '\r' and text[i] != '\n')) return null;
-    while (i < text.len and (text[i] == '\r' or text[i] == '\n')) i += 1;
-    return i;
+    var end: ?usize = null;
+    while (whitespaceLen(text, i)) |n| {
+        if (text[i] == '\r' or text[i] == '\n') end = i + 1;
+        i += n;
+    }
+    return end;
 }
 
-/// Pattern 6: `\s+(?!\S)`. Greedy match of all whitespace bytes, then
-/// shortens by 1 if the next char is \S so the trailing space can be picked
+/// Pattern 6: `\s+(?!\S)`. Greedy match of all whitespace codepoints, then
+/// shortens by one if the next char is \S so the trailing space can be picked
 /// up by pattern 2/4 on the next iteration. Returns null if there's only
 /// one whitespace char and the next is \S (lookahead can't be satisfied).
 fn matchTrailingWhitespace(text: []const u8, start: usize) ?usize {
-    if (start >= text.len) return null;
-    if (!isWhitespace(text[start])) return null;
     var end: usize = start;
-    while (end < text.len and isWhitespace(text[end])) end += 1;
+    var last: usize = start;
+    while (whitespaceLen(text, end)) |n| {
+        last = end;
+        end += n;
+    }
+    if (end == start) return null;
     // text[start..end] is the maximal whitespace run starting at start.
     if (end == text.len) return end; // end of input — lookahead trivially OK
     // text[end] is non-whitespace (\S). Backtrack one whitespace char so
     // the position-after-match lands on a whitespace char (lookahead OK).
-    if (end - start >= 2) return end - 1;
+    if (last > start) return last;
     return null;
 }
 
-fn isWhitespaceCp(cp: u21) bool {
-    if (cp > 0xFF) return false;
-    return isWhitespace(@intCast(cp));
+/// Pattern 7: `\s+`. Returns the end of the whitespace run, or null.
+fn matchWhitespaceRun(text: []const u8, start: usize) ?usize {
+    var end: usize = start;
+    while (whitespaceLen(text, end)) |n| end += n;
+    return if (end > start) end else null;
+}
+
+/// `\s` in HF `tokenizers`' regex engine (Oniguruma) is Unicode White_Space:
+/// the full-width U+3000 and NBSP U+00A0 are whitespace, not punctuation.
+pub fn isWhitespaceCp(cp: u21) bool {
+    return switch (cp) {
+        0x09...0x0D, 0x20, 0x85, 0xA0, 0x1680, 0x2000...0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000 => true,
+        else => false,
+    };
+}
+
+/// Byte length of the `\s` codepoint at `pos`, or null.
+fn whitespaceLen(text: []const u8, pos: usize) ?usize {
+    const c = decodeCodepoint(text, pos) orelse return null;
+    return if (isWhitespaceCp(c.cp)) c.len else null;
 }
 
 fn isLetterOrMark(cp: u21) bool {
@@ -1205,6 +1260,7 @@ fn isLetterOrMark(cp: u21) bool {
 /// combining ranges. Not exhaustive, but handles every codepoint our test
 /// corpus encounters; expand if a non-ASCII model surfaces a false negative.
 fn isMark(cp: u21) bool {
+    if (cp >= 0x80 and isDigit(cp)) return false; // whole-block ranges below hold digits
     if (cp >= 0x0300 and cp <= 0x036F) return true; // Combining diacritical marks
     if (cp >= 0x0483 and cp <= 0x0489) return true; // Cyrillic combining
     if (cp >= 0x0591 and cp <= 0x05BD) return true; // Hebrew points
@@ -1229,7 +1285,9 @@ fn decodeCodepoint(text: []const u8, pos: usize) ?CpInfo {
     return CpInfo{ .cp = cp, .len = end - pos };
 }
 
-fn isLetter(cp: u21) bool {
+pub fn isLetter(cp: u21) bool {
+    // The script ranges below are whole blocks; their digits are \p{N}, not letters.
+    if (cp >= 0x80 and isDigit(cp)) return false;
     // ASCII letters
     if (cp >= 'A' and cp <= 'Z') return true;
     if (cp >= 'a' and cp <= 'z') return true;
@@ -1245,12 +1303,54 @@ fn isLetter(cp: u21) bool {
     return false;
 }
 
-fn isDigit(cp: u21) bool {
-    return cp >= '0' and cp <= '9';
-}
+/// `\p{N}` (Nd, Nl, No) as inclusive ranges, Unicode 15.1.0:
+/// `[(a, b) for runs of unicodedata.category(c)[0] == 'N']`.
+const NUMBER_RANGES = [_][2]u21{
+    .{ 0x30, 0x39 }, .{ 0xB2, 0xB3 }, .{ 0xB9, 0xB9 }, .{ 0xBC, 0xBE }, .{ 0x660, 0x669 },
+    .{ 0x6F0, 0x6F9 }, .{ 0x7C0, 0x7C9 }, .{ 0x966, 0x96F }, .{ 0x9E6, 0x9EF }, .{ 0x9F4, 0x9F9 },
+    .{ 0xA66, 0xA6F }, .{ 0xAE6, 0xAEF }, .{ 0xB66, 0xB6F }, .{ 0xB72, 0xB77 }, .{ 0xBE6, 0xBF2 },
+    .{ 0xC66, 0xC6F }, .{ 0xC78, 0xC7E }, .{ 0xCE6, 0xCEF }, .{ 0xD58, 0xD5E }, .{ 0xD66, 0xD78 },
+    .{ 0xDE6, 0xDEF }, .{ 0xE50, 0xE59 }, .{ 0xED0, 0xED9 }, .{ 0xF20, 0xF33 }, .{ 0x1040, 0x1049 },
+    .{ 0x1090, 0x1099 }, .{ 0x1369, 0x137C }, .{ 0x16EE, 0x16F0 }, .{ 0x17E0, 0x17E9 },
+    .{ 0x17F0, 0x17F9 }, .{ 0x1810, 0x1819 }, .{ 0x1946, 0x194F }, .{ 0x19D0, 0x19DA },
+    .{ 0x1A80, 0x1A89 }, .{ 0x1A90, 0x1A99 }, .{ 0x1B50, 0x1B59 }, .{ 0x1BB0, 0x1BB9 },
+    .{ 0x1C40, 0x1C49 }, .{ 0x1C50, 0x1C59 }, .{ 0x2070, 0x2070 }, .{ 0x2074, 0x2079 },
+    .{ 0x2080, 0x2089 }, .{ 0x2150, 0x2182 }, .{ 0x2185, 0x2189 }, .{ 0x2460, 0x249B },
+    .{ 0x24EA, 0x24FF }, .{ 0x2776, 0x2793 }, .{ 0x2CFD, 0x2CFD }, .{ 0x3007, 0x3007 },
+    .{ 0x3021, 0x3029 }, .{ 0x3038, 0x303A }, .{ 0x3192, 0x3195 }, .{ 0x3220, 0x3229 },
+    .{ 0x3248, 0x324F }, .{ 0x3251, 0x325F }, .{ 0x3280, 0x3289 }, .{ 0x32B1, 0x32BF },
+    .{ 0xA620, 0xA629 }, .{ 0xA6E6, 0xA6EF }, .{ 0xA830, 0xA835 }, .{ 0xA8D0, 0xA8D9 },
+    .{ 0xA900, 0xA909 }, .{ 0xA9D0, 0xA9D9 }, .{ 0xA9F0, 0xA9F9 }, .{ 0xAA50, 0xAA59 },
+    .{ 0xABF0, 0xABF9 }, .{ 0xFF10, 0xFF19 }, .{ 0x10107, 0x10133 }, .{ 0x10140, 0x10178 },
+    .{ 0x1018A, 0x1018B }, .{ 0x102E1, 0x102FB }, .{ 0x10320, 0x10323 }, .{ 0x10341, 0x10341 },
+    .{ 0x1034A, 0x1034A }, .{ 0x103D1, 0x103D5 }, .{ 0x104A0, 0x104A9 }, .{ 0x10858, 0x1085F },
+    .{ 0x10879, 0x1087F }, .{ 0x108A7, 0x108AF }, .{ 0x108FB, 0x108FF }, .{ 0x10916, 0x1091B },
+    .{ 0x109BC, 0x109BD }, .{ 0x109C0, 0x109CF }, .{ 0x109D2, 0x109FF }, .{ 0x10A40, 0x10A48 },
+    .{ 0x10A7D, 0x10A7E }, .{ 0x10A9D, 0x10A9F }, .{ 0x10AEB, 0x10AEF }, .{ 0x10B58, 0x10B5F },
+    .{ 0x10B78, 0x10B7F }, .{ 0x10BA9, 0x10BAF }, .{ 0x10CFA, 0x10CFF }, .{ 0x10D30, 0x10D39 },
+    .{ 0x10E60, 0x10E7E }, .{ 0x10F1D, 0x10F26 }, .{ 0x10F51, 0x10F54 }, .{ 0x10FC5, 0x10FCB },
+    .{ 0x11052, 0x1106F }, .{ 0x110F0, 0x110F9 }, .{ 0x11136, 0x1113F }, .{ 0x111D0, 0x111D9 },
+    .{ 0x111E1, 0x111F4 }, .{ 0x112F0, 0x112F9 }, .{ 0x11450, 0x11459 }, .{ 0x114D0, 0x114D9 },
+    .{ 0x11650, 0x11659 }, .{ 0x116C0, 0x116C9 }, .{ 0x11730, 0x1173B }, .{ 0x118E0, 0x118F2 },
+    .{ 0x11950, 0x11959 }, .{ 0x11C50, 0x11C6C }, .{ 0x11D50, 0x11D59 }, .{ 0x11DA0, 0x11DA9 },
+    .{ 0x11F50, 0x11F59 }, .{ 0x11FC0, 0x11FD4 }, .{ 0x12400, 0x1246E }, .{ 0x16A60, 0x16A69 },
+    .{ 0x16AC0, 0x16AC9 }, .{ 0x16B50, 0x16B59 }, .{ 0x16B5B, 0x16B61 }, .{ 0x16E80, 0x16E96 },
+    .{ 0x1D2C0, 0x1D2D3 }, .{ 0x1D2E0, 0x1D2F3 }, .{ 0x1D360, 0x1D378 }, .{ 0x1D7CE, 0x1D7FF },
+    .{ 0x1E140, 0x1E149 }, .{ 0x1E2F0, 0x1E2F9 }, .{ 0x1E4F0, 0x1E4F9 }, .{ 0x1E8C7, 0x1E8CF },
+    .{ 0x1E950, 0x1E959 }, .{ 0x1EC71, 0x1ECAB }, .{ 0x1ECAD, 0x1ECAF }, .{ 0x1ECB1, 0x1ECB4 },
+    .{ 0x1ED01, 0x1ED2D }, .{ 0x1ED2F, 0x1ED3D }, .{ 0x1F100, 0x1F10C }, .{ 0x1FBF0, 0x1FBF9 },
+};
 
-fn isWhitespace(c: u8) bool {
-    return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 0x0B or c == 0x0C;
+/// `\p{N}`: every script's digits, superscripts, fractions and numerals, not just ASCII.
+pub fn isDigit(cp: u21) bool {
+    if (cp < 0x80) return cp >= '0' and cp <= '9';
+    var lo: usize = 0;
+    var hi: usize = NUMBER_RANGES.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        if (cp < NUMBER_RANGES[mid][0]) hi = mid else if (cp > NUMBER_RANGES[mid][1]) lo = mid + 1 else return true;
+    }
+    return false;
 }
 
 /// Build the GPT-2 bytes_to_unicode mapping (256 entries).
@@ -1323,8 +1423,128 @@ pub fn loadTokenizerSlow(io: std.Io, allocator: std.mem.Allocator, model_dir: []
         try appendJsonEscapedTok(allocator, &buf, line);
         try buf.append(allocator, '"');
     }
-    try buf.appendSlice(allocator, "]}}");
+    try buf.appendSlice(allocator, "]},\"added_tokens\":");
+    try appendAddedTokens(io, allocator, &buf, model_dir);
+    try buf.append(allocator, '}');
     return parseTokenizerContent(io, allocator, buf.items);
+}
+
+/// The slow format's added tokens (chat markers, `<think>`, Qwen3-ASR's `<asr_text>`) live in
+/// tokenizer_config.json's `added_tokens_decoder`, keyed by id; `[]` when it has none.
+fn appendAddedTokens(io: std.Io, allocator: std.mem.Allocator, buf: *std.ArrayList(u8), model_dir: []const u8) !void {
+    const path = try std.fmt.allocPrint(allocator, "{s}/tokenizer_config.json", .{model_dir});
+    defer allocator.free(path);
+    const bytes = readFileAllocTok(io, allocator, path) catch |e| switch (e) {
+        error.FileNotFound => return buf.appendSlice(allocator, "[]"),
+        else => return e,
+    };
+    defer allocator.free(bytes);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    try buf.append(allocator, '[');
+    const decoder = if (parsed.value == .object) parsed.value.object.get("added_tokens_decoder") else null;
+    if (decoder) |d| if (d == .object) {
+        var it = d.object.iterator();
+        var first = true;
+        while (it.next()) |e| {
+            const id = std.fmt.parseInt(u32, e.key_ptr.*, 10) catch continue;
+            if (e.value_ptr.* != .object) continue;
+            const content = e.value_ptr.object.get("content") orelse continue;
+            if (content != .string) continue;
+            const special = if (e.value_ptr.object.get("special")) |v| v == .bool and v.bool else false;
+            if (!first) try buf.append(allocator, ',');
+            first = false;
+            try buf.print(allocator, "{{\"id\":{d},\"special\":{},\"content\":\"", .{ id, special });
+            try appendJsonEscapedTok(allocator, buf, content.string);
+            try buf.appendSlice(allocator, "\"}");
+        }
+    };
+    try buf.append(allocator, ']');
+}
+
+/// Load an OpenAI tiktoken rank file (`<base64 bytes> <rank>` per line, ranks
+/// dense from 0) as a byte-level BPE tokenizer, through the equivalent
+/// synthesized `tokenizer.json`. No special tokens: callers add control ids.
+pub fn loadTiktoken(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Tokenizer {
+    const file_bytes = try readFileAllocTok(io, allocator, path);
+    defer allocator.free(file_bytes);
+    const json = try tiktokenToTokenizerJson(allocator, file_bytes);
+    defer allocator.free(json);
+    return parseTokenizerContent(io, allocator, json);
+}
+
+/// Every split of a token whose halves are both tokens is a merge, ordered by
+/// the merged token's rank then its halves' (transformers' tiktoken converter).
+fn tiktokenToTokenizerJson(allocator: std.mem.Allocator, file_bytes: []const u8) ![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var toks: std.ArrayList([]const u8) = .empty;
+    var ranks = std.StringHashMap(u32).init(arena);
+    var lines = std.mem.splitScalar(u8, file_bytes, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        const sp = std.mem.indexOfScalar(u8, line, ' ') orelse return error.BadTiktoken;
+        const dec = std.base64.standard.Decoder;
+        const bytes = try arena.alloc(u8, dec.calcSizeForSlice(line[0..sp]) catch return error.BadTiktoken);
+        dec.decode(bytes, line[0..sp]) catch return error.BadTiktoken;
+        const rank = std.fmt.parseInt(u32, line[sp + 1 ..], 10) catch return error.BadTiktoken;
+        if (rank != toks.items.len) return error.BadTiktoken;
+        try toks.append(arena, bytes);
+        try ranks.put(bytes, rank);
+    }
+
+    const b2u = buildBytesToUnicode();
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const Emit = struct {
+        fn token(a: std.mem.Allocator, o: *std.ArrayList(u8), map: *const [256]u21, bytes: []const u8) !void {
+            var enc: std.ArrayList(u8) = .empty;
+            defer enc.deinit(a);
+            for (bytes) |b| {
+                var utf8: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(map[b], &utf8) catch unreachable;
+                try enc.appendSlice(a, utf8[0..n]);
+            }
+            try appendJsonEscapedTok(a, o, enc.items);
+        }
+    };
+    try out.appendSlice(allocator, "{\"pre_tokenizer\":{\"type\":\"ByteLevel\"},\"model\":{\"type\":\"BPE\",\"vocab\":{");
+    for (toks.items, 0..) |t, rank| {
+        if (rank > 0) try out.append(allocator, ',');
+        try out.append(allocator, '"');
+        try Emit.token(allocator, &out, &b2u, t);
+        try out.print(allocator, "\":{d}", .{rank});
+    }
+    try out.appendSlice(allocator, "},\"merges\":[");
+    var first = true;
+    for (toks.items) |t| {
+        const Cand = struct { l: u32, r: u32, at: usize };
+        var cands: std.ArrayList(Cand) = .empty;
+        for (1..t.len) |at| {
+            const l = ranks.get(t[0..at]) orelse continue;
+            const r = ranks.get(t[at..]) orelse continue;
+            try cands.append(arena, .{ .l = l, .r = r, .at = at });
+        }
+        std.mem.sort(Cand, cands.items, {}, struct {
+            fn lt(_: void, a: Cand, b: Cand) bool {
+                return if (a.l != b.l) a.l < b.l else a.r < b.r;
+            }
+        }.lt);
+        for (cands.items) |c| {
+            if (!first) try out.append(allocator, ',');
+            first = false;
+            try out.append(allocator, '"');
+            try Emit.token(allocator, &out, &b2u, t[0..c.at]);
+            try out.append(allocator, ' ');
+            try Emit.token(allocator, &out, &b2u, t[c.at..]);
+            try out.append(allocator, '"');
+        }
+    }
+    try out.appendSlice(allocator, "]}}");
+    return out.toOwnedSlice(allocator);
 }
 
 fn readFileAllocTok(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -1495,9 +1715,11 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
         .tok_type = tok_type,
         .digit_group = if (root.get("pre_tokenizer")) |pt| digitGroupFromPreTokenizer(pt) else 1,
         .pretok_style = if (root.get("pre_tokenizer")) |pt| pretokStyleFromPreTokenizer(pt) else .gpt2,
+        .isolated_runs = if (root.get("pre_tokenizer")) |pt| isolatedRunsFromPreTokenizer(pt) else .{},
         .metaspace_prepend = if (root.get("pre_tokenizer")) |pt| metaspaceFromPreTokenizer(pt).prepend else .never,
         .metaspace_split = if (root.get("pre_tokenizer")) |pt| metaspaceFromPreTokenizer(pt).split else false,
         .byte_fallback = if (model_obj.get("byte_fallback")) |v| v == .bool and v.bool else false,
+        .ignore_merges = if (model_obj.get("ignore_merges")) |v| v == .bool and v.bool else false,
         .fuse_unk = if (model_obj.get("fuse_unk")) |v| v == .bool and v.bool else false,
         .unk_id = if (model_obj.get("unk_token")) |v| (if (v == .string) vocab.get(v.string) else null) else null,
         .byte_fallback_decode = if (root.get("decoder")) |d| decoderHasByteFallback(d) else false,
@@ -1560,14 +1782,33 @@ fn pretokStyleFromPreTokenizer(pt: std.json.Value) PretokStyle {
     return .gpt2;
 }
 
+/// Only a Sequence entry whose regex IS the class isolates it; the same class as a branch of a
+/// combined regex (Llama-3's `\p{N}{1,3}`) does not.
+fn isolatedRunsFromPreTokenizer(pt: std.json.Value) IsolatedRuns {
+    var runs: IsolatedRuns = .{};
+    if (pt != .object) return runs;
+    const list = pt.object.get("pretokenizers") orelse return runs;
+    if (list != .array) return runs;
+    for (list.array.items) |sub| {
+        if (sub != .object) continue;
+        const rx = splitRegexOf(sub) orelse continue;
+        if (std.mem.eql(u8, rx, "\\p{N}{1,3}")) runs.digits = true;
+        if (std.mem.eql(u8, rx, "[\u{4e00}-\u{9fa5}\u{3040}-\u{309f}\u{30a0}-\u{30ff}]+")) runs.cjk = true;
+    }
+    return runs;
+}
+
 fn splitRegexIsLlama3(node: std.json.Value) bool {
     const rx = splitRegexOf(node) orelse return false;
     return llama3StyleFromSplitRegex(rx);
 }
 
+/// Muse's cased grammar only: the plain Llama-3 regex (`\p{L}+`, no case classes) is the gpt2
+/// grammar with 3-digit groups.
 fn llama3StyleFromSplitRegex(rx: []const u8) bool {
     return std.mem.indexOf(u8, rx, "'s|'t|'re|'ve|'m|'ll|'d") != null and
-        std.mem.indexOf(u8, rx, "\\p{N}{1,3}") != null;
+        std.mem.indexOf(u8, rx, "\\p{N}{1,3}") != null and
+        std.mem.indexOf(u8, rx, "\\p{Lu}") != null;
 }
 
 fn splitRegexOf(node: std.json.Value) ?[]const u8 {
@@ -2225,6 +2466,22 @@ test "llama3 style detection: muse's combined Split regex selects it, others kee
     try testing.expect(!llama3StyleFromSplitRegex("[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}"));
 }
 
+test "the plain Llama-3 regex is the gpt2 grammar with 3-digit groups, never the cased one" {
+    // GLM-5.3, Llama-3.2, LFM2.5 and K2 ship this pattern: `\p{L}+` keeps camelCase whole
+    // and `//!\n` one pre-token, where the cased grammar split both against the reference.
+    const pre =
+        \\{"type": "Sequence", "pretokenizers": [{"type": "Split", "pattern": {"Regex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}, "behavior": "Isolated", "invert": false}, {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false}]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, pre, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(PretokStyle.gpt2, pretokStyleFromPreTokenizer(parsed.value));
+    try testing.expectEqual(@as(u8, 3), digitGroupFromPreTokenizer(parsed.value));
+    try testing.expectEqual(IsolatedRuns{}, isolatedRunsFromPreTokenizer(parsed.value));
+    try expectPreTokensG(testing.allocator, "x.indexOf(UserDefaults)\n//!\n//! 12345", 3, &.{
+        "x", ".indexOf", "(UserDefaults", ")\n", "//!\n", "//!", " ", "123", "45",
+    });
+}
+
 test "gpt2PreTokenize: leading space combines with punctuation" {
     // Pattern 4 is ` ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*`.
     try expectPreTokens(testing.allocator, " =", &.{" ="});
@@ -2324,6 +2581,100 @@ test "gpt2PreTokenize: newline run after whitespace" {
 test "gpt2PreTokenize: trailing whitespace at end of input" {
     // Pattern 6 trivially matches when end-of-input satisfies the lookahead.
     try expectPreTokens(testing.allocator, "x   ", &.{ "x", "   " });
+}
+
+test "pre-tokenize: \\s*[\\r\\n]+ ends at the whitespace run's last newline (gpt2 + llama3)" {
+    // Bar: the pre-tokens HF `tokenizers` gives for the Qwen3.8, Llama-3 and Muse split regexes.
+    const a = testing.allocator;
+    try expectPreTokens(a, "a\n    \nb", &.{ "a", "\n    \n", "b" });
+    try expectPreTokens(a, "a\n  \n  b", &.{ "a", "\n  \n", " ", " b" });
+    try expectPreTokens(a, "a  \n\n  \n b", &.{ "a", "  \n\n  \n", " b" });
+    try expectPreTokens(a, "a\r\n   \r\nb", &.{ "a", "\r\n   \r\n", "b" });
+    try expectPreTokens(a, "def f():\n    pass\n    \n    return 1", &.{
+        "def", " f", "():\n", "   ", " pass", "\n    \n", "   ", " return", " ", "1",
+    });
+    try expectPreTokensL3(a, "x\n\t\n\ny", &.{ "x", "\n\t\n\n", "y" });
+}
+
+test "pre-tokenize: \\s is Unicode White_Space, zero-width characters are not (gpt2 + llama3)" {
+    // Bar: the pre-tokens HF `tokenizers` gives for the Qwen3.8, Llama-3 and Muse split regexes.
+    const a = testing.allocator;
+    try expectPreTokens(a, "你好\u{3000}世界\u{3000}\u{3000}！", &.{ "你好", "\u{3000}世界", "\u{3000}", "\u{3000}", "！" });
+    try expectPreTokens(a, "x\u{3000} \u{a0}\ny", &.{ "x", "\u{3000} \u{a0}\n", "y" });
+    try expectPreTokens(a, "x \u{3000}\u{a0}y", &.{ "x", " \u{3000}", "\u{a0}y" });
+    try expectPreTokens(a, "a\u{200b}b\u{feff}c", &.{ "a", "\u{200b}b", "\u{feff}c" });
+    try expectPreTokensL3(a, "\u{300c}\u{3000}\u{3000}\u{300d}", &.{ "\u{300c}", "\u{3000}", "\u{3000}", "\u{300d}" });
+}
+
+test "pre-tokenize: DeepSeek's digit and CJK Splits run first, so a whitespace run before them stays whole" {
+    // Bar: the pre-tokens HF `tokenizers` gives for DeepSeek-V4's pre_tokenizer (Hy-MT2 ships the same one).
+    const pre =
+        \\{"type":"Sequence","pretokenizers":[
+        \\  {"type":"Split","pattern":{"Regex":"\\p{N}{1,3}"},"behavior":"Isolated","invert":false},
+        \\  {"type":"Split","pattern":{"Regex":"[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+"},"behavior":"Isolated","invert":false},
+        \\  {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]}
+    ;
+    const a = testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, pre, .{});
+    defer parsed.deinit();
+    const runs = isolatedRunsFromPreTokenizer(parsed.value);
+    try testing.expectEqual(IsolatedRuns{ .digits = true, .cjk = true }, runs);
+    const cases = [_]struct { []const u8, []const []const u8 }{
+        .{ "\u{3000}\u{3000}长江发源于青藏高原。", &.{ "\u{3000}\u{3000}", "长江发源于青藏高原", "。" } },
+        .{ "[\n    1,\n    22\n]", &.{ "[\n", "    ", "1", ",\n", "    ", "22", "\n", "]" } },
+        .{ "x \u{2003}1", &.{ "x", " \u{2003}", "1" } },
+        .{ "abc中文def", &.{ "abc", "中文", "def" } },
+    };
+    for (cases) |c| {
+        var words: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (words.items) |w| a.free(w);
+            words.deinit(a);
+        }
+        try isolatedRunsPreTokenize(a, c[0], 3, runs, &words);
+        try testing.expectEqual(c[1].len, words.items.len);
+        for (c[1], words.items) |want, got| try testing.expectEqualStrings(want, got);
+    }
+}
+
+test "tokenizer parity: encode() matches HF `tokenizers` ids (TOKENIZER_PARITY_MODEL)" {
+    // Bar: encode() returns HF `tokenizers`' ids for every case tests/dump_tokenizer_parity_fixtures.py wrote.
+    const model = std.c.getenv("TOKENIZER_PARITY_MODEL") orelse return error.SkipZigTest;
+    const cases_path = std.c.getenv("TOKENIZER_PARITY_CASES") orelse return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tok = try loadTokenizer(io, allocator, std.mem.span(model));
+    defer tok.deinit();
+
+    const f = try std.Io.Dir.openFileAbsolute(io, std.mem.span(cases_path), .{});
+    defer f.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = f.reader(io, &rb);
+    const text = try rs.interface.allocRemaining(allocator, .limited(16 << 20));
+    defer allocator.free(text);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
+    defer parsed.deinit();
+
+    var mismatches: usize = 0;
+    for (parsed.value.array.items) |c| {
+        const input = c.object.get("text").?.string;
+        const want = c.object.get("ids").?.array.items;
+        const ids = try tok.encode(allocator, input);
+        defer allocator.free(ids);
+        var same = ids.len == want.len;
+        if (same) for (ids, want) |g, w| {
+            if (g != w.integer) same = false;
+        };
+        if (same) continue;
+        mismatches += 1;
+        if (mismatches > 10) continue;
+        std.debug.print("\n[parity] {s} {f}\n  got  {any}\n  want", .{ c.object.get("name").?.string, std.json.fmt(input, .{ .escape_unicode = true }), ids });
+        for (want) |w| std.debug.print(" {d}", .{w.integer});
+        std.debug.print("\n", .{});
+    }
+    const n = parsed.value.array.items.len;
+    std.debug.print("\n[parity] {d}/{d} cases match HF tokenizers\n", .{ n - mismatches, n });
+    try testing.expectEqual(@as(usize, 0), mismatches);
 }
 
 test "gpt2PreTokenize: full Python snippet matches HF reference" {
@@ -2495,6 +2846,43 @@ test "bpeMerge: symbols missing from vocab fall back to byte pieces" {
     const ids = try tok.bpeMerge(allocator, "az");
     defer allocator.free(ids);
     try testing.expectEqualSlices(u32, &[_]u32{ 1, 99 }, ids);
+}
+
+test "gpt2PreTokenize: every \\p{N} digit groups like an ASCII one (superscripts, fractions, Indic)" {
+    // Reference: HF `tokenizers` on the plain Llama-3 regex; `²` sat outside `\p{N}{1,3}`.
+    try expectPreTokensG(testing.allocator, "x4\u{b2} \u{bd} \u{663}\u{664}\u{665} \u{967}\u{968} \u{2460}", 3, &.{
+        "x", "4\u{b2}", " ", "\u{bd}", " ", "\u{663}\u{664}\u{665}", " ", "\u{967}\u{968}", " ", "\u{2460}",
+    });
+}
+
+test "ignore_merges: a word the vocab holds whole is one token, whatever the merges reach" {
+    // HF BPE `ignore_merges` (Llama-3 / LFM2.5 / GLM class): LFM2.5's merges never build
+    // `_tokens`, its vocab does, and the reference emits the vocab entry.
+    const allocator = testing.allocator;
+    var vocab = std.StringHashMap(u32).init(allocator);
+    defer vocab.deinit();
+    for ([_][]const u8{ "_", "t", "o", "k", "e", "n", "s", "_t", "ok", "ens", "_tokens" }, 0..) |w, i| try vocab.put(w, @intCast(i));
+    var merge_ranks = std.HashMap(Tokenizer.MergePair, u32, Tokenizer.MergePairContext, std.hash_map.default_max_load_percentage).init(allocator);
+    defer merge_ranks.deinit();
+    try merge_ranks.put(.{ .left = "_", .right = "t" }, 0);
+    try merge_ranks.put(.{ .left = "o", .right = "k" }, 1);
+    try merge_ranks.put(.{ .left = "e", .right = "n" }, 2);
+    var id_to_token = std.AutoHashMap(u32, []const u8).init(allocator);
+    defer id_to_token.deinit();
+    var special_tokens = std.StringHashMap(u32).init(allocator);
+    defer special_tokens.deinit();
+    var tok = makeBpeTestTokenizer(allocator, &vocab, &merge_ranks, &id_to_token, &special_tokens);
+    defer tok.unicode_to_byte.deinit();
+
+    tok.ignore_merges = true;
+    const whole = try tok.bpeMerge(allocator, "_tokens");
+    defer allocator.free(whole);
+    try testing.expectEqualSlices(u32, &[_]u32{10}, whole);
+
+    tok.ignore_merges = false;
+    const merged = try tok.bpeMerge(allocator, "_tokens");
+    defer allocator.free(merged);
+    try testing.expect(merged.len > 1);
 }
 
 test "byte_fallback: an unknown character becomes its UTF-8 bytes as <0xNN> tokens; missing byte token -> fused unk" {
@@ -2792,4 +3180,48 @@ test "markerCloserFor: K2 think openers pair with their own closer" {
     try testing.expectEqual(@as(?u32, 5), tok.markerCloserFor(4));
     try testing.expectEqual(@as(?u32, null), tok.markerCloserFor(6));
     try testing.expectEqual(@as(?u32, null), tok.markerCloserFor(1));
+}
+
+test "tiktoken rank file encodes through the merges it implies" {
+    const a = testing.allocator;
+    // a b c ab abc bc; "abc" has two splits, (a,bc) outranks (ab,c) on its left half.
+    const ranks = "YQ== 0\nYg== 1\nYw== 2\nYWI= 3\nYWJj 4\nYmM= 5\n";
+    const json = try tiktokenToTokenizerJson(a, ranks);
+    defer a.free(json);
+    var tok = try parseTokenizerContent(testing.io, a, json);
+    defer tok.deinit();
+    for ([_]struct { text: []const u8, want: []const u32 }{
+        .{ .text = "abc", .want = &.{4} },
+        .{ .text = "bc", .want = &.{5} },
+        .{ .text = "cab", .want = &.{ 2, 3 } },
+    }) |c| {
+        const ids = try tok.encode(a, c.text);
+        defer a.free(ids);
+        try testing.expectEqualSlices(u32, c.want, ids);
+    }
+    try testing.expectError(error.BadTiktoken, tiktokenToTokenizerJson(a, "YQ== 1\n"));
+}
+
+test "loadTokenizerSlow: tokenizer_config.json's added tokens encode whole and decode" {
+    // Qwen3-ASR ships vocab.json + merges.txt; its chat markers and `<asr_text>` live only in
+    // tokenizer_config.json's `added_tokens_decoder`.
+    const io = testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "vocab.json", .data = "{\"a\":0,\"b\":1,\"ab\":2}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "merges.txt", .data = "#version: 0.2\na b\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data =
+        \\{"added_tokens_decoder": {"5": {"content": "<|im_end|>", "special": true},
+        \\  "6": {"content": "<asr_text>", "special": false}}}
+    });
+    var pbuf: [512]u8 = undefined;
+    const plen = try tmp.dir.realPath(io, &pbuf);
+    var tok = try loadTokenizerSlow(io, testing.allocator, pbuf[0..plen]);
+    defer tok.deinit();
+    const ids = try tok.encode(testing.allocator, "ab<asr_text>a<|im_end|>");
+    defer testing.allocator.free(ids);
+    try testing.expectEqualSlices(u32, &.{ 2, 6, 0, 5 }, ids);
+    const text = try tok.decode(testing.allocator, &.{ 2, 6, 0 }, false);
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings("ab<asr_text>a", text);
 }

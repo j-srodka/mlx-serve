@@ -26,16 +26,17 @@ enum AgentSkills {
     static func files() -> [(name: String, content: String)] {
         guard let src = sourceDir(),
               let names = try? FileManager.default.contentsOfDirectory(atPath: src.path) else { return [] }
-        return names.filter { $0.hasSuffix(".md") }.sorted().compactMap { n in
+        return names.filter { $0.hasSuffix(".md") || $0.hasSuffix(".mjs") || $0.hasSuffix(".tsx") }.sorted().compactMap { n in
             (try? String(contentsOf: src.appendingPathComponent(n), encoding: .utf8)).map { (n, $0) }
         }
     }
 
     /// Where an agent discovers skills in its dedicated config dir; opencode
-    /// reads `skills.paths` from its inline config instead.
+    /// reads `skills.paths` from its inline config instead. Codex gets none:
+    /// a link in the user's own Codex home would reach every codex session.
     static func linkPath(agentId: String) -> String? {
         switch agentId {
-        case "pi", "omp", "codex", "hermes": return "\(agentId)/skills/\(name)"
+        case "pi", "omp", "hermes", "grok": return "\(agentId)/skills/\(name)"
         case "claude": return "\(claudePluginDir)/skills/\(name)"
         default: return nil
         }

@@ -50,6 +50,7 @@ struct ToolApprovalSheet: View {
         case "generate_image": return "Generate an image"
         case "generate_speech": return "Generate spoken audio"
         case "generate_music": return "Generate a music track"
+        case "generate_sound": return "Generate a sound effect"
         case "generate_video": return "Generate a video"
         default:           return "Run \(request.toolName)"
         }
@@ -238,6 +239,42 @@ private struct AttachmentPreviewRow: View {
             .background(Color.secondary.opacity(0.15))
             .clipShape(RoundedRectangle(cornerRadius: 10))
             removeButton(remove)
+        }
+    }
+}
+
+/// A chat image decoded off-main once, not per bubble redraw.
+private struct AttachmentImageCell: View {
+    let image: ChatImage
+    @State private var decoded: NSImage?
+    @State private var undecodable = false
+
+    var body: some View {
+        Group {
+            if let decoded {
+                // `.fill`: the rounded corners clip the frame,
+                // so a letterboxed picture keeps square corners.
+                Image(nsImage: decoded)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: ChatImagePreview.displayWidth(for: decoded),
+                           height: ChatMetrics.attachmentHeight)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .onTapGesture(count: 2) { ChatImagePreview.openInPreview(image) }
+                    .help("Double-click to open in Preview")
+            } else if !undecodable {
+                // Hold the row's height so the transcript does not jump.
+                Color.clear
+                    .frame(width: ChatMetrics.attachmentHeight,
+                           height: ChatMetrics.attachmentHeight)
+            }
+        }
+        .task(id: image.id) {
+            let loaded = await MediaImage.load(data: image.data,
+                                               id: image.id.uuidString,
+                                               maxPixel: 1536)
+            guard !Task.isCancelled else { return }
+            if let loaded { decoded = loaded } else { undecodable = true }
         }
     }
 }
@@ -555,6 +592,7 @@ struct ChatView: View {
         case .audio:   AudioGenView()
                            .environmentObject(appState.audioGen)
                            .environmentObject(appState.musicGen)
+                           .environmentObject(appState.soundGen)
         case .model3d: Model3DGenView().environmentObject(appState.model3dGen)
         }
     }
@@ -1004,10 +1042,7 @@ struct ChatSidebar: View {
                             sessions: [SidebarChatRows.Row],
                             visible: [UUID], all: [UUID], chats: [UUID]) {
         let agentIds = Set(SidebarSessionGroups.split(appState.visibleChatSessions).agents.map(\.id))
-        let rows = SidebarChatRows.merge(chats: appState.visibleChatSessions,
-                                         terminals: terminals.sessions.sessions,
-                                         order: appState.sidebarOrder)
-        let parts = appState.sidebarGroups.partition(rows)
+        let parts = appState.sidebarGroups.partition(appState.sidebarRows)
         let agents = parts.ungrouped.filter { agentIds.contains($0.id) }
         let sessions = parts.ungrouped.filter { !agentIds.contains($0.id) }
         let shown = agents + parts.groups.flatMap { $0.group.collapsed ? [] : $0.rows } + sessions
@@ -1166,7 +1201,7 @@ struct ChatSidebar: View {
             switch sheet {
             case .create(let ids):
                 SidebarGroupSheet(title: "New Group", action: "Create", name: "") {
-                    appState.sidebarGroups.create($0, with: ids)
+                    appState.createSidebarGroup(named: $0, with: ids)
                 }
             case .rename(let id, let name):
                 SidebarGroupSheet(title: "Rename Group", action: "Rename", name: name) {
@@ -1463,21 +1498,21 @@ struct ChatSidebar: View {
         .contextMenu {
             Button { groupSheet = .rename(group.id, group.name) } label: { Text("Rename Group…")
                 .font(.app(.body)) }
-            Button(role: .destructive) { appState.sidebarGroups.delete(group.id) } label: { Text("Delete Group")
+            Button(role: .destructive) { appState.deleteSidebarGroup(group.id) } label: { Text("Delete Group")
                 .font(.app(.body)) }
         }
     }
 
     private func groupDrop(_ group: UUID?) -> SidebarGroupDrop {
-        SidebarGroupDrop(dragging: $draggingRowId) { appState.sidebarGroups.assign([$0], to: group) }
+        SidebarGroupDrop(dragging: $draggingRowId) { appState.moveToSidebarGroup([$0], group: group) }
     }
 
     /// "Move to Group" for a row, or for the multi-selection it sits in.
     @ViewBuilder
     private func groupMenu(for ids: Set<UUID>, current: UUID?) -> some View {
         Menu("Move to Group") {
-            ForEach(appState.sidebarGroups.groups) { group in
-                Button { appState.sidebarGroups.assign(ids, to: group.id) } label: { Text(group.name)
+            ForEach(appState.sidebarGroups.ordered) { group in
+                Button { appState.moveToSidebarGroup(ids, group: group.id) } label: { Text(group.name)
                     .font(.app(.body)) }
                     .disabled(ids.count == 1 && group.id == current)
             }
@@ -1486,7 +1521,7 @@ struct ChatSidebar: View {
                 .font(.app(.body)) }
         }
         if current != nil {
-            Button { appState.sidebarGroups.assign(ids, to: nil) } label: { Text("Remove from Group")
+            Button { appState.moveToSidebarGroup(ids, group: nil) } label: { Text("Remove from Group")
                 .font(.app(.body)) }
         }
         Divider()
@@ -1522,7 +1557,7 @@ struct ChatSidebar: View {
         Menu {
             Button {
                 appState.showConversation()
-                appState.sidebarGroups.assign([appState.newChatSession()], to: group)
+                appState.newChatSession(group: group)
             } label: {
                 Label("New Chat", systemImage: "square.and.pencil").font(.app(.body))
             }
@@ -1688,7 +1723,7 @@ struct ChatSidebar: View {
             Button { beginRename(session.id, current: session.title) } label: { Text("Rename…")
                 .font(.app(.body)) }
             groupMenu(for: inSelection ? appState.sidebarSelection : [session.id],
-                      current: appState.sidebarGroups.group(of: session.id))
+                      current: session.groupId)
             if inSelection {
                 Button(role: .destructive) {
                     requestDeleteChats(appState.sidebarSelection, keyboard: false)
@@ -1765,7 +1800,7 @@ struct ChatSidebar: View {
         .contextMenu {
             Button { beginRename(t.id, current: t.displayName) } label: { Text("Rename…")
                 .font(.app(.body)) }
-            groupMenu(for: [t.id], current: appState.sidebarGroups.group(of: t.id))
+            groupMenu(for: [t.id], current: t.groupId)
             if t.isInOwnWindow {
                 Button { showTerminal(t.id) } label: { Text("Show Window")
                     .font(.app(.body)) }
@@ -1999,6 +2034,9 @@ struct ChatDetailView: View {
     /// Read only to rebuild the transcript when it changes.
     @AppStorage(InterfacePrefKey.chatColumn) private var interfaceChatColumn = ChatColumnWidth.wide.rawValue
     @State private var inputText = ""
+    /// True while the input method holds an unconfirmed composition in the
+    /// composer — the binding stays blind to it, so this reports it.
+    @State private var composerHasMarkedText = false
     /// Where ↑/↓ have walked back to in this chat's own history. Per-tab state
     /// like everything else here — `ChatDetailView` is REUSED across tabs, so a
     /// walk left running would resume in someone else's conversation. Stale
@@ -2758,6 +2796,10 @@ struct ChatDetailView: View {
                 // drawn by the scroll view itself so nothing new can intercept
                 // a click.
                 .scrollEdgeEffectStyle(.soft, for: .top)
+                // The empty toolbar band gives that effect nothing to frost, so
+                // unclipped rows would run under it to the window's top edge.
+                .clipped()
+                .contentShape(Rectangle())
                 // A chat opens at its newest line by LAYOUT, with the real
                 // heights in hand, not by a jump aimed at an estimate of them.
                 .defaultScrollAnchor(.bottom, for: .initialOffset)
@@ -2862,6 +2904,9 @@ struct ChatDetailView: View {
                 if let note = steeringNote {
                     SteeringNoteRow(note: note, onPause: { pauseSteeringNote() })
                 }
+                if let note = chatEngine.steering.restoringNote(for: sessionId) {
+                    SteeringNoteRow(note: note, isPaused: true, onPause: { restoreSteeringNote() })
+                }
 
                 // One rounded container, two rows: the input on top with the
                 // full width of the column, its controls beneath — inside the
@@ -2877,22 +2922,10 @@ struct ChatDetailView: View {
                     RoundedRectangle(cornerRadius: 18)
                         .stroke(Color.secondary.opacity(0.25), lineWidth: 0.5)
                 )
-                // "/" skill menu — FLOATS over the transcript rather than
-                // sitting in the bar: as a sibling it grew the composer and
-                // shoved the conversation up on every keystroke. An overlay
-                // past the clip, its own bottom guide pinned to the
-                // container's top, so it needs no height to position itself.
-                // Not an NSPopover — that takes first responder, and the menu
-                // has to stay open while you keep typing.
-                .overlay(alignment: .topLeading) {
-                    if !slashMatches.isEmpty {
-                        SlashSkillMenu(matches: slashMatches,
-                                       selection: min(slashSelection, max(0, slashMatches.count - 1)),
-                                       onPick: { pickSlashSkill($0) })
-                            .alignmentGuide(.top) { $0[.bottom] + 8 }
-                            .shadow(color: .black.opacity(0.28), radius: 14, y: 4)
-                    }
-                }
+                // "/" skill menu, past the clip so it can hang above the container.
+                .slashSkillMenu(matches: slashMatches,
+                                selection: min(slashSelection, max(0, slashMatches.count - 1)),
+                                onPick: { pickSlashSkill($0) })
                 // Hover cards for the row's bare glyphs. Drawn HERE, past the
                 // clip: an overlay on the control itself is cut off at the
                 // container's rounded edge and lands over the text field.
@@ -3135,6 +3168,12 @@ struct ChatDetailView: View {
                 inputFocused = true
             }
         }
+        .onChange(of: composerHasMarkedText) { _, marked in
+            if !marked { restoreSteeringNote() }
+        }
+        .onChange(of: chatEngine.steering.restoringNote(for: sessionId)) { _, _ in
+            restoreSteeringNote()
+        }
         // The keyboard arriving in the composer collapses the sidebar selection
         // to this chat. Keyed on the focus MIRROR rather than on the click, so
         // it covers every way the field ends up holding the keyboard — and the
@@ -3208,6 +3247,7 @@ struct ChatDetailView: View {
                           measuredHeight: $composerHeight,
                           isIdle: composerState == .idle,
                           canSteer: true,
+                          onMarkedTextChanged: { composerHasMarkedText = $0 },
                           onSend: { sendMessage() },
                           // Escape stops the reply being written. Handled here
                           // rather than as a hidden `.cancelAction` button so
@@ -3237,7 +3277,7 @@ struct ChatDetailView: View {
                 slashSelection = 0
             }
             .overlay(alignment: .topLeading) {
-                if inputText.isEmpty {
+                if ComposerKey.showsPlaceholder(inputText, hasMarkedText: composerHasMarkedText) {
                     Text(L10n.text(composerPlaceholder))
                         .font(.app(.body))
                         .foregroundStyle(.secondary)
@@ -3545,9 +3585,10 @@ struct ChatDetailView: View {
     private var videoSupported: Bool { server.chatModelInfo?.supportsVideo ?? false }
 
     /// Convert pending videos to a ChatVideo array, clearing the list.
+    /// Written on SEND like the pictures (`AttachmentStore.storedVideo`).
     private func consumePendingVideos() -> [ChatVideo]? {
         guard !pendingVideos.isEmpty else { return nil }
-        let videos = pendingVideos
+        let videos = pendingVideos.map { AttachmentStore.storedVideo($0) }
         pendingVideos = []
         return videos
     }
@@ -3939,16 +3980,22 @@ struct ChatDetailView: View {
     /// typed there, so nothing fires while it is being rewritten; Return
     /// queues it again.
     private func pauseSteeringNote() {
-        guard let note = steeringNote else { return }
-        chatEngine.clearSteeringNote(for: sessionId)
-        inputText = SteeringNotes.joined(note, inputText)
+        chatEngine.pauseSteeringNote(for: sessionId)
+        restoreSteeringNote()
         inputFocused = true
+    }
+
+    private func restoreSteeringNote() {
+        guard let draft = chatEngine.restoreSteeringNote(
+            for: sessionId, into: inputText, hasMarkedText: composerHasMarkedText) else { return }
+        inputText = draft
     }
 
     /// A note whose turn ended while this chat was in another tab: nobody
     /// watched the state flip, so it is recovered on the way in.
     private func recoverSteeringNoteIfIdle() {
         if composerState == .idle { pauseSteeringNote() }
+        else { restoreSteeringNote() }
     }
 
     /// Names of MCP servers the user currently has enabled (disabled != true).
@@ -3999,7 +4046,7 @@ struct ChatDetailView: View {
         }
 
         chatEngine.runTurn(sessionId: sessionId, userText: text,
-                           images: attachedImages, audio: attachedAudio,
+                           images: attachedImages, videos: attachedVideos, audio: attachedAudio,
                            config: buildTurnConfig(),
                            approval: { await requestToolApproval($0) })
         // Your own message always wins: sending from halfway up the history used
@@ -4074,7 +4121,7 @@ struct ChatDetailView: View {
                                caretAtStart: Bool, caretAtEnd: Bool) -> Bool {
         // A waiting steering note is the newest thing said and not yet sent:
         // ↑ on an empty draft takes it back first, exactly as Pause does.
-        if direction == .up, steeringNote != nil,
+        if direction == .up, chatEngine.steering.composerNote(for: sessionId) != nil,
            inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             pauseSteeringNote()
             return true
@@ -4578,17 +4625,8 @@ struct MessageBubble: View {
                                     .padding(.vertical, 8)
                                     .background(.quaternary.opacity(0.4))
                                     .clipShape(RoundedRectangle(cornerRadius: 8))
-                            } else if let nsImage = NSImage(data: img.data) {
-                                // `.fill`: the rounded corners clip the frame,
-                                // so a letterboxed picture keeps square corners.
-                                Image(nsImage: nsImage)
-                                    .resizable()
-                                    .aspectRatio(contentMode: .fill)
-                                    .frame(width: ChatImagePreview.displayWidth(for: nsImage),
-                                           height: ChatMetrics.attachmentHeight)
-                                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                                    .onTapGesture(count: 2) { ChatImagePreview.openInPreview(img) }
-                                    .help("Double-click to open in Preview")
+                            } else {
+                                AttachmentImageCell(image: img)
                             }
                         }
                     }
@@ -4646,8 +4684,13 @@ struct MessageBubble: View {
                                 .foregroundStyle(.secondary)
                         }
                         if message.role == .assistant {
-                            MarkdownText(message.content.isEmpty && message.isStreaming ? " " : message.content)
+                            MarkdownText(message.content.isEmpty && message.isStreaming ? " " : message.content,
+                                         streaming: message.isStreaming)
                                 .textSelection(.enabled)
+                                .environment(\.codeBlockRow, CodeBlockRow(
+                                    resize: { resize(animated: false, $0) },
+                                    isExpanded: { [foldStore, id = message.id] in foldStore?.isExpanded(id, block: $0) ?? false },
+                                    setExpanded: { [foldStore, id = message.id] in foldStore?.set(id, block: $0, expanded: $1) }))
                         } else {
                             // The user's own turn is plain text (no markdown
                             // render), so it needs the transcript size stated —
@@ -5648,8 +5691,12 @@ struct MarkdownText: View {
         "tool_call", "tool_response",
     ]
 
-    init(_ source: String) {
+    /// The reply is still coming, so a block with an open fence is being written.
+    let streaming: Bool
+
+    init(_ source: String, streaming: Bool = false) {
         self.source = source
+        self.streaming = streaming
     }
 
     private var latexTheme: LaTeXTheme {
@@ -5664,7 +5711,7 @@ struct MarkdownText: View {
         // lists, and tables. See `MarkdownSegmenter` for why the split is at
         // fences, not at blocks.
         VStack(alignment: .leading, spacing: 4) {
-            ForEach(Array(MarkdownSegmenter.segments(source).enumerated()), id: \.offset) { _, segment in
+            ForEach(Array(MarkdownSegmenter.segments(source).enumerated()), id: \.offset) { index, segment in
                 switch segment {
                 case .prose(let text):
                     ForEach(Array(Self.latexBlocks(in: text).enumerated()), id: \.offset) { _, block in
@@ -5677,8 +5724,9 @@ struct MarkdownText: View {
                             DisplayLaTeXView(latex: latex, raw: raw, theme: latexTheme)
                         }
                     }
-                case .code(let language, let code):
-                    CodeBlockView(language: language, code: code)
+                case .code(let language, let code, let closed):
+                    CodeBlockView(language: language, code: code,
+                                  status: .of(closed: closed, replyStreaming: streaming), index: index)
                 }
             }
         }
@@ -6804,7 +6852,11 @@ enum ComposerLayout {
 /// idle, and is otherwise swallowed (never a stray newline mid-generation).
 /// `.steer`: the chat is generating, so the text becomes a note for the
 /// agent's next step rather than a second send.
-enum ComposerReturnAction: Equatable { case send, steer, newline, ignore }
+enum ComposerReturnAction: Equatable {
+    case send, steer, newline, ignore
+    /// The field is mid-input-method-composition; Return belongs to that.
+    case confirmMarkedText
+}
 
 /// What an Escape keypress does in the composer. `.pass` hands the key back to
 /// AppKit rather than swallowing it — with no turn to stop, Escape still has
@@ -6815,13 +6867,30 @@ enum ComposerEscapeAction: Equatable { case stop, pass }
 enum ComposerKeyCommand { case up, down, accept, cancel }
 
 enum ComposerKey {
-    /// `canSteer`: a busy chat takes the text as a steering note (the main
-    /// composer); the edit bubble leaves it false, so a blank draft's Return
-    /// is still swallowed.
-    static func onReturn(shift: Bool, isIdle: Bool, canSteer: Bool = false) -> ComposerReturnAction {
+    /// `hasMarkedText`: Enter is also the input method's confirm key, so a
+    /// mid-composition Return outranks every other arm. `canSteer`: a busy
+    /// chat steers instead of sending; the edit bubble leaves it false.
+    static func onReturn(shift: Bool, isIdle: Bool, canSteer: Bool = false,
+                         hasMarkedText: Bool = false) -> ComposerReturnAction {
+        if hasMarkedText { return .confirmMarkedText }
         if shift { return .newline }
         if isIdle { return .send }
         return canSteer ? .steer : .ignore
+    }
+
+    /// Whether an external write may replace what the field holds: mid
+    /// composition the binding is the STALE side, and assigning it drops the
+    /// unconfirmed string the user is looking at on every redraw.
+    static func shouldAdoptExternalText(field: String, bound: String,
+                                        hasMarkedText: Bool) -> Bool {
+        !hasMarkedText && field != bound
+    }
+
+    /// The empty-field example line, and only on a field the user actually
+    /// sees as empty: the binding carries no marked text, so emptiness
+    /// alone is blind to an in-progress composition.
+    static func showsPlaceholder(_ text: String, hasMarkedText: Bool) -> Bool {
+        text.isEmpty && !hasMarkedText
     }
 
     /// Escape stops the reply being written, and does nothing otherwise.
@@ -6851,7 +6920,7 @@ enum ComposerKey {
 /// string on every edit (janky on a big paste) and exposes no scroller (the
 /// mouse wheel does nothing past the line limit). TextKit handles large text
 /// natively and the scroll view gives real mouse-wheel scrolling.
-fileprivate struct GrowingTextEditor: NSViewRepresentable {
+struct GrowingTextEditor: NSViewRepresentable {
     @Binding var text: String
     @Binding var isFocused: Bool
     @Binding var measuredHeight: CGFloat
@@ -6860,6 +6929,10 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
     var maxLines: Int = 15
     var isIdle: Bool
     var canSteer: Bool = false
+    /// Fires when the input method starts or stops holding marked text in
+    /// the field. `text` never carries an unconfirmed string and
+    /// `textDidChange` waits for the commit, so the binding is blind here.
+    var onMarkedTextChanged: (Bool) -> Void = { _ in }
     var onSend: () -> Void
     /// Escape, from the responder chain. Defaults to nothing so a field that
     /// has no use for the key leaves it to AppKit.
@@ -6910,6 +6983,7 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
         tv.string = text
         tv.onBecomeFocus = { [weak c = context.coordinator] in c?.setFocus(true) }
         tv.onResignFocus = { [weak c = context.coordinator] in c?.setFocus(false) }
+        tv.onMarkedTextChanged = { [weak c = context.coordinator] marked in c?.parent.onMarkedTextChanged(marked) }
 
         scroll.documentView = tv
         context.coordinator.textView = tv
@@ -6922,7 +6996,8 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
         context.coordinator.parent = self
         // External text changes (e.g. cleared on send) without clobbering an
         // in-progress edit at the same value.
-        if tv.string != text {
+        if ComposerKey.shouldAdoptExternalText(field: tv.string, bound: text,
+                                               hasMarkedText: tv.hasMarkedText()) {
             tv.string = text
             // Caret to the END of whatever was just put in the field. Setting
             // `string` collapses the selection to the front, which after a
@@ -7010,11 +7085,15 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
                     collapsed && selection.location == length)
             }
             guard commandSelector == #selector(NSResponder.insertNewline(_:)) else { return false }
+            let marked = textView.hasMarkedText()
             // Return picks the highlighted command when the menu is open —
-            // it must not send a half-typed "/mus".
-            if parent.onKeyCommand(.accept) { return true }
+            // it must not send a half-typed "/mus", nor steal Enter from an
+            // input method mid-composition.
+            if !marked, parent.onKeyCommand(.accept) { return true }
             let shift = NSApp.currentEvent?.modifierFlags.contains(.shift) ?? false
-            switch ComposerKey.onReturn(shift: shift, isIdle: parent.isIdle, canSteer: parent.canSteer) {
+            switch ComposerKey.onReturn(shift: shift, isIdle: parent.isIdle,
+                                        canSteer: parent.canSteer,
+                                        hasMarkedText: marked) {
             case .newline:
                 textView.insertNewlineIgnoringFieldEditor(self)
                 return true
@@ -7025,6 +7104,10 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
                 return true
             case .ignore:
                 return true
+            case .confirmMarkedText:
+                // Return belongs to the input method: hand it to AppKit's
+                // default (what it does after committing is IME-dependent).
+                return false
             }
         }
 
@@ -7056,9 +7139,27 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
 
 /// NSTextView that reports focus transitions so SwiftUI's `inputFocused` mirror
 /// stays accurate — the Cmd+V "attach from clipboard" monitor reads it.
-fileprivate final class ComposerTextView: NSTextView {
+final class ComposerTextView: NSTextView {
     var onBecomeFocus: (() -> Void)?
     var onResignFocus: (() -> Void)?
+    /// The only channel by which SwiftUI learns about composition — every
+    /// input-method entry point reports the state AFTER the superclass ran,
+    /// which is when `hasMarkedText` flips.
+    var onMarkedTextChanged: ((Bool) -> Void)?
+    override func setMarkedText(_ markedString: Any, selectedRange: NSRange,
+                                replacementRange: NSRange) {
+        super.setMarkedText(markedString, selectedRange: selectedRange,
+                            replacementRange: replacementRange)
+        onMarkedTextChanged?(hasMarkedText())
+    }
+    override func unmarkText() {
+        super.unmarkText()
+        onMarkedTextChanged?(hasMarkedText())
+    }
+    override func insertText(_ insertString: Any, replacementRange: NSRange) {
+        super.insertText(insertString, replacementRange: replacementRange)
+        onMarkedTextChanged?(hasMarkedText())
+    }
     override func becomeFirstResponder() -> Bool {
         let ok = super.becomeFirstResponder()
         if ok { onBecomeFocus?() }

@@ -419,9 +419,10 @@ final class TaskScheduler: ObservableObject {
         var run = run
         let approval = makeApproval(runId: run.id, autonomy: task.autonomy,
                                     workDir: resolved.workingDirectory)
-        let config = ChatTurnEngine.TurnConfig.from(resolved)
+        var config = ChatTurnEngine.TurnConfig.from(resolved)
+        config.modelPath = resolved.modelPath
         runEngine.runTurn(sessionId: sessionId, userText: userText,
-                          images: nil, audio: nil, config: config, approval: approval)
+                          images: nil, videos: nil, audio: nil, config: config, approval: approval)
         if runEngine.isGenerating {
             for await generating in runEngine.$isGenerating.values where !generating { break }
         }

@@ -91,6 +91,7 @@ def entries_ok(label, content):
 print("── [1/8] chat non-streaming ──")
 r = post("/v1/chat/completions", {**REQ, "stream": False})
 ns = (r["choices"][0].get("logprobs") or {}).get("content") or []
+chat_text = r["choices"][0]["message"].get("content") or ""
 ck("[non-stream] logprobs present", bool(ns), f"got {r['choices'][0].get('logprobs')}")
 if ns:
     entries_ok("non-stream", ns)
@@ -169,6 +170,33 @@ if st:
     ck("[stream] tokens match non-streaming", not tok_mismatch, f"{tok_mismatch[:5]}")
     lp_mismatch = [i for i in range(n) if abs(st[i]["logprob"] - ns[i]["logprob"]) > 1e-6]
     ck("[stream] logprob VALUES match non-streaming", not lp_mismatch, f"{lp_mismatch[:5]}")
+
+print("── [4b] STREAMING + a stop string: entries never run ahead of the delivered content ──")
+# A stop string that spans several tokens makes the stream HOLD a token's tail until the
+# next token decides it; the held token's logprob entry must wait with its bytes.
+if len(chat_text) < 24:
+    ck("[stream+stop] reference answer long enough to carve a stop string from", False, repr(chat_text))
+else:
+    stop = chat_text[len(chat_text) // 3:][:7]
+    resp = post("/v1/chat/completions", {**REQ, "stream": True, "stop": [stop]}, stream=True)
+    text, toks, ahead = "", "", []
+    for raw in resp:
+        line = raw.decode().strip()
+        if not line.startswith("data: ") or line == "data: [DONE]":
+            continue
+        for ch in json.loads(line[6:]).get("choices", []):
+            text += (ch.get("delta") or {}).get("content") or ""
+            toks += "".join(e["token"] for e in ((ch.get("logprobs") or {}).get("content") or []))
+            if not text.startswith(toks):
+                ahead.append((toks[-20:], text[-20:]))
+    ck("[stream+stop] entries never run ahead of the content", not ahead, f"{ahead[:2]}")
+    # The cut lands INSIDE a token: that token's bytes before the cut ship, its entry (for a
+    # token the client never saw whole) does not.
+    ck("[stream+stop] entries describe the delivered content",
+       text.startswith(toks) and len(text.encode()) - len(toks.encode()) <= 16,
+       f"entries {toks[-30:]!r} vs content {text[-30:]!r}")
+    ck("[stream+stop] the stop string never reached the client", stop not in text, repr(stop))
+
 
 print("── [5/8] STREAMING /v1/completions carries the legacy shape ──")
 CREQ = {"model": MODEL, "prompt": "Count from one to five:", "max_tokens": 24,
@@ -312,6 +340,52 @@ ch = post("/v1/chat/completions", {**FREQ, "response_format": SCHEMA, "enable_th
                                    "max_tokens": 1000})["choices"][0]
 format_entries_ok("json_schema thinking", (ch.get("logprobs") or {}).get("content") or [],
                   ch["message"].get("content") or "")
+
+print("── [7b] /v1/completions echo: every prompt token carries its logprob ──")
+# lm-eval's loglikelihood reads sum(token_logprobs[ctxlen:-1]); an echo that drops the
+# prompt rows hands it an empty sum it reports as perplexity 1.
+EPROMPT = "Water boils at one hundred degrees Celsius at sea level. At higher altitudes the boiling point drops."
+ids = post("/tokenize", {"content": EPROMPT})["tokens"]
+EREQ = {"model": MODEL, "prompt": ids, "max_tokens": 1, "temperature": 0, "logprobs": 5, "echo": True}
+r = post("/v1/completions", EREQ)
+elp = r["choices"][0]["logprobs"]
+n = r["usage"]["prompt_tokens"] + r["usage"]["completion_tokens"]
+ck("[echo] one entry per prompt and generated token",
+   all(len(elp[k]) == n for k in ("tokens", "token_logprobs", "top_logprobs", "text_offset")),
+   f"{[len(elp[k]) for k in elp]} vs {n}")
+ck("[echo] the first prompt token is unscored", elp["token_logprobs"][0] is None and elp["top_logprobs"][0] is None)
+ck("[echo] every other logprob is <= 0", all(v <= 1e-6 for v in elp["token_logprobs"][1:]))
+unpaired = [i for i, (t, v, m) in enumerate(zip(elp["tokens"], elp["token_logprobs"], elp["top_logprobs"]))
+            if m and t in m and abs(m[t] - v) > 1e-4]
+ck("[echo] each entry describes its own token", not unpaired, f"{unpaired[:5]}")
+plain = post("/v1/completions", {**EREQ, "echo": False})["choices"][0]["logprobs"]
+ck("[echo] the generated token matches the plain request",
+   elp["tokens"][-1] == plain["tokens"][0] and abs(elp["token_logprobs"][-1] - plain["token_logprobs"][0]) < 1e-4,
+   f"{elp['tokens'][-1]!r} {elp['token_logprobs'][-1]} vs {plain['tokens'][0]!r} {plain['token_logprobs'][0]}")
+# Row alignment: row i is the distribution a plain request on ids[:i] samples from, so their
+# rank-1 entries agree. A shifted row picks other tokens; the median absorbs bf16 logit steps.
+same, deltas = 0, []
+for i in range(1, len(ids)):
+    pt, pv = max(post("/v1/completions", {**EREQ, "prompt": ids[:i], "echo": False})["choices"][0]["logprobs"]["top_logprobs"][0].items(), key=lambda kv: kv[1])
+    et, ev = max(elp["top_logprobs"][i].items(), key=lambda kv: kv[1])
+    if pt == et:
+        same += 1
+        deltas.append(abs(pv - ev))
+deltas.sort()
+ck("[echo] prompt rows hold the distribution a plain request on that prefix samples",
+   same >= 0.8 * (len(ids) - 1) and deltas[len(deltas) // 2] < 0.05,
+   f"rank 1 agrees on {same}/{len(ids) - 1}, median |d| {deltas[len(deltas) // 2] if deltas else None}")
+again = post("/v1/completions", EREQ)["choices"][0]["logprobs"]["token_logprobs"]
+ck("[echo] a repeat (prefix cache warm) returns every row again", again == elp["token_logprobs"],
+   f"{len(again)} vs {len(elp['token_logprobs'])}")
+t = post("/v1/completions", {**EREQ, "prompt": EPROMPT, "logprobs": None})["choices"][0]
+ck("[echo] without logprobs the prompt text leads the completion", t["text"].startswith(EPROMPT) and t["logprobs"] is None,
+   repr(t["text"][:60]))
+try:
+    post("/v1/completions", {**EREQ, "stream": True}).read()
+    ck("[echo] echo + stream is refused by name", False, "got 200")
+except urllib.error.HTTPError as e:
+    ck("[echo] echo + stream is refused by name", e.code == 400 and b"echo" in e.read(), str(e.code))
 
 print("── [8/8] every response body is valid UTF-8 ──")
 ck("no response carried a split multi-byte token as raw bytes", not utf8_bad,
