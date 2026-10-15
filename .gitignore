@@ -56,7 +56,10 @@ server_err.log
 .vscode
 
 # Cursor IDE / Cloud Agents. Local tooling only; not for upstream PRs.
-.cursor/
+# Exception: committed project RULES (enforcement for Cursor agents) — .cursor/rules/*.mdc
+.cursor/*
+!.cursor/rules/
+!.cursor/rules/**
 agent-tools/
 
 # Speculative-decoding working notes (MTP + PLD planning/scratchpad)

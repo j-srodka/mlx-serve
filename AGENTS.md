@@ -103,7 +103,9 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dslow-tests -
 - Process/CalVer/CHANGELOG: `/release`. Per-release perf gate = `./tests/bench.sh` on the FINAL tree vs the previous column in `benchmarks.md` (ONE new column per release).
 - Methodology: `/bench` (llmprobe measures; bench.sh drives mlx-serve, `--url` probes another engine). Only diff same-methodology cells (llmprobe from 26.8); spec cells are variance — sample across runs/boot-orders, same-session ratios only, name the engine in every win, and an A/B arm is proven by ENGAGEMENT lines in its log. Record = `benchmarks.md` + `~/claude-tmp/bench-<tag>/`.
 
-## Remotes & branch topology (READ FIRST before any git push)
+## Remotes & branch topology (READ FIRST before any git push) — ENFORCED
+
+- ENFORCED by `.githooks/pre-push` (wire it on a fresh clone: `git config core.hooksPath .githooks`): origin pushes and fork:main pushes are REJECTED at the wire. `.cursor/rules/00-repo-topology.mdc` always-applies in Cursor.
 
 - `origin` = **ddalcu/mlx-serve upstream — NEVER push**. `fork` = j-srodka/mlx-serve; its `main` is the ddalcu-STAGING mirror (pull upstream there, review, then integrate into `local/ornith-h3`) — never push custom work to it; branch push targets only.
 - Custom/H3 work lives on `local/ornith-h3` and IS committed in the parent (intentional) + pushed to `fork/local/ornith-h3`; branch backups live at `fork/backup/*`; never `git clean -fd` without a pathspec.

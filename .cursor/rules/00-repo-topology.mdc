@@ -1,0 +1,13 @@
+---
+description: Repo remotes & branch topology for mlx-serve — push targets and forbidden operations. ALWAYS applies before any git push, checkout, clean, or branch delete.
+alwaysApply: true
+---
+
+# mlx-serve git topology — hard rules
+
+- `origin` = **ddalcu/mlx-serve upstream — NEVER push anything to it** (a tracked `.githooks/pre-push` hook blocks it).
+- `fork` = j-srodka/mlx-serve. Push ONLY branch targets: `local/ornith-h3` and `backup/*`. **Never push to `fork/main`** — it is the ddalcu-STAGING mirror (hook blocks this too).
+- Custom/H3 work is **intentionally committed in the parent repo on `local/ornith-h3`**. Do not "restore upstream-only" or discard the working tree to clean it — that deletes committed work other apps (H3 Timeline) depend on.
+- The `lib/mlxc-src` dirty state is intentional (`scripts/build-mlx.sh` patches it). Never stage its gitlink, never restore it, never commit inside it.
+- `src/h3_refmod.zig`, `start-minimax-h3*.sh`, `h3_timeline.py`, `tests/test_h3_*` are load-bearing for H3 Timeline (`~/Github/h3-timeline`). Never `git clean -fd` without a pathspec. Sidecar `local/` = patch backup; run `./local/export.sh` before/after parent commits.
+- Full story: `docs/gotchas/repo-topology.md`.

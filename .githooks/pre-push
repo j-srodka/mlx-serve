@@ -1,0 +1,32 @@
+#!/bin/bash
+# mlx-serve guard hook (wired via `git config core.hooksPath .githooks`).
+# Block, at the wire level, the two mistakes every topology doc warns about:
+#   1. pushing ANYTHING to origin (ddalcu upstream),
+#   2. pushing a custom branch over fork/main (ddalcu-staging mirror).
+# Rejects with the pointer to docs/gotchas/repo-topology.md so the agent
+# self-corrects instead of guessing.
+set -euo pipefail
+
+remote="${1:-}"
+url="$(git remote get-url "$remote" 2>/dev/null || true)"
+
+fail() {
+    echo "PRE-PUSH BLOCKED ($remote): $1" >&2
+    echo "See docs/gotchas/repo-topology.md — origin=ddalcu (never push);" >&2
+    echo "custom work pushes to fork on local/* or backup/* branches only." >&2
+    exit 1
+}
+
+case "$url" in
+    *ddalcu*|*DISABLED*) fail "origin is the ddalcu upstream and must never be pushed." ;;
+esac
+
+if [ "$remote" = "fork" ]; then
+    while read -r _local_ref _local_sha remote_ref _remote_sha; do
+        case "$remote_ref" in
+            refs/heads/main) fail "fork/main is the ddalcu-STAGING mirror. Push custom work to a local/* or backup/* branch." ;;
+        esac
+    done
+fi
+
+exit 0
