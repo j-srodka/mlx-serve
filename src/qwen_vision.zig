@@ -520,8 +520,10 @@ pub fn buildPixelValues(
 // ─────────────────────────────────────────────────────────────────────────────
 // Qwen3-VL ViT encoder. Mirrors mlx-vlm qwen3_vl/vision.py for a SINGLE still
 // image (grid_thw = [[1, grid_h, grid_w]]): full bidirectional attention over all
-// patches (cu_seqlens trivial), no windowing, no DeepStack. Dense bf16 — even on
-// 4-bit checkpoints the vision tower ships bf16, so no quantized-linear path.
+// patches (cu_seqlens trivial), no windowing, no DeepStack. Linears are dense
+// bf16 after load: 5-bit XL checkpoints quantize the ViT (pos_embed/qkv/proj/fc1
+// /merger). `mlx_take`/`matmul` on packed U32 aborts Metal, so those tensors are
+// dequantized to bf16 at init.
 //
 // forward(patches [N, C*tps*ps*ps], grid_h, grid_w) → [1, N/merge², out_hidden].
 // `patches` is the processor's `pixel_values`, already in merge-block token order
@@ -567,6 +569,8 @@ pub const QwenVision = struct {
     merger_fc1_b: mlx.mlx_array,
     merger_fc2_w: mlx.mlx_array,
     merger_fc2_b: mlx.mlx_array,
+    /// Dequantized ViT tensors. Borrowed Weights entries stay in the map.
+    owned: []mlx.mlx_array,
 
     pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !QwenVision {
         const s = mlx.mlx_default_gpu_stream_new();
@@ -585,6 +589,59 @@ pub const QwenVision = struct {
                     log.warn("MISSING QWEN VISION WEIGHT: {s}\n", .{name});
                     return error.MissingVisionWeights;
                 };
+            }
+        }.f;
+
+        var owned_list = std.ArrayList(mlx.mlx_array).empty;
+        errdefer {
+            for (owned_list.items) |a| _ = mlx.mlx_array_free(a);
+            owned_list.deinit(allocator);
+        }
+
+        const loadDense = struct {
+            fn f(
+                wts: *const Weights,
+                b: *[256]u8,
+                name: []const u8,
+                cfg: ModelConfig,
+                stream: mlx.mlx_stream,
+                list: *std.ArrayList(mlx.mlx_array),
+                alloc: std.mem.Allocator,
+            ) !mlx.mlx_array {
+                const w = getWeightLocal(wts, b, name) orelse {
+                    log.warn("MISSING QWEN VISION WEIGHT: {s}\n", .{name});
+                    return error.MissingVisionWeights;
+                };
+                if (!std.mem.endsWith(u8, name, ".weight")) return w;
+                var stem_buf: [256]u8 = undefined;
+                const stem = name[0 .. name.len - ".weight".len];
+                if (stem.len > stem_buf.len) return w;
+                @memcpy(stem_buf[0..stem.len], stem);
+                const sc_name = std.fmt.bufPrint(b, "{s}.scales", .{stem_buf[0..stem.len]}) catch return w;
+                const sc = wts.get(sc_name) orelse return w;
+                const bi_name = std.fmt.bufPrint(b, "{s}.biases", .{stem_buf[0..stem.len]}) catch return w;
+                const bi = if (cfg.quant_mode.hasBiases())
+                    (wts.get(bi_name) orelse mlx.mlx_array{ .ctx = null })
+                else
+                    mlx.mlx_array{ .ctx = null };
+                const bits: u32 = if (cfg.quant_bits > 0) cfg.quant_bits else 4;
+                const gs: u32 = if (cfg.quant_group_size > 0) cfg.quant_group_size else 64;
+                var deq = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_dequantize(
+                    &deq,
+                    w,
+                    sc,
+                    bi,
+                    mlx.mlx_optional_int.some(@intCast(gs)),
+                    mlx.mlx_optional_int.some(@intCast(bits)),
+                    cfg.quant_mode.cstr(),
+                    mlx.mlx_array{ .ctx = null },
+                    .{ .value = .bfloat16, .has_value = true },
+                    stream,
+                ));
+                try mlx.check(mlx.mlx_array_eval(deq));
+                try list.append(alloc, deq);
+                return deq;
             }
         }.f;
 
@@ -618,7 +675,7 @@ pub const QwenVision = struct {
             }
         }
         const patch_b = try must(weights, &buf, fmtKey(&kbuf, prefix, "patch_embed.proj.bias"));
-        const pos_embed = try must(weights, &buf, fmtKey(&kbuf, prefix, "pos_embed.weight"));
+        const pos_embed = try loadDense(weights, &buf, fmtKey(&kbuf, prefix, "pos_embed.weight"), config, s, &owned_list, allocator);
 
         const depth = config.qv_depth;
         var blocks = try allocator.alloc(QBlock, depth);
@@ -629,13 +686,13 @@ pub const QwenVision = struct {
                 .norm1_b = try must(weights, &buf, fmtLayer(&buf, prefix, i, "norm1.bias")),
                 .norm2_w = try must(weights, &buf, fmtLayer(&buf, prefix, i, "norm2.weight")),
                 .norm2_b = try must(weights, &buf, fmtLayer(&buf, prefix, i, "norm2.bias")),
-                .qkv_w = try must(weights, &buf, fmtLayer(&buf, prefix, i, "attn.qkv.weight")),
+                .qkv_w = try loadDense(weights, &buf, fmtLayer(&buf, prefix, i, "attn.qkv.weight"), config, s, &owned_list, allocator),
                 .qkv_b = try must(weights, &buf, fmtLayer(&buf, prefix, i, "attn.qkv.bias")),
-                .proj_w = try must(weights, &buf, fmtLayer(&buf, prefix, i, "attn.proj.weight")),
+                .proj_w = try loadDense(weights, &buf, fmtLayer(&buf, prefix, i, "attn.proj.weight"), config, s, &owned_list, allocator),
                 .proj_b = try must(weights, &buf, fmtLayer(&buf, prefix, i, "attn.proj.bias")),
-                .fc1_w = try must(weights, &buf, fmtLayer(&buf, prefix, i, "mlp.linear_fc1.weight")),
+                .fc1_w = try loadDense(weights, &buf, fmtLayer(&buf, prefix, i, "mlp.linear_fc1.weight"), config, s, &owned_list, allocator),
                 .fc1_b = try must(weights, &buf, fmtLayer(&buf, prefix, i, "mlp.linear_fc1.bias")),
-                .fc2_w = try must(weights, &buf, fmtLayer(&buf, prefix, i, "mlp.linear_fc2.weight")),
+                .fc2_w = try loadDense(weights, &buf, fmtLayer(&buf, prefix, i, "mlp.linear_fc2.weight"), config, s, &owned_list, allocator),
                 .fc2_b = try must(weights, &buf, fmtLayer(&buf, prefix, i, "mlp.linear_fc2.bias")),
             };
         }
@@ -656,15 +713,26 @@ pub const QwenVision = struct {
             .blocks = blocks,
             .merger_norm_w = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.norm.weight")),
             .merger_norm_b = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.norm.bias")),
-            .merger_fc1_w = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.linear_fc1.weight")),
+            .merger_fc1_w = try loadDense(weights, &buf, fmtKey(&kbuf, prefix, "merger.linear_fc1.weight"), config, s, &owned_list, allocator),
             .merger_fc1_b = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.linear_fc1.bias")),
-            .merger_fc2_w = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.linear_fc2.weight")),
+            .merger_fc2_w = try loadDense(weights, &buf, fmtKey(&kbuf, prefix, "merger.linear_fc2.weight"), config, s, &owned_list, allocator),
             .merger_fc2_b = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.linear_fc2.bias")),
+            .owned = blk: {
+                const owned_slice = try owned_list.toOwnedSlice(allocator);
+                if (owned_slice.len > 0) {
+                    log.info("qwen-vit: dequantized {d} tensors to bf16 ({d}-bit {s})\n", .{
+                        owned_slice.len, config.quant_bits, @tagName(config.quant_mode),
+                    });
+                }
+                break :blk owned_slice;
+            },
         };
     }
 
     pub fn deinit(self: *QwenVision) void {
         _ = mlx.mlx_array_free(self.patch_w);
+        for (self.owned) |a| _ = mlx.mlx_array_free(a);
+        self.allocator.free(self.owned);
         self.allocator.free(self.blocks);
     }
 
@@ -1024,52 +1092,42 @@ pub const QwenVision = struct {
         const k_rope = try self.applyVisionRope(parts[1], cos, sin, n, hd);
         defer _ = mlx.mlx_array_free(k_rope);
 
-        // [N, heads, hd] → [heads, N, hd], in fp32 to mirror the reference's
-        // fused SDPA (bf16 in/out, fp32 internal accumulation). Computing the
-        // score/softmax/context core in bf16 leaves sparse ~0.9 outliers on
-        // high-variance channels; fp32 internals match the reference far closer.
-        const perm = [_]c_int{ 1, 0, 2 };
+        // Fused SDPA ([1, H, N, D]) instead of explicit fp32 q@k^T. The matmul
+        // path aborted the process even at ~250 image tokens (uncatchable Metal
+        // error); flash-attn never materializes N×N scores.
+        const perm = [_]c_int{ 1, 0, 2 }; // [N, H, D] → [H, N, D]
         var qh = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(qh);
         try mlx.check(mlx.mlx_transpose_axes(&qh, q_rope, &perm, 3, self.s));
-        try mlx.check(mlx.mlx_astype(&qh, qh, .float32, self.s));
         var kh = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(kh);
         try mlx.check(mlx.mlx_transpose_axes(&kh, k_rope, &perm, 3, self.s));
-        try mlx.check(mlx.mlx_astype(&kh, kh, .float32, self.s));
         var vh = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(vh);
         try mlx.check(mlx.mlx_transpose_axes(&vh, parts[2], &perm, 3, self.s));
-        try mlx.check(mlx.mlx_astype(&vh, vh, .float32, self.s));
-
-        // scores = q @ k^T * scale
-        const kperm = [_]c_int{ 0, 2, 1 };
-        var kt = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(kt);
-        try mlx.check(mlx.mlx_transpose_axes(&kt, kh, &kperm, 3, self.s));
-        var scores = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(scores);
-        try mlx.check(mlx.mlx_matmul(&scores, qh, kt, self.s));
-        const scale = mlx.mlx_array_new_float(1.0 / @sqrt(@as(f32, @floatFromInt(self.head_dim))));
-        defer _ = mlx.mlx_array_free(scale);
-        var scaled = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(scaled);
-        try mlx.check(mlx.mlx_multiply(&scaled, scores, scale, self.s));
-        var probs = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(probs);
-        try mlx.check(mlx.mlx_softmax_axis(&probs, scaled, -1, true, self.s));
-        var ctx32 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(ctx32);
-        try mlx.check(mlx.mlx_matmul(&ctx32, probs, vh, self.s)); // [heads, N, hd] f32
-        var ctx = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(ctx);
-        try mlx.check(mlx.mlx_astype(&ctx, ctx32, .bfloat16, self.s));
-
-        // [heads, N, hd] → [N, heads*hd]
-        const operm = [_]c_int{ 1, 0, 2 };
+        const bshape = [_]c_int{ 1, heads, n, hd };
+        var q4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q4);
+        try mlx.check(mlx.mlx_reshape(&q4, qh, &bshape, 4, self.s));
+        var k4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k4);
+        try mlx.check(mlx.mlx_reshape(&k4, kh, &bshape, 4, self.s));
+        var v4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v4);
+        try mlx.check(mlx.mlx_reshape(&v4, vh, &bshape, 4, self.s));
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.head_dim)));
+        var attn = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(attn);
+        const null_a = mlx.mlx_array{ .ctx = null };
+        // force_fused demands a kernel for the exact shape (see transformer
+        // .sdpaForceFusedFor: hd 256, more than 8 rows, q <= k). The ViT's hd is
+        // 96/64, and a tiny test hd aborts inside mlx. MLX still picks a fused
+        // kernel for hd <= 128 on its own, so leave the choice to it.
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, q4, k4, v4, scale, "", null_a, null_a, false, self.s));
+        const operm = [_]c_int{ 0, 2, 1, 3 }; // [1, H, N, D] → [1, N, H, D]
         var ctt = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(ctt);
-        try mlx.check(mlx.mlx_transpose_axes(&ctt, ctx, &operm, 3, self.s));
+        try mlx.check(mlx.mlx_transpose_axes(&ctt, attn, &operm, 4, self.s));
         var flat = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(flat);
         const fshape = [_]c_int{ n, @intCast(self.hidden) };
@@ -1131,6 +1189,10 @@ pub const QwenVision = struct {
                 x = h;
             }
             dt.layer(x, block_idx);
+            // Bound the lazy graph per block. Without this, 27 ViT layers of
+            // attention compile as one Metal graph and kill the process
+            // (uncatchable MLX OOM) even at ~250 image tokens.
+            try mlx.check(mlx.mlx_array_eval(x));
         }
         dt.end(x);
 
@@ -1182,21 +1244,23 @@ pub const QwenVision = struct {
         var t: u32 = 0;
         while (t < grid_t) : (t += 1) {
             var group = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(group);
             const ti: c_int = @intCast(t);
             const start = [_]c_int{ ti * n_per_group, 0 };
             const stop = [_]c_int{ (ti + 1) * n_per_group, feat };
             const strides = [_]c_int{ 1, 1 };
             try mlx.check(mlx.mlx_slice(&group, patches, &start, 2, &stop, 2, &strides, 2, self.s));
             parts[t] = try self.forward(group, grid_h, grid_w);
+            try mlx.check(mlx.mlx_array_eval(parts[t]));
+            _ = mlx.mlx_array_free(group);
             built += 1;
         }
-        defer for (parts) |p| { _ = mlx.mlx_array_free(p); };
 
         const cat_vec = mlx.mlx_vector_array_new_data(parts.ptr, parts.len);
         defer _ = mlx.mlx_vector_array_free(cat_vec);
         var out = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_concatenate_axis(&out, cat_vec, 1, self.s));
+        try mlx.check(mlx.mlx_array_eval(out));
+        for (parts) |p| _ = mlx.mlx_array_free(p);
         return out;
     }
 };
@@ -1243,6 +1307,25 @@ pub fn resolveVisionPrefix(weights: *const Weights) ?[]const u8 {
         if (weights.get(fmtKey(&buf, p, "patch_embed.proj.weight")) != null) return p;
     }
     return null;
+}
+
+test "qwen ViT attention uses fused SDPA" {
+    const src = @embedFile("qwen_vision.zig");
+    try std.testing.expect(std.mem.indexOf(u8, src, "mlx_fast_scaled_dot_product_attention") != null);
+}
+
+test "qwen ViT dequantizes packed vision weights at init" {
+    const src = @embedFile("qwen_vision.zig");
+    try std.testing.expect(std.mem.indexOf(u8, src, "mlx_dequantize") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "qwen-vit: dequantized") != null);
+}
+
+test "qwen ViT forward evals residual after each block" {
+    const src = @embedFile("qwen_vision.zig");
+    const needle = "dt.layer(x, block_idx)";
+    const idx = std.mem.indexOf(u8, src, needle) orelse return error.MissingLayerTrace;
+    const window = src[idx..@min(src.len, idx + 400)];
+    try std.testing.expect(std.mem.indexOf(u8, window, "mlx_array_eval(x)") != null);
 }
 
 test "qwen vision tower prefix and patch_embed layout are PROBED, not hardcoded" {
@@ -1720,15 +1803,23 @@ test "qwen forwardVideo == per-group forward()+concat (self-consistency)" {
     const a = std.testing.allocator;
     const s = mlx.mlx_default_gpu_stream_new();
 
-    const mkArr = struct {
-        fn f(shape: []const c_int, val_base: f32) mlx.mlx_array {
-            var buf: [64]f32 = undefined;
+    const weight_slab = try a.alloc(f32, 512);
+    defer a.free(weight_slab);
+    var slab_at: usize = 0;
+    const WSlab = struct {
+        data: []f32,
+        at: *usize,
+        fn mk(self: *const @This(), shape: []const c_int, val_base: f32) !mlx.mlx_array {
             var total: usize = 1;
             for (shape) |d| total *= @intCast(d);
+            if (self.at.* + total > self.data.len) return error.OutOfMemory;
+            const buf = self.data[self.at.*..][0..total];
+            self.at.* += total;
             for (0..total) |i| buf[i] = val_base + @as(f32, @floatFromInt(i)) * 0.01;
-            return mlx.mlx_array_new_data(&buf, shape.ptr, @intCast(shape.len), .float32);
+            return mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float32);
         }
-    }.f;
+    };
+    var wslab = WSlab{ .data = weight_slab, .at = &slab_at };
 
     // hidden=4, 1 head of head_dim=4, depth=1, merge=1 (no reduction — keeps
     // token counts trivial), grid 2x2 (n=4 patches/group) matching
@@ -1750,30 +1841,31 @@ test "qwen forwardVideo == per-group forward()+concat (self-consistency)" {
         .merge = 1,
         .num_grid_per_side = 2,
         .out_hidden = 4,
-        .patch_w = mkArr(&patch_w_shape, 0.1),
-        .patch_b = mkArr(&hidden, 0.0),
-        .pos_embed = mkArr(&pos_shape, 0.2),
+        .patch_w = try wslab.mk(&patch_w_shape, 0.1),
+        .patch_b = try wslab.mk(&hidden, 0.0),
+        .pos_embed = try wslab.mk(&pos_shape, 0.2),
         .blocks = try a.alloc(QBlock, 1),
-        .merger_norm_w = mkArr(&hidden, 1.0),
-        .merger_norm_b = mkArr(&hidden, 0.0),
-        .merger_fc1_w = mkArr(&hidden2, 0.05),
-        .merger_fc1_b = mkArr(&hidden, 0.0),
-        .merger_fc2_w = mkArr(&hidden2, 0.05),
-        .merger_fc2_b = mkArr(&hidden, 0.0),
+        .merger_norm_w = try wslab.mk(&hidden, 1.0),
+        .merger_norm_b = try wslab.mk(&hidden, 0.0),
+        .merger_fc1_w = try wslab.mk(&hidden2, 0.05),
+        .merger_fc1_b = try wslab.mk(&hidden, 0.0),
+        .merger_fc2_w = try wslab.mk(&hidden2, 0.05),
+        .merger_fc2_b = try wslab.mk(&hidden, 0.0),
+        .owned = &.{},
     };
     qv.blocks[0] = .{
-        .norm1_w = mkArr(&hidden, 1.0),
-        .norm1_b = mkArr(&hidden, 0.0),
-        .norm2_w = mkArr(&hidden, 1.0),
-        .norm2_b = mkArr(&hidden, 0.0),
-        .qkv_w = mkArr(&qkv_w_shape, 0.03),
-        .qkv_b = mkArr(&qkv_b_shape, 0.0),
-        .proj_w = mkArr(&hidden2, 0.04),
-        .proj_b = mkArr(&hidden, 0.0),
-        .fc1_w = mkArr(&hidden2, 0.02),
-        .fc1_b = mkArr(&hidden, 0.0),
-        .fc2_w = mkArr(&hidden2, 0.02),
-        .fc2_b = mkArr(&hidden, 0.0),
+        .norm1_w = try wslab.mk(&hidden, 1.0),
+        .norm1_b = try wslab.mk(&hidden, 0.0),
+        .norm2_w = try wslab.mk(&hidden, 1.0),
+        .norm2_b = try wslab.mk(&hidden, 0.0),
+        .qkv_w = try wslab.mk(&qkv_w_shape, 0.03),
+        .qkv_b = try wslab.mk(&qkv_b_shape, 0.0),
+        .proj_w = try wslab.mk(&hidden2, 0.04),
+        .proj_b = try wslab.mk(&hidden, 0.0),
+        .fc1_w = try wslab.mk(&hidden2, 0.02),
+        .fc1_b = try wslab.mk(&hidden, 0.0),
+        .fc2_w = try wslab.mk(&hidden2, 0.02),
+        .fc2_b = try wslab.mk(&hidden, 0.0),
     };
     defer {
         _ = mlx.mlx_array_free(qv.patch_w);
@@ -1813,6 +1905,7 @@ test "qwen forwardVideo == per-group forward()+concat (self-consistency)" {
 
     const out_video = try qv.forwardVideo(patches_all, grid_t, 2, 2);
     defer _ = mlx.mlx_array_free(out_video);
+    try mlx.check(mlx.mlx_array_eval(out_video));
 
     // Manual reference: slice each group from the SAME source buffer, call
     // forward() directly, concatenate along the token axis.
@@ -1820,8 +1913,9 @@ test "qwen forwardVideo == per-group forward()+concat (self-consistency)" {
     for (0..grid_t) |g| {
         const group_shape = [_]c_int{ @intCast(n_per_group), 1 };
         const group_arr = mlx.mlx_array_new_data(patches_buf[g * n_per_group ..].ptr, &group_shape, 2, .float32);
-        defer _ = mlx.mlx_array_free(group_arr);
         manual_parts[g] = try qv.forward(group_arr, 2, 2);
+        try mlx.check(mlx.mlx_array_eval(manual_parts[g]));
+        _ = mlx.mlx_array_free(group_arr);
     }
     defer for (manual_parts) |p| { _ = mlx.mlx_array_free(p); };
     const cat_vec = mlx.mlx_vector_array_new_data(&manual_parts, manual_parts.len);

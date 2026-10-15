@@ -55,6 +55,7 @@ struct VideoGenView: View {
     @State private var stage2Steps: Int = 0
     @State private var cfgAudioScale: Double = 7.0
     @State private var chainWindows: Int = 1
+    @State private var latentPrefixChain: Bool = false
     @State private var seed: Int = 42
     /// Style LoRAs (Advanced): stacked `.safetensors` adapters ([] = none).
     /// Several can attach at once — their effects sum, so order doesn't matter.
@@ -64,6 +65,10 @@ struct VideoGenView: View {
     // frame; the SERVICE gates the field on `supportsLastFrame`, so a leftover
     // pick can never reach a backend without the anchor.
     @State private var lastFrameImageURL: URL? = nil
+    /// LTX source clip. Kept across preset switches; the request gates it.
+    @State private var guideVideoURL: URL? = nil
+    @State private var guideVideoSummary: String? = nil
+    @State private var isGuideDropTargeted = false
     @State private var isLastFrameDropTargeted = false
     // ref2va references, kept across preset changes like firstFrameImageURL —
     // `requestBody` gates the fields on the pack's own capability, so state
@@ -152,6 +157,7 @@ struct VideoGenView: View {
         // Windows multiply the DELIVERED frames (`w*n - (w-1)` in one
         // response), so raising them shortens the ladder under a set length.
         .onChange(of: chainWindows) { _, _ in guard !hydrating else { return }; clampFramesToRAM() }
+        .onChange(of: latentPrefixChain) { _, _ in guard !hydrating else { return }; clampFramesToRAM() }
         // The two size fields are separate because they do more than persist.
         .onChange(of: customWidthText) { _, _ in guard !hydrating else { return }; clampFramesToRAM(); persist() }
         .onChange(of: customHeightText) { _, _ in guard !hydrating else { return }; clampFramesToRAM(); persist() }
@@ -769,10 +775,16 @@ struct VideoGenView: View {
     private var customSizeValid: Bool { customResolutionVerdict.isValid }
 
     /// The length x windows x canvas combination the request would carry.
+    private var effectiveLatentPrefixOverlap: Int {
+        guard model.supportsChainedWindows, chainWindows > 1, latentPrefixChain else { return 0 }
+        return VideoModelPreset.chainLatentPrefixOverlapFrames
+    }
+
     private var payloadFits: Bool {
         model.framePayloadFits(width: effectiveSize.width, height: effectiveSize.height,
                                numFrames: numFrames,
-                               chainWindows: model.supportsChainedWindows ? chainWindows : 1)
+                               chainWindows: model.supportsChainedWindows ? chainWindows : 1,
+                               latentPrefixFrames: effectiveLatentPrefixOverlap)
     }
 
     /// The canvas the request carries. The FIELDS are the source of truth; an
@@ -832,7 +844,9 @@ struct VideoGenView: View {
     /// pick longer than RAM suggests — we just hint at it in the warning
     /// below the dropdown rather than removing the option.
     private var availableFrameOptions: [Int] {
-        model.frameOptions(width: effectiveSize.width, height: effectiveSize.height, chainWindows: chainWindows)
+        model.frameOptions(width: effectiveSize.width, height: effectiveSize.height,
+                           chainWindows: chainWindows,
+                           latentPrefixFrames: effectiveLatentPrefixOverlap)
     }
 
     /// Soft hint when the chosen length looks too aggressive for the Mac's
@@ -913,6 +927,7 @@ struct VideoGenView: View {
             FoldingSectionHeader(title: "Media inputs for generation", isExpanded: $showMediaInputs)
             if showMediaInputs {
                 keyframeRow
+                referenceVideoSection
                 referencesSection
                 speechSection
                 // Closes the block, the way the rule above Style LoRAs opens
@@ -1036,6 +1051,95 @@ struct VideoGenView: View {
         // window; see `MediaDropTarget`.
         .mediaDrop(.image, isTargeted: isTargeted) { urls in
             if let dropped = urls.first { url.wrappedValue = dropped }
+        }
+    }
+
+    /// Source clip for an LTX in-context guide (Ripple). Hidden on backends
+    /// that do not declare it. Attaching a clip does not change the pipeline.
+    @ViewBuilder
+    private var referenceVideoSection: some View {
+        if model.supportsVideoInput {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Text("Reference video").font(.app(.subheadline).weight(.semibold))
+                    Text("optional, motion to follow")
+                        .font(.app(.caption))
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                }
+                if let picked = guideVideoURL {
+                    MediaDropWellFilled(isTargeted: isGuideDropTargeted) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "film")
+                                .frame(width: 64, height: 48)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(picked.lastPathComponent)
+                                    .font(.app(.caption))
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                if let guideVideoSummary {
+                                    Text(guideVideoSummary)
+                                        .font(.app(.caption2))
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            Spacer()
+                            Button {
+                                guideVideoURL = nil
+                                guideVideoSummary = nil
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                            }
+                            .buttonStyle(.borderless)
+                            .foregroundStyle(.secondary)
+                            .help("Clear reference video")
+                        }
+                    }
+                } else {
+                    MediaDropWell(title: "Choose video...",
+                                  systemImage: "film",
+                                  isTargeted: isGuideDropTargeted) { chooseGuideVideo() }
+                        .help("A clip whose motion, timing and camera the edit should follow.")
+                }
+                Text("Ripple recipe: one-stage, guidance 1, LoRA strength 1.35. Choosing a clip does not change the pipeline or guidance you already picked. The first frame, if set, replaces frame 0 of this clip.")
+                    .font(.app(.caption2))
+                    .foregroundStyle(.secondary)
+            }
+            .mediaDrop(.video, isTargeted: $isGuideDropTargeted) { urls in
+                if let dropped = urls.first {
+                    guideVideoURL = dropped
+                    refreshGuideSummary()
+                }
+            }
+            .onChange(of: guideVideoURL) { _, _ in refreshGuideSummary() }
+        }
+    }
+
+    private func chooseGuideVideo() {
+        let panel = OpenPanel.make()
+        panel.allowedContentTypes = [.movie, .mpeg4Movie, .quickTimeMovie]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        if AppActivation.runModal(panel) == .OK, let url = panel.url {
+            guideVideoURL = url
+            refreshGuideSummary()
+        }
+    }
+
+    private func refreshGuideSummary() {
+        guard let url = guideVideoURL else {
+            guideVideoSummary = nil
+            return
+        }
+        Task {
+            let asset = AVURLAsset(url: url)
+            guard let duration = try? await asset.load(.duration) else { return }
+            let seconds = CMTimeGetSeconds(duration)
+            guard seconds.isFinite, seconds > 0 else { return }
+            let n = VideoGenService.guideFrameCount(available: Int(seconds * 24))
+            let text = String(format: "%.1f s · %d frames at 24 fps", seconds, n)
+            if guideVideoURL == url { guideVideoSummary = text }
         }
     }
 
@@ -1659,13 +1763,20 @@ struct VideoGenView: View {
             if model.supportsChainedWindows {
                 intSliderRow("Chained windows", value: $chainWindows, range: 1...6,
                              help: "Join several generations end to end, each starting from the last frame of the one before.")
+                if chainWindows > 1 {
+                    Toggle("Latent tail continuation (22 frames)", isOn: $latentPrefixChain)
+                        .help("Hold the previous window's video and audio latent tail inside the next sample instead of re-encoding the last pixel frame. Experimental FL2VA seam mode.")
+                }
                 // Through `deliveredFrames`: windows SHARE their seam frames,
-                // so the joined clip is one frame short per extra window.
+                // so the joined clip is one frame short per extra window (or
+                // 22 per seam when latent-tail chaining is on).
                 Text(chainWindows > 1
                      ? L10n.format(
-                        "%lld windows joined end to end — %lld frames, and roughly %lldx the time of a single window.",
+                        "%lld windows joined end to end — %lld frames delivered, and roughly %lldx the time of a single window.",
                         Int64(chainWindows),
-                        Int64(VideoModelPreset.deliveredFrames(perWindow: numFrames, chainWindows: chainWindows)),
+                        Int64(VideoModelPreset.deliveredFrames(
+                            perWindow: numFrames, chainWindows: chainWindows,
+                            latentPrefixFrames: effectiveLatentPrefixOverlap)),
                         Int64(chainWindows))
                      : L10n.text("Joins several generations end to end for a longer clip. Each window costs another full generation."))
                     .font(.app(.caption2)).foregroundStyle(.secondary)
@@ -1953,7 +2064,7 @@ struct VideoGenView: View {
             // this one guards a combination the controls no longer produce:
             // it is the backstop, not the message people normally see.
             if !payloadFits {
-                Text("\(VideoModelPreset.deliveredFrames(perWindow: numFrames, chainWindows: chainWindows)) frames at \(effectiveSize.width) × \(effectiveSize.height) is more than one response can carry. Shorten the clip, drop a window, or use a smaller canvas.")
+                Text("\(VideoModelPreset.deliveredFrames(perWindow: numFrames, chainWindows: chainWindows, latentPrefixFrames: effectiveLatentPrefixOverlap)) frames at \(effectiveSize.width) × \(effectiveSize.height) is more than one response can carry. Shorten the clip, drop a window, or use a smaller canvas.")
                     .font(.app(.caption2)).foregroundStyle(.orange)
             }
             if !service.isRunning, let est = timeEstimate {
@@ -2088,6 +2199,7 @@ struct VideoGenView: View {
         stage2Steps = min(6, max(0, s.stage2Steps))
         cfgAudioScale = min(12, max(1, s.cfgAudioScale))
         chainWindows = model.supportsChainedWindows ? min(6, max(1, s.chainWindows)) : 1
+        latentPrefixChain = model.supportsChainedWindows && s.latentPrefixChain
         seed = s.seed
         keepResident = s.keepResident
         livePreview = s.livePreview
@@ -2111,6 +2223,8 @@ struct VideoGenView: View {
         showAdvanced = s.showAdvanced
         firstFrameImageURL = Self.existingFile(s.firstFramePath)
         lastFrameImageURL = Self.existingFile(s.lastFramePath)
+        guideVideoURL = Self.existingFile(s.guideVideoPath)
+        refreshGuideSummary()
         speechText = s.speechText
         audioSource = model.supportsAudioInput ? s.audioSource : .none
         if let clip = Self.existingFile(s.audioPath), audioSource != .none {
@@ -2164,6 +2278,7 @@ struct VideoGenView: View {
         s.stage2Steps = stage2Steps
         s.cfgAudioScale = cfgAudioScale
         s.chainWindows = chainWindows
+        s.latentPrefixChain = latentPrefixChain
         s.seed = seed
         s.keepResident = keepResident
         s.livePreview = livePreview
@@ -2175,6 +2290,7 @@ struct VideoGenView: View {
         s.prompt = prompt
         s.firstFramePath = firstFrameImageURL?.path
         s.lastFramePath = lastFrameImageURL?.path
+        s.guideVideoPath = guideVideoURL?.path
         s.audioSource = audioSource
         s.audioPath = audioURL?.path
         s.speechText = speechText
@@ -2233,7 +2349,7 @@ struct VideoGenView: View {
         stgScale = s.stgScale
         // A tier does not describe chaining, but a preset switch can land on a
         // partition without it — collapse rather than carry a dead value.
-        if !model.supportsChainedWindows { chainWindows = 1 }
+        if !model.supportsChainedWindows { chainWindows = 1; latentPrefixChain = false }
         numFrames = s.numFrames
         clampFramesToRAM()
         // Keep firstFrameImageURL across preset changes so users can swap
@@ -2277,6 +2393,7 @@ struct VideoGenView: View {
             stgScale: stgScale,
             firstFrameImagePath: firstFrameImageURL?.path,
             lastFrameImagePath: lastFrameImageURL?.path,
+            guideVideoPath: model.supportsVideoInput ? guideVideoURL?.path : nil,
             // Belt-and-braces with the requestBody gate: a clip must never
             // reach the transcode (whose failure is a hard error) on a
             // backend that generates its own soundtrack.
@@ -2294,6 +2411,7 @@ struct VideoGenView: View {
             // Gated here too: the stepper's value survives a preset switch,
             // and only the fl2va partition has a keyframe row to chain.
             chainWindows: model.supportsChainedWindows ? chainWindows : 1,
+            latentPrefixChain: model.supportsChainedWindows && chainWindows > 1 && latentPrefixChain,
             stage2Steps: stage2Steps,
             cfgAudioScale: cfgAudioScale,
             // Belt-and-braces with the requestBody gate, same as `audioPath`

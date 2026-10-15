@@ -133,6 +133,22 @@ ffmpeg -f rawvideo -pix_fmt rgb24 -s 768x512 -r 24 -i frames.rgb \
 The `audio_*` fields appear only when the model made sound. Video renders take
 minutes and hold a lot of memory: one at a time, unload the model after.
 
+### MiniMax H3 FL2VA: chained windows
+
+Only the **FL2VA** pack (not REF2VA, not hybrid with refs). `ref_images`,
+ref video, ref audio, and RefMod cannot be combined with chaining — the server
+returns a named 400. `first_frame_image` and `last_frame_image` can: the first
+image anchors window 0, the last image anchors the final window, including
+when `latent_prefix_frames` is set.
+
+| field | notes |
+|---|---|
+| `chain_windows` | Integer ≥ 2. Run `num_frames` per window in one request; windows are joined server-side. Default (omit or 1) is a single window. |
+| `latent_prefix_frames` | Optional. Requires `chain_windows` > 1 and FL2VA. `0` or omit = **pixel chain**: last decoded frame is re-encoded as a one-frame condition; delivered length is `N·num_frames − (N−1)` (one frame dropped per seam). Non-zero (app sends **22**) = **latent pin**: the previous window's video/audio latent tail is held in the next sample; delivered length is `N·num_frames − (N−1)·overlap`. Legal overlaps are 5, 22, 39, 56 source frames. **22 is the proven overlap** — cleaner seam than the pixel chain on the same prompt. REF2VA and any request with references rejects this field. |
+
+Same prompt, seed, width, height, `num_frames`, and `steps` across windows.
+`"fast": false` and no turbo when comparing pixel chain vs latent pin.
+
 ## 3D: `POST /v1/3d/generations`
 
 | field | notes |

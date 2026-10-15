@@ -3128,13 +3128,25 @@ fn renderLtxPreview(
     const shp = mlx.getShape(x0_tokens);
     if (shp.len < 3) return error.BadLatentShape;
     const nv: u32 = @intCast(shp[1]);
-    if (nv != win.preview_f * win.preview_h * win.preview_w) return error.BadLatentShape;
+    const canvas_n = win.preview_f * win.preview_h * win.preview_w;
+    if (canvas_n == 0 or nv < canvas_n) return error.BadLatentShape;
+    // Appended guide / last-frame tokens sit after the canvas. The preview
+    // gathers the canvas only; a longer stream used to miss every step.
+    var trimmed: ?mlx.mlx_array = null;
+    defer if (trimmed) |t| {
+        _ = mlx.mlx_array_free(t);
+    };
+    const tokens = if (nv > canvas_n) blk: {
+        const sl = try sliceTokens(x0_tokens, 0, canvas_n, s);
+        trimmed = sl;
+        break :blk sl;
+    } else x0_tokens;
 
     var idx_buf: [preview_mod.Opts.max_frames]u32 = undefined;
     const idx = preview_mod.temporalIndices(&idx_buf, win.preview_f, opts.normalize().frames, win.preview_first_frame);
     const n: u32 = @intCast(idx.len);
 
-    const vol = try unpatchifyVideoFrames(x0_tokens, win.preview_f, win.preview_h, win.preview_w, idx, s);
+    const vol = try unpatchifyVideoFrames(tokens, win.preview_f, win.preview_h, win.preview_w, idx, s);
     defer _ = mlx.mlx_array_free(vol);
     const cpu = try copyArrayF32(alloc, vol, s);
     defer alloc.free(cpu);
@@ -4088,6 +4100,15 @@ pub fn computeVideoLatentShape(num_frames: u32, height: u32, width: u32) struct 
     return .{ .F = (num_frames + 7) / 8, .H = height / 32, .W = width / 32 };
 }
 
+/// Ripple's guide slice. Longer than a typical canvas, and already `8*15+1`.
+pub const guide_frame_cap: u32 = 121;
+
+/// Largest `8n+1` count that does not exceed `n`. Zero when `n` is zero.
+pub fn snapGuideFrameCount(n: u32) u32 {
+    if (n == 0) return 0;
+    return ((n - 1) / 8) * 8 + 1;
+}
+
 /// Audio latent token count for a video length (≈25 latents/sec).
 pub fn computeAudioTokenCount(num_frames: u32, frame_rate: f32) u32 {
     const dur = @as(f32, @floatFromInt(num_frames)) / frame_rate;
@@ -4245,6 +4266,9 @@ pub fn generateVideoFrames(
     vae_encoder: ?*const Component,
     cond_image: ?mlx.mlx_array,
     last_image: ?mlx.mlx_array,
+    /// `[1,3,K,H,W]` pixels, already on this stage's grid. One causal-VAE
+    /// clip, appended as clean tokens. Null → no guide.
+    guide_clip: ?mlx.mlx_array,
     gemma_dir: []const u8,
     pos_ids: []const i32,
     neg_ids: []const i32,
@@ -4310,10 +4334,15 @@ pub fn generateVideoFrames(
     const HW = H * W;
     var kf: ?KeyframeCond = null;
     defer if (kf) |*c| c.deinit(alloc);
-    if (vae_encoder) |venc| if (cond_image != null or last_image != null) {
+    if (vae_encoder) |venc| if (cond_image != null or last_image != null or guide_clip != null) {
         if (progress) |p| p.emit("Encoding image", 0, num_steps);
-        kf = try buildKeyframeCond(alloc, venc, cond_image, last_image, noise_v, vpos, H, W, F, num_frames, frame_rate, s);
-        log.info("[ltx] keyframe conditioning: first={} last={} ({d} of {d} tokens)\n", .{ cond_image != null, last_image != null, HW * (@as(u32, @intFromBool(cond_image != null)) + @intFromBool(last_image != null)), Nv });
+        kf = try buildKeyframeCond(alloc, venc, cond_image, last_image, guide_clip, noise_v, vpos, H, W, F, num_frames, frame_rate, s);
+        if (cond_image != null or last_image != null)
+            log.info("[ltx] keyframe conditioning: first={} last={} ({d} of {d} tokens)\n", .{ cond_image != null, last_image != null, HW * (@as(u32, @intFromBool(cond_image != null)) + @intFromBool(last_image != null)), Nv });
+        if (guide_clip) |g| {
+            const k: u32 = @intCast(mlx.getShape(g)[2]);
+            log.info("[ltx] video guide: {d} frames ({d} latent frames)\n", .{ k, (k + 7) / 8 });
+        }
     };
     const clean_v: ?mlx.mlx_array = if (kf) |c| c.clean else null;
     const cond_mask: ?[]const f32 = if (kf) |c| c.mask else null;
@@ -4389,19 +4418,23 @@ const KeyframeCond = struct {
 
 /// Denoise mask over the video token stream: 0 on conditioned tokens, 1
 /// elsewhere. A first anchor REPLACES latent frame 0 (tokens `[0, HW)`,
-/// `VideoConditionByLatentIndex`); a last anchor is APPENDED as `HW` extra
-/// tokens after the `F_lat*HW` canvas (`VideoConditionByKeyframeIndex`) —
-/// a standalone-frame latent dropped into slot `F_lat-1` decodes as eight
-/// pixel frames of noise on the causal VAE (#260). This is the ONE place
-/// keyframe token ranges are computed; strength 1.
-pub fn keyframeMask(alloc: std.mem.Allocator, HW: u32, F_lat: u32, has_first: bool, has_last: bool) ![]f32 {
+/// `VideoConditionByLatentIndex`). A video guide and a last anchor are
+/// APPENDED, in that order, after the `F_lat*HW` canvas: the guide is
+/// `guide_lat*HW` clean tokens (mask 0, canvas left noised), then the last
+/// anchor's `HW` tokens. A standalone-frame latent dropped into slot
+/// `F_lat-1` decodes as eight pixel frames of noise on the causal VAE (#260).
+/// This is the ONE place keyframe token ranges are computed; strength 1.
+pub fn keyframeMask(alloc: std.mem.Allocator, HW: u32, F_lat: u32, has_first: bool, has_last: bool, guide_lat: u32) ![]f32 {
     if (F_lat < 2 and (has_first or has_last)) return error.KeyframeCanvasTooShort;
     const Nv = F_lat * HW;
-    const n = Nv + if (has_last) HW else 0;
+    const guide_n = guide_lat * HW;
+    const last_n: u32 = if (has_last) HW else 0;
+    const n = Nv + guide_n + last_n;
     const mask = try alloc.alloc(f32, n);
     @memset(mask, 1.0);
     if (has_first) @memset(mask[0..HW], 0.0);
-    if (has_last) @memset(mask[Nv..n], 0.0);
+    if (guide_n > 0) @memset(mask[Nv .. Nv + guide_n], 0.0);
+    if (has_last) @memset(mask[Nv + guide_n .. n], 0.0);
     return mask;
 }
 
@@ -4424,14 +4457,51 @@ pub fn keyframePositions(alloc: std.mem.Allocator, base: []const f32, H: u32, W:
     return out;
 }
 
-/// VAE-encode the present anchors: the first is pinned clean over `base`'s
-/// latent frame 0, the last rides appended clean tokens (see `keyframeMask`).
-/// `positions` is the sampler's video position table for the whole stream.
-fn buildKeyframeCond(alloc: std.mem.Allocator, venc: *const Component, first: ?mlx.mlx_array, last: ?mlx.mlx_array, base: mlx.mlx_array, vpos: []const f32, H: u32, W: u32, F_lat: u32, num_frames: u32, frame_rate: f32, s: S) !KeyframeCond {
+/// `base` video positions plus a guide clip's own causal timeline
+/// (`computeVideoPositions` for `guide_lat` frames on this stage's grid).
+pub fn appendGuidePositions(alloc: std.mem.Allocator, base: []const f32, guide_lat: u32, H: u32, W: u32, frame_rate: f32) ![]f32 {
+    const guide = try computeVideoPositions(alloc, guide_lat, H, W, frame_rate);
+    defer alloc.free(guide);
+    const out = try alloc.alloc(f32, base.len + guide.len);
+    @memcpy(out[0..base.len], base);
+    @memcpy(out[base.len..], guide);
+    return out;
+}
+
+/// Canvas positions, then the guide's timeline, then the end-anchored last frame.
+fn composeCondPositions(alloc: std.mem.Allocator, vpos: []const f32, H: u32, W: u32, guide_lat: u32, has_last: bool, num_frames: u32, frame_rate: f32) ![]f32 {
+    var pos = try alloc.dupe(f32, vpos);
+    if (guide_lat > 0) {
+        const next = appendGuidePositions(alloc, pos, guide_lat, H, W, frame_rate) catch |e| {
+            alloc.free(pos);
+            return e;
+        };
+        alloc.free(pos);
+        pos = next;
+    }
+    if (has_last) {
+        const next = keyframePositions(alloc, pos, H, W, num_frames, frame_rate) catch |e| {
+            alloc.free(pos);
+            return e;
+        };
+        alloc.free(pos);
+        pos = next;
+    }
+    return pos;
+}
+
+/// VAE-encode the present anchors. The first is pinned clean over `base`'s
+/// latent frame 0. A guide clip (`[1,3,K,H,W]` pixels) is one `vaeEncode`,
+/// appended as clean tokens. The last rides appended clean tokens after the
+/// guide (see `keyframeMask`). `positions` is the sampler's video position
+/// table for the whole stream.
+fn buildKeyframeCond(alloc: std.mem.Allocator, venc: *const Component, first: ?mlx.mlx_array, last: ?mlx.mlx_array, guide: ?mlx.mlx_array, base: mlx.mlx_array, vpos: []const f32, H: u32, W: u32, F_lat: u32, num_frames: u32, frame_rate: f32, s: S) !KeyframeCond {
     const HW = H * W;
-    const mask = try keyframeMask(alloc, HW, F_lat, first != null, last != null);
+    const guide_px: u32 = if (guide) |g| @intCast(mlx.getShape(g)[2]) else 0;
+    const guide_lat: u32 = if (guide_px == 0) 0 else (guide_px + 7) / 8;
+    const mask = try keyframeMask(alloc, HW, F_lat, first != null, last != null, guide_lat);
     errdefer alloc.free(mask);
-    const positions = if (last != null) try keyframePositions(alloc, vpos, H, W, num_frames, frame_rate) else try alloc.dupe(f32, vpos);
+    const positions = try composeCondPositions(alloc, vpos, H, W, guide_lat, last != null, num_frames, frame_rate);
     errdefer alloc.free(positions);
     const Nv = F_lat * HW;
 
@@ -4456,6 +4526,19 @@ fn buildKeyframeCond(alloc: std.mem.Allocator, venc: *const Component, first: ?m
         _ = mlx.mlx_array_free(clean);
         clean = nc;
     }
+    if (guide) |clip| {
+        if (guide_lat == 0) return error.GuideLatentShape;
+        const tokens = try encodeAnchorTokens(venc, clip, s);
+        defer _ = mlx.mlx_array_free(tokens);
+        const n: u32 = @intCast(mlx.getShape(tokens)[1]);
+        if (n != guide_lat * HW) return error.GuideLatentShape;
+        const ni = try concatTokens(init_latent, tokens, s);
+        _ = mlx.mlx_array_free(init_latent);
+        init_latent = ni;
+        const nc = try concatTokens(clean, tokens, s);
+        _ = mlx.mlx_array_free(clean);
+        clean = nc;
+    }
     if (last) |img| {
         const tokens = try encodeAnchorTokens(venc, img, s);
         defer _ = mlx.mlx_array_free(tokens);
@@ -4470,11 +4553,12 @@ fn buildKeyframeCond(alloc: std.mem.Allocator, venc: *const Component, first: ?m
     return .{ .init_latent = init_latent, .clean = clean, .mask = mask, .positions = positions, .canvas_tokens = Nv };
 }
 
-/// One anchor image → `[1,HW,128]` clean latent tokens.
+/// One image or a stacked clip → `[1,F*H*W,128]` clean latent tokens.
+/// A single frame is `F=1`. A guide is one encode of the whole clip.
 fn encodeAnchorTokens(venc: *const Component, img: mlx.mlx_array, s: S) !mlx.mlx_array {
-    const ref_lat = try vaeEncode(venc, img, s); // [1,128,1,H,W]
+    const ref_lat = try vaeEncode(venc, img, s); // [1,128,F,H,W]
     defer _ = mlx.mlx_array_free(ref_lat);
-    return patchifyVideo(ref_lat, s); // [1,HW,128]
+    return patchifyVideo(ref_lat, s);
 }
 
 /// `x` with tokens `[start, start+len(ins))` replaced by `ins`.
@@ -4492,23 +4576,78 @@ fn spliceTokens(x: mlx.mlx_array, ins: mlx.mlx_array, start: u32, Nv: u32, s: S)
 test "ltx keyframeMask: first replaces latent frame 0, last is APPENDED" {
     const a = testing.allocator;
     const HW: u32 = 4;
-    const m_first = try keyframeMask(a, HW, 3, true, false);
+    const m_first = try keyframeMask(a, HW, 3, true, false, 0);
     defer a.free(m_first);
     try testing.expectEqualSlices(f32, &[_]f32{ 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1 }, m_first);
     // A last anchor never touches latent slot F_lat-1 (a standalone-frame
     // latent there decodes as 8 pixel frames of noise, #260): it rides HW
     // appended tokens after the canvas, VideoConditionByKeyframeIndex.
-    const m_last = try keyframeMask(a, HW, 3, false, true);
+    const m_last = try keyframeMask(a, HW, 3, false, true, 0);
     defer a.free(m_last);
     try testing.expectEqualSlices(f32, &[_]f32{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0 }, m_last);
-    const m_both = try keyframeMask(a, HW, 3, true, true);
+    const m_both = try keyframeMask(a, HW, 3, true, true, 0);
     defer a.free(m_both);
     try testing.expectEqualSlices(f32, &[_]f32{ 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0 }, m_both);
-    const m_none = try keyframeMask(a, HW, 1, false, false);
+    const m_none = try keyframeMask(a, HW, 1, false, false, 0);
     defer a.free(m_none);
     try testing.expectEqualSlices(f32, &[_]f32{ 1, 1, 1, 1 }, m_none);
-    try testing.expectError(error.KeyframeCanvasTooShort, keyframeMask(a, HW, 1, true, true));
-    try testing.expectError(error.KeyframeCanvasTooShort, keyframeMask(a, HW, 1, false, true));
+    try testing.expectError(error.KeyframeCanvasTooShort, keyframeMask(a, HW, 1, true, true, 0));
+    try testing.expectError(error.KeyframeCanvasTooShort, keyframeMask(a, HW, 1, false, true, 0));
+}
+
+test "ltx video guide: canvas stays noised, positions are the causal timeline" {
+    const a = testing.allocator;
+    const H: u32 = 1;
+    const W: u32 = 2;
+    const HW = H * W;
+    const F: u32 = 3;
+    const fps: f32 = 24;
+    const canvas = try computeVideoPositions(a, F, H, W, fps);
+    defer a.free(canvas);
+    // Pixel counts 1, 9, 17 → latent frames 1, 2, 3. Counts 2 and 8 both
+    // collapse to one latent frame, so they cannot see g≥1.
+    try testing.expectEqual(@as(u32, 1), computeVideoLatentShape(1, 32, 32).F);
+    try testing.expectEqual(@as(u32, 2), computeVideoLatentShape(9, 32, 32).F);
+    try testing.expectEqual(@as(u32, 3), computeVideoLatentShape(17, 32, 32).F);
+    for ([_]u32{ 1, 2, 3 }) |Fg| {
+        const mask = try keyframeMask(a, HW, F, false, false, Fg);
+        defer a.free(mask);
+        try testing.expectEqual((F + Fg) * HW, mask.len);
+        for (mask[0 .. F * HW]) |v| try testing.expectEqual(@as(f32, 1), v);
+        for (mask[F * HW ..]) |v| try testing.expectEqual(@as(f32, 0), v);
+
+        const pos = try appendGuidePositions(a, canvas, Fg, H, W, fps);
+        defer a.free(pos);
+        const guide = try computeVideoPositions(a, Fg, H, W, fps);
+        defer a.free(guide);
+        try testing.expectEqualSlices(f32, canvas, pos[0..canvas.len]);
+        try testing.expectEqualSlices(f32, guide, pos[canvas.len..]);
+    }
+    // Guide then last: canvas, guide zeros, last zeros. A longer guide
+    // extends past the canvas timeline.
+    const both = try keyframeMask(a, HW, F, false, true, 2);
+    defer a.free(both);
+    try testing.expectEqual((F + 2) * HW + HW, both.len);
+    for (both[0 .. F * HW]) |v| try testing.expectEqual(@as(f32, 1), v);
+    for (both[F * HW .. (F + 2) * HW]) |v| try testing.expectEqual(@as(f32, 0), v);
+    for (both[(F + 2) * HW ..]) |v| try testing.expectEqual(@as(f32, 0), v);
+    const short_canvas = try computeVideoPositions(a, 2, H, W, fps);
+    defer a.free(short_canvas);
+    const long = try appendGuidePositions(a, short_canvas, 3, H, W, fps);
+    defer a.free(long);
+    const long_guide = try computeVideoPositions(a, 3, H, W, fps);
+    defer a.free(long_guide);
+    try testing.expectEqualSlices(f32, long_guide, long[short_canvas.len..]);
+    try testing.expect(long_guide[(2 * HW) * 3] > short_canvas[short_canvas.len - 3]);
+}
+
+test "ltx snapGuideFrameCount is the 8n+1 ladder, capped by the caller" {
+    try testing.expectEqual(@as(u32, 0), snapGuideFrameCount(0));
+    try testing.expectEqual(@as(u32, 1), snapGuideFrameCount(1));
+    try testing.expectEqual(@as(u32, 1), snapGuideFrameCount(8));
+    try testing.expectEqual(@as(u32, 9), snapGuideFrameCount(9));
+    try testing.expectEqual(@as(u32, 113), snapGuideFrameCount(120));
+    try testing.expectEqual(guide_frame_cap, snapGuideFrameCount(guide_frame_cap));
 }
 
 test "ltx keyframePositions: appended tokens sit at pixel frame num_frames-1, one frame wide" {
@@ -4571,6 +4710,11 @@ pub fn generateVideoFramesTwoStage(
     cond_image_full: ?mlx.mlx_array,
     last_image_half: ?mlx.mlx_array,
     last_image_full: ?mlx.mlx_array,
+    /// Guide pixels at the stage-1 / stage-2 grids. This function frees
+    /// `guide_half` after the stage-1 encode (the full-res clip stays the
+    /// caller's). Null → no guide on that stage.
+    guide_half: ?mlx.mlx_array,
+    guide_full: ?mlx.mlx_array,
     // a2vid: encoded clean audio tokens [1,Na,128] (encodeAudioCond). Stage 1
     // FREEZES them (audio timestep 0, x0 pinned) so the video is generated
     // against the real soundtrack; stage 2 renoises + jointly refines exactly
@@ -4646,12 +4790,25 @@ pub fn generateVideoFramesTwoStage(
     // defaults). Structural, not caller-optional.
     const ap1: GuiderParams = if (audio_cond != null) .{} else ap;
 
+    var guide_half_owned: ?mlx.mlx_array = guide_half;
+    errdefer if (guide_half_owned) |g| {
+        _ = mlx.mlx_array_free(g);
+    };
     var cond1: ?KeyframeCond = null;
     defer if (cond1) |*c| c.deinit(alloc);
-    if (cond_image_half != null or last_image_half != null) {
+    if (cond_image_half != null or last_image_half != null or guide_half_owned != null) {
         if (progress) |p| p.emit("Encoding image", 0, total);
-        cond1 = try buildKeyframeCond(alloc, vae_encoder, cond_image_half, last_image_half, noise_v1, vpos1, H1, W1, F, num_frames, frame_rate, s);
-        log.info("[ltx] keyframe conditioning (stage 1): first={} last={} ({d} of {d} tokens)\n", .{ cond_image_half != null, last_image_half != null, H1 * W1 * (@as(u32, @intFromBool(cond_image_half != null)) + @intFromBool(last_image_half != null)), Nv1 });
+        cond1 = try buildKeyframeCond(alloc, vae_encoder, cond_image_half, last_image_half, guide_half_owned, noise_v1, vpos1, H1, W1, F, num_frames, frame_rate, s);
+        if (cond_image_half != null or last_image_half != null)
+            log.info("[ltx] keyframe conditioning (stage 1): first={} last={} ({d} of {d} tokens)\n", .{ cond_image_half != null, last_image_half != null, H1 * W1 * (@as(u32, @intFromBool(cond_image_half != null)) + @intFromBool(last_image_half != null)), Nv1 });
+        if (guide_half_owned) |g| {
+            const k: u32 = @intCast(mlx.getShape(g)[2]);
+            log.info("[ltx] video guide: {d} frames ({d} latent frames)\n", .{ k, (k + 7) / 8 });
+        }
+    }
+    if (guide_half_owned) |g| {
+        _ = mlx.mlx_array_free(g);
+        guide_half_owned = null;
     }
 
     const stage1_v = if (cond1) |c| c.init_latent else noise_v1;
@@ -4713,9 +4870,14 @@ pub fn generateVideoFramesTwoStage(
 
     var cond2: ?KeyframeCond = null;
     defer if (cond2) |*c| c.deinit(alloc);
-    if (cond_image_full != null or last_image_full != null) {
-        cond2 = try buildKeyframeCond(alloc, vae_encoder, cond_image_full, last_image_full, noisy_v2, vpos2, H2, W2, F, num_frames, frame_rate, s);
-        log.info("[ltx] keyframe conditioning (stage 2): first={} last={} ({d} of {d} tokens)\n", .{ cond_image_full != null, last_image_full != null, H2 * W2 * (@as(u32, @intFromBool(cond_image_full != null)) + @intFromBool(last_image_full != null)), Nv2 });
+    if (cond_image_full != null or last_image_full != null or guide_full != null) {
+        cond2 = try buildKeyframeCond(alloc, vae_encoder, cond_image_full, last_image_full, guide_full, noisy_v2, vpos2, H2, W2, F, num_frames, frame_rate, s);
+        if (cond_image_full != null or last_image_full != null)
+            log.info("[ltx] keyframe conditioning (stage 2): first={} last={} ({d} of {d} tokens)\n", .{ cond_image_full != null, last_image_full != null, H2 * W2 * (@as(u32, @intFromBool(cond_image_full != null)) + @intFromBool(last_image_full != null)), Nv2 });
+        if (guide_full) |g| {
+            const k: u32 = @intCast(mlx.getShape(g)[2]);
+            log.info("[ltx] video guide: {d} frames ({d} latent frames)\n", .{ k, (k + 7) / 8 });
+        }
     }
 
     // audio: carry stage-1 latent, renoised to the stage-2 start sigma.

@@ -75,6 +75,8 @@ const supported_model_types = [_][]const u8{
 pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
     // LTX: distinguishes the real bundle from any other "AudioVideo" config
     // and proves the text path can load.
+    // Connector lands before either transformer. A dir with only the
+    // connector is a mid-download; `mediaPackReady` also requires a DiT.
     if (std.mem.eql(u8, model_type, "AudioVideo")) return "connector.safetensors";
     // MiniMax-H3: our converted layout always writes this next to config.json.
     if (std.mem.eql(u8, model_type, "minimax_h3")) return "transformer.safetensors";
@@ -83,6 +85,47 @@ pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
     // ACE-Step: the text encoder is a subdir a partial pull can miss.
     if (std.mem.eql(u8, model_type, "acestep")) return "text_encoder/model.safetensors";
     return null;
+}
+
+fn dirHasWeight(io: std.Io, dir: std.Io.Dir, name: []const u8) bool {
+    const st = dir.statFile(io, name, .{}) catch return false;
+    return st.kind == .file or st.kind == .sym_link;
+}
+
+fn weightFilePresent(io: std.Io, model_dir: []const u8, name: []const u8) bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ model_dir, name }) catch return false;
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return st.kind == .file or st.kind == .sym_link;
+}
+
+fn ltxTransformerPresentDir(io: std.Io, dir: std.Io.Dir) bool {
+    return dirHasWeight(io, dir, "transformer-distilled.safetensors") or
+        dirHasWeight(io, dir, "transformer-dev.safetensors");
+}
+
+fn ltxTransformerPresentPath(io: std.Io, model_dir: []const u8) bool {
+    return weightFilePresent(io, model_dir, "transformer-distilled.safetensors") or
+        weightFilePresent(io, model_dir, "transformer-dev.safetensors");
+}
+
+/// Marker file present. For LTX, also a transformer the loader can open.
+/// Connector-only dirs are mid-downloads; registering one shadows a finished
+/// copy in a later `--model-dir`.
+pub fn mediaPackReadyIn(io: std.Io, dir: std.Io.Dir, model_type: []const u8) bool {
+    if (requiredMediaMarker(model_type)) |marker| {
+        if (!dirHasWeight(io, dir, marker)) return false;
+    }
+    if (!std.mem.eql(u8, model_type, "AudioVideo")) return true;
+    return ltxTransformerPresentDir(io, dir);
+}
+
+pub fn mediaPackReady(io: std.Io, model_dir: []const u8, model_type: []const u8) bool {
+    if (requiredMediaMarker(model_type)) |marker| {
+        if (!weightFilePresent(io, model_dir, marker)) return false;
+    }
+    if (!std.mem.eql(u8, model_type, "AudioVideo")) return true;
+    return ltxTransformerPresentPath(io, model_dir);
 }
 
 pub fn isMediaModelType(model_type: []const u8) bool {
@@ -949,13 +992,10 @@ fn tryAddModel(
 
     // An incomplete media pack stays invisible, like any half-pulled
     // download (see `requiredMediaMarker`).
-    if (requiredMediaMarker(model_type)) |marker| {
-        const present = if (sub.statFile(io, marker, .{})) |st| st.kind == .file else |_| false;
-        if (!present) {
-            log.info("[discovery] skip {s}: {s} without {s} (incomplete media pack)", .{ name, model_type, marker });
-            allocator.free(model_type);
-            return true;
-        }
+    if (!mediaPackReadyIn(io, sub, model_type)) {
+        log.info("[discovery] skip {s}: {s} incomplete media pack", .{ name, model_type });
+        allocator.free(model_type);
+        return true;
     }
 
     // Compute weight bytes (sum of *.safetensors sizes) — best-effort.
@@ -1087,12 +1127,7 @@ pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const
 
     // Same completeness rule as tryAddModel: registering an incomplete media
     // pack by path would hand it straight to the text loader.
-    if (requiredMediaMarker(model_type)) |marker| {
-        var msub = dir.openDir(io, base, .{}) catch return error.ModelDirNotFound;
-        defer msub.close(io);
-        const present = if (msub.statFile(io, marker, .{})) |st| st.kind == .file else |_| false;
-        if (!present) return error.IncompleteMediaPack;
-    }
+    if (!mediaPackReady(io, trimmed, model_type)) return error.IncompleteMediaPack;
 
     var bytes: u64 = 0;
     var bytes_ok = false;
@@ -2147,12 +2182,28 @@ test "discovery skips an incomplete media pack (media model_type without its mar
     try tmp.dir.createDirPath(io, "x/ltx-partial");
     try tmp.dir.writeFile(io, .{ .sub_path = "x/ltx-partial/config.json", .data = "{\"model_type\":\"AudioVideo\"}" });
     try tmp.dir.writeFile(io, .{ .sub_path = "x/ltx-partial/vae_decoder.safetensors", .data = "0123" });
+    // Connector without a transformer is still a mid-download. It must not
+    // register and shadow a finished copy in a later root.
+    try tmp.dir.createDirPath(io, "x/ltx-connector");
+    try tmp.dir.writeFile(io, .{ .sub_path = "x/ltx-connector/config.json", .data = "{\"model_type\":\"AudioVideo\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "x/ltx-connector/connector.safetensors", .data = "0123" });
+    try tmp.dir.createDirPath(io, "x/ltx-ready");
+    try tmp.dir.writeFile(io, .{ .sub_path = "x/ltx-ready/config.json", .data = "{\"model_type\":\"AudioVideo\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "x/ltx-ready/connector.safetensors", .data = "0123" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "x/ltx-ready/transformer-distilled.safetensors", .data = "0123" });
 
     var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
     defer result.deinit();
 
-    try testing.expectEqual(@as(usize, 1), result.models.len);
-    try testing.expectEqualStrings("ddalcu/h3-complete", result.models[0].id);
+    try testing.expectEqual(@as(usize, 2), result.models.len);
+    var saw_h3 = false;
+    var saw_ltx = false;
+    for (result.models) |m| {
+        if (std.mem.eql(u8, m.id, "ddalcu/h3-complete")) saw_h3 = true;
+        if (std.mem.eql(u8, m.id, "x/ltx-ready")) saw_ltx = true;
+    }
+    try testing.expect(saw_h3);
+    try testing.expect(saw_ltx);
 }
 
 test "probeModelDir refuses an incomplete media pack by name" {

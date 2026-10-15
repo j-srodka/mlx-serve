@@ -239,6 +239,75 @@ PY
   [ "$code" = "400" ] && grep -q "9 frames" /tmp/test_flf_short.json \
     && echo "PASS: last frame on a one-latent-frame canvas -> named 400" \
     || { echo "FAIL: short canvas with last frame http $code"; head -c 200 /tmp/test_flf_short.json; rc=1; }
+
+  # ── Source-video guide (Ripple / in-context) ──────────────────────────────
+  # Named refusals, then one short generation. The canvas stays 17 frames;
+  # the guide is 9 pixel frames (2 latent). first_frame_image must NOT pin
+  # the canvas when a guide is present.
+  code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+    -d '{"prompt":"x","ref_video_frames":[]}' -o /tmp/test_v2v_empty.json -w "%{http_code}")
+  [ "$code" = "400" ] && grep -q "empty" /tmp/test_v2v_empty.json \
+    && echo "PASS: empty ref_video_frames -> named 400" \
+    || { echo "FAIL: empty ref_video_frames http $code"; head -c 200 /tmp/test_v2v_empty.json; rc=1; }
+  code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+    -d '{"prompt":"x","ref_video_frames":"nope"}' -o /tmp/test_v2v_bad.json -w "%{http_code}")
+  [ "$code" = "400" ] && grep -q "ref_video_frames" /tmp/test_v2v_bad.json \
+    && echo "PASS: malformed ref_video_frames -> named 400" \
+    || { echo "FAIL: malformed ref_video_frames http $code"; head -c 200 /tmp/test_v2v_bad.json; rc=1; }
+  code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+    -d '{"prompt":"x","ref_video_frames":["!!!"]}' -o /tmp/test_v2v_b64.json -w "%{http_code}")
+  [ "$code" = "400" ] && grep -q "base64" /tmp/test_v2v_b64.json \
+    && echo "PASS: bad ref_video_frames base64 -> named 400" \
+    || { echo "FAIL: bad ref_video_frames base64 http $code"; head -c 200 /tmp/test_v2v_b64.json; rc=1; }
+  # YQ== is valid base64 and not an image. The refusal names the index.
+  code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+    -d '{"prompt":"x","ref_video_frames":["YQ=="]}' -o /tmp/test_v2v_img.json -w "%{http_code}")
+  [ "$code" = "400" ] && grep -q "ref_video_frames'\[0\]" /tmp/test_v2v_img.json \
+    && echo "PASS: undecodable ref_video_frames[0] -> named 400" \
+    || { echo "FAIL: undecodable ref_video_frames http $code"; head -c 200 /tmp/test_v2v_img.json; rc=1; }
+  python3 - <<'PY'
+import json
+frames = ["YQ=="] * 122
+json.dump({"prompt":"x","ref_video_frames":frames}, open("/tmp/test_v2v_over.json","w"))
+PY
+  code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+    --data @/tmp/test_v2v_over.json -o /tmp/test_v2v_over_resp.json -w "%{http_code}")
+  [ "$code" = "400" ] && grep -q "121" /tmp/test_v2v_over_resp.json \
+    && echo "PASS: ref_video_frames over 121 -> named 400" \
+    || { echo "FAIL: over-cap ref_video_frames http $code"; head -c 200 /tmp/test_v2v_over_resp.json; rc=1; }
+
+  python3 - "$B64" <<'PY'
+import json, sys
+b64 = sys.argv[1]
+json.dump({
+    "prompt": "a red fox running through a snowy forest",
+    "num_frames": 17, "height": 256, "width": 384, "steps": 4, "seed": 7,
+    "first_frame_image": b64,
+    "ref_video_frames": [b64] * 9,
+}, open("/tmp/test_v2v_req.json", "w"))
+PY
+  kf_before=$(grep -c "keyframe conditioning: first=true" /tmp/test_video_server.log || true)
+  V2V=/tmp/test_video_v2v.json
+  code=$(curl -s --max-time 600 -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+    --data @/tmp/test_v2v_req.json -o "$V2V" -w "%{http_code}")
+  if [ "$code" = "200" ]; then
+    grep -q "video guide: 9 frames (2 latent frames)" /tmp/test_video_server.log \
+      || { echo "FAIL: video guide not engaged"; rc=1; }
+    kf_after=$(grep -c "keyframe conditioning: first=true" /tmp/test_video_server.log || true)
+    [ "$kf_after" = "$kf_before" ] \
+      || { echo "FAIL: guide request also pinned the canvas first frame"; rc=1; }
+    python3 - "$V2V" <<'PY'
+import sys, json, base64
+d = json.load(open(sys.argv[1]))
+assert d["frames"] == 17, d["frames"]
+raw = base64.b64decode(d["data"])
+assert len(raw) == 17 * d["height"] * d["width"] * 3
+print("PASS: video guide engaged, canvas stayed 17 frames, first frame was not pinned")
+PY
+    [ $? -eq 0 ] || rc=1
+  else
+    echo "FAIL: video guide http $code"; head -c 300 "$V2V"; rc=1
+  fi
 else
   echo "no vae_encoder.safetensors in $MODEL -> skipping image-to-video test"
   code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
@@ -246,6 +315,11 @@ else
   [ "$code" = "400" ] && grep -q "vae_encoder" /tmp/test_flf_noenc.json \
     && echo "PASS: last_frame_image without encoder -> named 400" \
     || { echo "FAIL: last_frame_image without encoder http $code"; rc=1; }
+  code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+    -d '{"prompt":"x","ref_video_frames":["YQ=="]}' -o /tmp/test_v2v_noenc.json -w "%{http_code}")
+  [ "$code" = "400" ] && grep -q "vae_encoder" /tmp/test_v2v_noenc.json \
+    && echo "PASS: ref_video_frames without encoder -> named 400" \
+    || { echo "FAIL: ref_video_frames without encoder http $code"; rc=1; }
 fi
 
 # ── Two-stage pipeline (dev CFG half-res → x2 upsample → distilled refine) ──
@@ -274,6 +348,34 @@ PY
     [ $? -eq 0 ] || rc=1
   else
     echo "FAIL: two_stage http $code"; head -c 300 "$TS"; rc=1
+  fi
+  # Same guide on the two-stage path: half grid then full grid. HQ shares
+  # this function. Canvas stays 9 frames.
+  python3 - "$B64" <<'PY'
+import json, sys
+b64 = sys.argv[1]
+json.dump({
+    "prompt": "a red fox running through a snowy forest",
+    "pipeline": "two_stage", "num_frames": 9, "height": 256, "width": 384,
+    "steps": 4, "seed": 7, "ref_video_frames": [b64] * 9,
+}, open("/tmp/test_v2v_two.json", "w"))
+PY
+  g_before=$(grep -c "video guide: 9 frames (2 latent frames)" /tmp/test_video_server.log || true)
+  code=$(curl -s --max-time 1200 -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+    --data @/tmp/test_v2v_two.json -o /tmp/test_v2v_two_resp.json -w "%{http_code}")
+  if [ "$code" = "200" ]; then
+    g_after=$(grep -c "video guide: 9 frames (2 latent frames)" /tmp/test_video_server.log || true)
+    [ $((g_after - g_before)) -ge 2 ] \
+      || { echo "FAIL: two-stage guide did not log both stages"; rc=1; }
+    python3 - <<'PY'
+import json
+d = json.load(open("/tmp/test_v2v_two_resp.json"))
+assert d["frames"] == 9, d["frames"]
+print("PASS: two-stage video guide, canvas stayed 9 frames")
+PY
+    [ $? -eq 0 ] || rc=1
+  else
+    echo "FAIL: two-stage video guide http $code"; head -c 300 /tmp/test_v2v_two_resp.json; rc=1
   fi
   # invalid grid (not divisible by 64) must 400, never silently downgrade
   code=$(curl -s --max-time 60 -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \

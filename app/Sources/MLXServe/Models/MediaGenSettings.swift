@@ -359,6 +359,8 @@ struct VideoGenSettings: Codable, Equatable {
     var cfgAudioScale: Double = 7.0
     /// Chained windows (H3 fl2va): 1 = a single ordinary window.
     var chainWindows: Int = 1
+    /// Hold the previous window's latent tail (22 frames) across chained windows.
+    var latentPrefixChain: Bool = false
     /// Style LoRAs (Advanced): sticky stack of adapter path + strength pairs.
     /// Empty = none attached.
     var loras: [LoraAdapter] = []
@@ -377,6 +379,7 @@ struct VideoGenSettings: Codable, Equatable {
     var prompt: String = ""
     var firstFramePath: String? = nil
     var lastFramePath: String? = nil
+    var guideVideoPath: String? = nil
     var audioSource: VideoAudioSource = .none
     var audioPath: String? = nil
     var speechText: String = ""
@@ -477,6 +480,7 @@ extension VideoGenSettings {
         if let v = try c.decodeIfPresent(Int.self, forKey: .stage2Steps) { stage2Steps = v }
         if let v = try c.decodeIfPresent(Double.self, forKey: .cfgAudioScale) { cfgAudioScale = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .chainWindows) { chainWindows = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .latentPrefixChain) { latentPrefixChain = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .livePreview) { livePreview = v }
         if let v = try c.decodeIfPresent(Double.self, forKey: .promptHeight) {
             promptHeight = PromptEditorHeight.clamp(v)
@@ -494,6 +498,7 @@ extension VideoGenSettings {
         if let v = try c.decodeIfPresent(String.self, forKey: .prompt) { prompt = v }
         firstFramePath = try c.decodeIfPresent(String.self, forKey: .firstFramePath)
         lastFramePath = try c.decodeIfPresent(String.self, forKey: .lastFramePath)
+        guideVideoPath = try c.decodeIfPresent(String.self, forKey: .guideVideoPath)
         if let v = try c.decodeIfPresent(VideoAudioSource.self, forKey: .audioSource) { audioSource = v }
         audioPath = try c.decodeIfPresent(String.self, forKey: .audioPath)
         if let v = try c.decodeIfPresent(String.self, forKey: .speechText) { speechText = v }

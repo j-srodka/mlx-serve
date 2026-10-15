@@ -84,9 +84,11 @@ final class MediaGenServiceTests: XCTestCase {
         // decoded resets on every launch (the `bestQuality` class).
         var s = VideoGenSettings()
         s.livePreview = true
+        s.guideVideoPath = "/clips/take.mp4"
         let data = try! JSONEncoder().encode(s)
         let back = try! JSONDecoder().decode(VideoGenSettings.self, from: data)
         XCTAssertTrue(back.livePreview)
+        XCTAssertEqual(back.guideVideoPath, "/clips/take.mp4")
     }
 
     func testDiffusionDecoderFieldIsGatedOnThePacksOwnCapability() {
@@ -234,6 +236,17 @@ final class MediaGenServiceTests: XCTestCase {
         body = VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil)
         XCTAssertEqual(body["turbo"] as? Bool, true)
         XCTAssertEqual(body["chain_windows"] as? Int, 2)
+        XCTAssertNil(body["latent_prefix_frames"], "latent pin off by default")
+
+        req.latentPrefixChain = true
+        body = VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil)
+        XCTAssertEqual(body["latent_prefix_frames"] as? Int, 22)
+
+        req.chainWindows = 1
+        req.latentPrefixChain = true
+        body = VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil)
+        XCTAssertNil(body["chain_windows"])
+        XCTAssertNil(body["latent_prefix_frames"], "single window never sends the pin")
 
         // A preset switch leaves the state populated; the REF2VA pack must
         // never see either field (the server 400s chaining there by name).
@@ -241,9 +254,11 @@ final class MediaGenServiceTests: XCTestCase {
                                   numFrames: 124, fps: 24, mode: .oneStage, steps: 30, cfgScale: 1.0)
         ref.turbo = true
         ref.chainWindows = 3
+        ref.latentPrefixChain = true
         body = VideoGenService.requestBody(model: "m", prompt: "p", request: ref, firstFrameB64: nil)
         XCTAssertNil(body["turbo"])
         XCTAssertNil(body["chain_windows"])
+        XCTAssertNil(body["latent_prefix_frames"])
     }
 
     func testTurboBillsTheLoraBesideTheDiT() {
@@ -1014,6 +1029,32 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertEqual(ServerManager.resolveModelDir(repo: repo, roots: [partialRoot, fullRoot]), full)
     }
 
+    /// LTX's connector ships before either transformer. A first root that has
+    /// the connector and two `.partial` DiTs must not win over a later root
+    /// whose transformer files are real.
+    func testResolveModelDirSkipsAnLtxPackWithNoTransformer() throws {
+        let fm = FileManager.default
+        let base = NSTemporaryDirectory() + "resolvedir-ltx-\(UUID().uuidString)"
+        defer { try? fm.removeItem(atPath: base) }
+        let repo = "ddalcu/LTX-2.5-MLX-Serve-8bit"
+        let cfg = Data("{\"model_type\":\"AudioVideo\"}".utf8)
+
+        let partialRoot = base + "/dl", fullRoot = base + "/omlx"
+        let partial = (partialRoot as NSString).appendingPathComponent(repo)
+        let full = (fullRoot as NSString).appendingPathComponent(repo)
+        try fm.createDirectory(atPath: partial, withIntermediateDirectories: true)
+        try fm.createDirectory(atPath: full, withIntermediateDirectories: true)
+        for dir in [partial, full] {
+            fm.createFile(atPath: dir + "/config.json", contents: cfg)
+            fm.createFile(atPath: dir + "/connector.safetensors", contents: Data([0, 1]))
+        }
+        fm.createFile(atPath: partial + "/transformer-dev.safetensors.partial", contents: Data([0]))
+        fm.createFile(atPath: full + "/transformer-distilled.safetensors", contents: Data([0, 1]))
+
+        XCTAssertNil(ServerManager.resolveModelDir(repo: repo, roots: [partialRoot]))
+        XCTAssertEqual(ServerManager.resolveModelDir(repo: repo, roots: [partialRoot, fullRoot]), full)
+    }
+
     // MARK: - Residency default
 
     func testKeepResidentDefaultsOff() {
@@ -1611,5 +1652,44 @@ extension MediaGenServiceTests {
         XCTAssertNotNil(lbody["cfg_scale"])
         XCTAssertEqual(lbody["lora_paths"] as? [String], ["/tmp/some.safetensors"])
         XCTAssertEqual(lbody["lora_scales"] as? [Double], [1.0])
+    }
+
+    func testRefVideoFramesFollowTheCapabilityAndTheEditOrder() {
+        XCTAssertTrue(VideoModelPreset.ltx23Q4.supportsVideoInput)
+        XCTAssertTrue(VideoModelPreset.ltx25Q4.supportsVideoInput)
+        XCTAssertTrue(VideoModelPreset.ltx25Q8.supportsVideoInput)
+        XCTAssertFalse(VideoModelPreset.minimaxH3.supportsVideoInput)
+
+        XCTAssertEqual(VideoGenService.guideFrameCount(available: 0), 0)
+        XCTAssertEqual(VideoGenService.guideFrameCount(available: 1), 1)
+        XCTAssertEqual(VideoGenService.guideFrameCount(available: 8), 1)
+        XCTAssertEqual(VideoGenService.guideFrameCount(available: 9), 9)
+        XCTAssertEqual(VideoGenService.guideFrameCount(available: 120), 113)
+        XCTAssertEqual(VideoGenService.guideFrameCount(available: 121), 121)
+        XCTAssertEqual(VideoGenService.guideFrameCount(available: 400), 121)
+
+        let wide = VideoGenService.coverDrawRect(srcW: 200, srcH: 100, dstW: 50, dstH: 50)
+        XCTAssertEqual(wide.width, 100, accuracy: 0.01)
+        XCTAssertEqual(wide.origin.x, -25, accuracy: 0.01)
+
+        var ltx = VideoGenRequest(model: .ltx25Q8, prompt: "p", width: 384, height: 256,
+                                  numFrames: 97, fps: 24, mode: .oneStage, steps: 8, cfgScale: 1.0)
+        let absent = VideoGenService.requestBody(model: "m", prompt: "p", request: ltx, firstFrameB64: "QQ==")
+        XCTAssertNil(absent["ref_video_frames"])
+        XCTAssertEqual(absent["first_frame_image"] as? String, "QQ==")
+
+        ltx.guideVideoPath = "/clips/take.mp4"
+        let frames = ["edited", "src1", "src2"]
+        let present = VideoGenService.requestBody(
+            model: "m", prompt: "p", request: ltx, firstFrameB64: "QQ==", guideFrames: frames)
+        XCTAssertEqual(present["ref_video_frames"] as? [String], frames)
+        XCTAssertNil(present["first_frame_image"], "the edited frame is ref_video_frames[0], not a canvas pin")
+
+        var h3 = VideoGenRequest(model: .minimaxH3, prompt: "p", width: 384, height: 256,
+                                 numFrames: 124, fps: 24, mode: .oneStage, steps: 8, cfgScale: 1.0)
+        h3.guideVideoPath = "/clips/take.mp4"
+        let gated = VideoGenService.requestBody(
+            model: "m", prompt: "p", request: h3, firstFrameB64: nil, guideFrames: frames)
+        XCTAssertNil(gated["ref_video_frames"])
     }
 }

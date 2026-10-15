@@ -58,6 +58,12 @@ pub const FRAME_OVERLAP: u32 = if (TOKEN_OVERLAP * VAE_RATIO_T > FRAME_PRE_PADDI
 else
     0;
 
+/// Fizgig still decode. One latent token is repeated into the VAE's 5-token
+/// training group and pixel frame 3 is kept, just past the causal lead-in.
+/// A lone token normalizes its coordinates over T=1 and comes back banded.
+pub const STILL_GROUP: u32 = TOKENS_CHUNK_SIZE;
+pub const STILL_KEEP: u32 = FRAME_PRE_PADDING;
+
 pub const IMAGENET_MEAN = [3]f32{ 0.485, 0.456, 0.406 };
 pub const IMAGENET_STD = [3]f32{ 0.229, 0.224, 0.225 };
 
@@ -842,6 +848,51 @@ fn decodeSpatial(dec: *const Decoder, z: mlx.mlx_array, alloc: std.mem.Allocator
     return outp;
 }
 
+/// ImageNet denorm, clamp to [0, 1], then map to [-1, 1]. Does not free `decoded`.
+fn imagenetToPm1(decoded: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const df = try astype(decoded, mlx.mlx_dtype.float32, s);
+    defer _ = mlx.mlx_array_free(df);
+    const pshape = [_]c_int{ 1, 3, 1, 1, 1 };
+    const pm_arr = mlx.mlx_array_new_data(&IMAGENET_MEAN, &pshape, 5, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(pm_arr);
+    const ps_arr = mlx.mlx_array_new_data(&IMAGENET_STD, &pshape, 5, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(ps_arr);
+    const m1 = try mulA(df, ps_arr, s);
+    defer _ = mlx.mlx_array_free(m1);
+    const a1 = try addA(m1, pm_arr, s);
+    defer _ = mlx.mlx_array_free(a1);
+    const lo = mlx.mlx_array_new_float(0.0);
+    defer _ = mlx.mlx_array_free(lo);
+    const hi = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(hi);
+    var cl = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cl);
+    try mlx.check(mlx.mlx_clip(&cl, a1, lo, hi, s));
+    const two = mlx.mlx_array_new_float(2.0);
+    defer _ = mlx.mlx_array_free(two);
+    const scaled2 = try mulA(cl, two, s);
+    defer _ = mlx.mlx_array_free(scaled2);
+    const one2 = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(one2);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_subtract(&out, scaled2, one2, s));
+    return out;
+}
+
+/// Repeat a T=1 latent into a 5-token group, decode, keep pixel frame 3.
+fn decodeStill(dec: *const Decoder, z: mlx.mlx_array, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
+    var group = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_repeat_axis(&group, z, @intCast(STILL_GROUP), 2, s));
+    defer _ = mlx.mlx_array_free(group);
+    const raw = try decodeSpatial(dec, group, alloc, s);
+    defer _ = mlx.mlx_array_free(raw);
+    const nframes: u32 = @intCast(mlx.getShape(raw)[2]);
+    if (nframes <= STILL_KEEP) return error.StillDecodeShort;
+    const frame = try sliceAxis(raw, 2, @intCast(STILL_KEEP), @intCast(STILL_KEEP + 1), s);
+    defer _ = mlx.mlx_array_free(frame);
+    return imagenetToPm1(frame, s);
+}
+
 /// Full decode: normalized latents [1,24,T,H,W] -> pixels [1,3,frames,H*16,W*16]
 /// in [-1, 1].
 pub fn decode(dec: *const Decoder, z_norm: mlx.mlx_array, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
@@ -881,6 +932,10 @@ pub fn decode(dec: *const Decoder, z_norm: mlx.mlx_array, alloc: std.mem.Allocat
     defer _ = mlx.mlx_array_free(backc);
     var z = try reshape(backc, &[_]c_int{ 1, @intCast(dec.cfg.in_channels), @intCast(latent_t), @intCast(lat_h), @intCast(lat_w) }, s);
     defer _ = mlx.mlx_array_free(z);
+
+    // A still never takes the clip pad (that repeats the token out to 7 and
+    // bands). The group decode keeps frame 3 of a clean 5-token repeat.
+    if (latent_t == 1) return decodeStill(dec, z, alloc, s);
 
     const plan = planTemporal(latent_t);
     // Pad by repeating the LAST latent token.
@@ -961,34 +1016,8 @@ pub fn decode(dec: *const Decoder, z_norm: mlx.mlx_array, alloc: std.mem.Allocat
         dec_all = trimmed;
     }
 
-    // Pixel denormalization: ImageNet stats, clamp to [0,1], then to [-1,1].
-    const df = try astype(dec_all, mlx.mlx_dtype.float32, s);
+    const out = try imagenetToPm1(dec_all, s);
     _ = mlx.mlx_array_free(dec_all);
-    defer _ = mlx.mlx_array_free(df);
-    const pshape = [_]c_int{ 1, 3, 1, 1, 1 };
-    const pm_arr = mlx.mlx_array_new_data(&IMAGENET_MEAN, &pshape, 5, mlx.mlx_dtype.float32);
-    defer _ = mlx.mlx_array_free(pm_arr);
-    const ps_arr = mlx.mlx_array_new_data(&IMAGENET_STD, &pshape, 5, mlx.mlx_dtype.float32);
-    defer _ = mlx.mlx_array_free(ps_arr);
-    const m1 = try mulA(df, ps_arr, s);
-    defer _ = mlx.mlx_array_free(m1);
-    const a1 = try addA(m1, pm_arr, s);
-    defer _ = mlx.mlx_array_free(a1);
-    const lo = mlx.mlx_array_new_float(0.0);
-    defer _ = mlx.mlx_array_free(lo);
-    const hi = mlx.mlx_array_new_float(1.0);
-    defer _ = mlx.mlx_array_free(hi);
-    var cl = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(cl);
-    try mlx.check(mlx.mlx_clip(&cl, a1, lo, hi, s));
-    const two = mlx.mlx_array_new_float(2.0);
-    defer _ = mlx.mlx_array_free(two);
-    const scaled2 = try mulA(cl, two, s);
-    defer _ = mlx.mlx_array_free(scaled2);
-    const one2 = mlx.mlx_array_new_float(1.0);
-    defer _ = mlx.mlx_array_free(one2);
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_subtract(&out, scaled2, one2, s));
     return out;
 }
 
@@ -1001,6 +1030,8 @@ test "minimax h3 vae: temporal constants follow from the clip length" {
     // them together or the chunk walk desynchronizes from the blend.
     try testing.expectEqual(@as(u32, 3), FRAME_PRE_PADDING);
     try testing.expectEqual(@as(u32, 5), TOKENS_CHUNK_SIZE);
+    try testing.expectEqual(@as(u32, 5), STILL_GROUP);
+    try testing.expectEqual(@as(u32, 3), STILL_KEEP);
     try testing.expectEqual(@as(u32, 2), TOKEN_OVERLAP);
     try testing.expectEqual(@as(u32, 5), FRAME_OVERLAP);
 }

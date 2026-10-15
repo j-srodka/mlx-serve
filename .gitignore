@@ -94,3 +94,10 @@ tests/soak_log.csv
 
 # Agent eval runs (tests/agent_eval): projects, sessions, frames, verdicts
 /tests/agent_eval/out/
+
+# Agent scratch (server logs live in ~/.mlx-serve) + local review bundles
+/logs/
+/nohup.out
+/:memory:.ses
+/.h3-review/
+1necho

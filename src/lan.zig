@@ -61,7 +61,7 @@ pub fn routeClass(method: []const u8, path: []const u8) RouteClass {
             "/v1/embeddings",         "/v1/images/generations",
             "/v1/images/edits",       "/v1/audio/speech",
             "/v1/audio/music-generations",
-            "/v1/video/generations",  "/v1/3d/generations",
+            "/v1/video/generations",  "/v1/video/refmods",  "/v1/3d/generations",
             "/api/chat",              "/api/generate",
             "/api/embed",             "/api/embeddings",
         }) |p| if (eql(u8, path, p)) return .model_gated;
@@ -1082,7 +1082,7 @@ test "lan: routeClass allows exactly the shared inference surface" {
         "/v1/embeddings",              "/v1/images/generations",
         "/v1/images/edits",            "/v1/audio/speech",
         "/v1/audio/music-generations",
-        "/v1/video/generations",       "/v1/3d/generations",
+        "/v1/video/generations",       "/v1/video/refmods",       "/v1/3d/generations",
         "/api/chat",                   "/api/generate",
         "/api/embed",                  "/api/embeddings",
     }) |p| try t.expectEqual(RouteClass.model_gated, routeClass("POST", p));

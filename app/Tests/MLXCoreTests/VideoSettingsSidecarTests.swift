@@ -20,6 +20,7 @@ final class VideoSettingsSidecarTests: XCTestCase {
         req.firstFrameImagePath = "/private/reference/start.png"
         req.lastFrameImagePath = "/private/reference/end.png"
         req.audioPath = "/private/reference/dialogue.m4a"
+        req.guideVideoPath = "/private/reference/take.mp4"
         req.loras = [LoraAdapter(path: "/private/loras/cinematic.safetensors", scale: 0.75)]
 
         let text = VideoGenService.settingsText(
@@ -46,6 +47,7 @@ final class VideoSettingsSidecarTests: XCTestCase {
         XCTAssertTrue(text.contains("first_frame: start.png"))
         XCTAssertTrue(text.contains("last_frame: end.png"))
         XCTAssertTrue(text.contains("input_audio: dialogue.m4a"))
+        XCTAssertTrue(text.contains("reference_video: take.mp4"))
         XCTAssertTrue(text.contains("lora_1_file: cinematic.safetensors"))
         XCTAssertTrue(text.contains("lora_1_scale: 0.75"))
         XCTAssertTrue(text.contains("# Prompt\nA lighthouse in a winter storm.\n"))
@@ -135,6 +137,17 @@ final class VideoSettingsSidecarTests: XCTestCase {
         let text = VideoGenService.settingsText(req, modelId: "h3")
         XCTAssertTrue(text.contains("turbo: true"))
         XCTAssertTrue(text.contains("fast_recipe: false"))
+    }
+
+    func testLatentPrefixChainRecordedWhenChained() {
+        var req = VideoGenRequest(model: .minimaxH3, prompt: "p", width: 960, height: 544,
+                                  numFrames: 56, fps: 24, mode: .oneStage,
+                                  steps: 10, cfgScale: 1.0)
+        req.chainWindows = 2
+        req.latentPrefixChain = true
+        let text = VideoGenService.settingsText(req, modelId: "h3")
+        XCTAssertTrue(text.contains("chain_windows: 2"))
+        XCTAssertTrue(text.contains("latent_prefix_frames: 22"))
     }
 
     func testSidecarPathAndAtomicWrite() throws {

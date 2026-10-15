@@ -368,7 +368,16 @@ class DownloadManager: ObservableObject {
               let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let mt = cfg["model_type"] as? String,
               let marker = requiredMediaMarker(modelType: mt) else { return true }
-        return fm.fileExists(atPath: (dir as NSString).appendingPathComponent(marker))
+        let base = dir as NSString
+        guard fm.fileExists(atPath: base.appendingPathComponent(marker)) else { return false }
+        // Connector lands before either DiT. A mid-download with only the
+        // connector still resolves, and first-wins then hides a finished copy.
+        if mt == "AudioVideo" {
+            let dev = fm.fileExists(atPath: base.appendingPathComponent("transformer-dev.safetensors"))
+            let distilled = fm.fileExists(atPath: base.appendingPathComponent("transformer-distilled.safetensors"))
+            return dev || distilled
+        }
+        return true
     }
 
     /// Laya typed-decision checkpoints ship no root config.json; these two

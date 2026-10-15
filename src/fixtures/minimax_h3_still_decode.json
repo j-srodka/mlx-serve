@@ -1,0 +1,9 @@
+{
+  "VAE_RATIO_T": 4,
+  "FRAME_PRE_PADDING": 3,
+  "TOKENS_CHUNK_SIZE": 5,
+  "TOKEN_OVERLAP": 2,
+  "pixel_frames_after_pre_padding": 1,
+  "latent_t": 1,
+  "note": "decodeStill must NOT call planTemporal; T=1 padded to a 5-token chunk is the grid artifact."
+}

@@ -16,6 +16,11 @@ final class FramePayloadBudgetTests: XCTestCase {
         XCTAssertEqual(VideoModelPreset.deliveredFrames(perWindow: 100, chainWindows: 6), 595)
         XCTAssertEqual(VideoModelPreset.deliveredFrames(perWindow: 100, chainWindows: 0), 100,
                        "a nonsense window count is one window")
+        // Latent-tail chain: 22-frame overlap per seam (A/B plan: 2×56 − 22 = 90).
+        XCTAssertEqual(VideoModelPreset.deliveredFrames(perWindow: 56, chainWindows: 2,
+                                                        latentPrefixFrames: 22), 90)
+        XCTAssertEqual(VideoModelPreset.deliveredFrames(perWindow: 100, chainWindows: 2,
+                                                        latentPrefixFrames: 22), 178)
     }
 
     /// The reported case: 260 frames is fine alone and impossible six times

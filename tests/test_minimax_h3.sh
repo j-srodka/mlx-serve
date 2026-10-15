@@ -56,11 +56,15 @@ curl -s "http://127.0.0.1:$PORT/v1/models" | grep -q '"video"' \
 # before the VAEs), and the DiT sheds its AdaLN weights, so the 8-bit pack's
 # bill is max(TE 26.28, DiT 32.83x0.65 + turbo 0.73 + 6 activations) = 28.06 —
 # against a 64.5 GB sum and the 38.97 this used to read.
-PEAK=$(grep -m1 "media peak" "$LOG" | sed -E 's/.*media peak ~([0-9.]+) GB.*/\1/')
-if [ -n "$PEAK" ] && python3 -c "import sys; sys.exit(0 if 24.0 < float('$PEAK') < 32.0 else 1)"; then
-  echo "PASS: media preflight billed the biggest stage (~$PEAK GB, not the ~64.5 sum)"
+if [ "${SKIP_MEM_PREFLIGHT:-0}" = "1" ]; then
+  echo "SKIP: media preflight peak (SKIP_MEM_PREFLIGHT=1)"
 else
-  echo "FAIL: media preflight peak '$PEAK' GB is not the staged bill"; rc=1
+  PEAK=$(grep -m1 "media peak" "$LOG" | sed -E 's/.*media peak ~([0-9.]+) GB.*/\1/')
+  if [ -n "$PEAK" ] && python3 -c "import sys; sys.exit(0 if 24.0 < float('$PEAK') < 32.0 else 1)"; then
+    echo "PASS: media preflight billed the biggest stage (~$PEAK GB, not the ~64.5 sum)"
+  else
+    echo "FAIL: media preflight peak '$PEAK' GB is not the staged bill"; rc=1
+  fi
 fi
 
 # [2] the named-400 surface — all cheap, so they run before any generation
@@ -83,6 +87,43 @@ if [ "$code" = "400" ] && grep -q "multiples of 32" /tmp/h3_dims.json; then
   echo "PASS: non-/32 canvas -> named 400"
 else
   echo "FAIL: non-/32 canvas returned $code ($(head -c 120 /tmp/h3_dims.json))"; rc=1
+fi
+
+# Latent sidecar fields (FL2VA-only extend path).
+code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+  -d '{"prompt":"x","num_frames":56,"width":64,"height":64,"latent_prefix_frames":22,"chain_windows":1}' \
+  -o /tmp/h3_latpref_nowin.json -w "%{http_code}")
+if [ "$code" = "400" ] && grep -q "latent_prefix_frames" /tmp/h3_latpref_nowin.json; then
+  echo "PASS: latent_prefix_frames without sidecar path -> named 400"
+else
+  echo "FAIL: latent_prefix_frames no-path returned $code ($(head -c 160 /tmp/h3_latpref_nowin.json))"; rc=1
+fi
+
+code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+  -d '{"prompt":"x","num_frames":56,"width":64,"height":64,"latent_out":"latents.safetensors"}' \
+  -o /tmp/h3_latout_rel.json -w "%{http_code}")
+if [ "$code" = "400" ] && grep -q "latent_out" /tmp/h3_latout_rel.json; then
+  echo "PASS: relative latent_out -> named 400"
+else
+  echo "FAIL: relative latent_out returned $code ($(head -c 160 /tmp/h3_latout_rel.json))"; rc=1
+fi
+
+code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+  -d '{"prompt":"x","num_frames":56,"width":64,"height":64,"latent_out":"/tmp/no_such_parent_dir_zz/latents.safetensors"}' \
+  -o /tmp/h3_latout_parent.json -w "%{http_code}")
+if [ "$code" = "400" ] && grep -q "latent_out" /tmp/h3_latout_parent.json; then
+  echo "PASS: latent_out missing parent -> named 400"
+else
+  echo "FAIL: latent_out parent returned $code ($(head -c 160 /tmp/h3_latout_parent.json))"; rc=1
+fi
+
+code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+  -d '{"prompt":"x","num_frames":56,"width":64,"height":64,"latent_prefix_path":"/tmp/no_h3_sidecar.safetensors"}' \
+  -o /tmp/h3_latpath_noframes.json -w "%{http_code}")
+if [ "$code" = "400" ] && grep -q "latent_prefix_path" /tmp/h3_latpath_noframes.json; then
+  echo "PASS: latent_prefix_path without latent_prefix_frames -> named 400"
+else
+  echo "FAIL: latent_prefix_path alone returned $code ($(head -c 160 /tmp/h3_latpath_noframes.json))"; rc=1
 fi
 
 code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
@@ -289,6 +330,13 @@ if [ "$HAS_FL2VA" = "yes" ]; then
   else
     echo "PASS: 'fast': false kept every forward dense"
   fi
+fi
+code=$(curl -s --max-time 60 -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+  -d '{"prompt":"x","ref_video_frames":["QQ=="]}' -o /tmp/h3_ref_video_frames.json -w "%{http_code}")
+if [ "$code" = "400" ] && grep -q "ref_video_frames" /tmp/h3_ref_video_frames.json; then
+  echo "PASS: ref_video_frames on H3 -> named 400"
+else
+  echo "FAIL: ref_video_frames on H3 returned $code ($(head -c 160 /tmp/h3_ref_video_frames.json))"; rc=1
 fi
 code=$(curl -s --max-time 900 -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
   -d '{"prompt":"a slow pan over dunes","num_frames":5,"width":64,"height":64,"steps":12,"seed":2}' -o /dev/null -w "%{http_code}")

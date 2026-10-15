@@ -150,6 +150,17 @@ final class VideoGenService: ObservableObject {
                     setPhase(.failed("Couldn't read one of the reference files. Images must be PNG or JPEG, clips a QuickTime/MP4 movie of at least 5 frames, and audio a WAV, MP3, M4A or AAC file."), for: gen)
                     return
                 }
+                let guideFrames: [String]? = await Task.detached(priority: .userInitiated) {
+                    guard request.model.supportsVideoInput,
+                          let path = request.guideVideoPath, !path.isEmpty else { return [String]() }
+                    return await Self.guideFramePayload(
+                        path: path, width: request.width, height: request.height,
+                        editedFirstPath: request.firstFrameImagePath)
+                }.value
+                guard let guideFrames else {
+                    setPhase(.failed("Couldn't read the reference video. Use a QuickTime or MP4 clip."), for: gen)
+                    return
+                }
                 let (port, modelId, unloadId) = try await server.prepareGenModel(
                     lanModelId: request.lanModelId, repo: request.model.repo)
                 loadedId = unloadId
@@ -161,7 +172,8 @@ final class VideoGenService: ObservableObject {
                 let body = Self.requestBody(model: modelId, prompt: prompt,
                                             request: request, firstFrameB64: firstFrameB64,
                                             lastFrameB64: lastFrameB64,
-                                            audioB64: audioB64, refs: refs)
+                                            audioB64: audioB64, refs: refs,
+                                            guideFrames: guideFrames)
                 // SSE: the server pushes `progress` events per denoise step, then a
                 // `complete` event with the frames. Drive a determinate bar from them.
                 var decoded: DecodedFrames? = nil
@@ -394,7 +406,8 @@ final class VideoGenService: ObservableObject {
                                         request: VideoGenRequest, firstFrameB64: String?,
                                         lastFrameB64: String? = nil,
                                         audioB64: String? = nil,
-                                        refs: VideoRefPayloads = .init()) -> [String: Any] {
+                                        refs: VideoRefPayloads = .init(),
+                                        guideFrames: [String] = []) -> [String: Any] {
         var pipeline: String
         switch request.mode {
         case .oneStage:   pipeline = "one_stage"
@@ -442,7 +455,12 @@ final class VideoGenService: ObservableObject {
         if request.model.supportsPipelineModes, pipeline != "one_stage", request.stage2Steps > 0 {
             body["stage2_steps"] = request.stage2Steps
         }
-        if let firstFrameB64 { body["first_frame_image"] = firstFrameB64 }
+        // A guide already carries the edited frame as index 0. Sending
+        // `first_frame_image` as well would pin the canvas, which this LoRA
+        // does not do.
+        let sendingGuide = request.model.supportsVideoInput && !guideFrames.isEmpty
+        if let firstFrameB64, !sendingGuide { body["first_frame_image"] = firstFrameB64 }
+        if sendingGuide { body["ref_video_frames"] = guideFrames }
         // The other half of fl2va. Capability-gated like every field above: a
         // preset switch leaves the picked file in state, and LTX's handler has
         // no `last_frame_image` to ignore it with.
@@ -463,6 +481,9 @@ final class VideoGenService: ObservableObject {
         if request.model.supportsTurbo, request.turbo { body["turbo"] = true }
         if request.model.supportsChainedWindows, request.chainWindows > 1 {
             body["chain_windows"] = request.chainWindows
+            if request.latentPrefixChain {
+                body["latent_prefix_frames"] = VideoModelPreset.chainLatentPrefixOverlapFrames
+            }
         }
         if request.model.supportsAudioInput, hasAudio, let audioB64 { body["audio"] = audioB64 }
         // Stacked style LoRAs (adapters sum, so several can attach at once —
@@ -573,6 +594,9 @@ final class VideoGenService: ObservableObject {
         }
         if request.model.supportsChainedWindows {
             lines.append("chain_windows: \(max(request.chainWindows, 1))")
+            if request.chainWindows > 1, request.latentPrefixChain {
+                lines.append("latent_prefix_frames: \(VideoModelPreset.chainLatentPrefixOverlapFrames)")
+            }
         }
 
         func basename(_ path: String) -> String {
@@ -583,6 +607,9 @@ final class VideoGenService: ObservableObject {
         }
         if let path = request.lastFrameImagePath, !path.isEmpty {
             lines.append("last_frame: \(basename(path))")
+        }
+        if request.model.supportsVideoInput, let path = request.guideVideoPath, !path.isEmpty {
+            lines.append("reference_video: \(basename(path))")
         }
         if hasAudio, let path = request.audioPath {
             lines.append("input_audio: \(basename(path))")
@@ -688,6 +715,76 @@ final class VideoGenService: ObservableObject {
     /// frames is pure payload — a 124-frame clip at 4K is hundreds of MB of
     /// base64 against a 64 MB request cap.
     nonisolated static let refFrameMaxEdge: CGFloat = 1024
+
+    /// Ripple's guide slice. Independent of the output frame count.
+    nonisolated static let guideFrameCap = 121
+
+    /// Largest `8n+1` count that does not exceed `available`, and never past
+    /// `guideFrameCap`. Zero when the clip has no frames.
+    nonisolated static func guideFrameCount(available: Int) -> Int {
+        let n = min(max(available, 0), guideFrameCap)
+        guard n > 0 else { return 0 }
+        return ((n - 1) / 8) * 8 + 1
+    }
+
+    /// Aspect-fill rect of a `src` image drawn into a `dst` pixel buffer.
+    /// The image is centered; the long axis is cropped.
+    nonisolated static func coverDrawRect(srcW: CGFloat, srcH: CGFloat, dstW: CGFloat, dstH: CGFloat) -> CGRect {
+        guard srcW > 0, srcH > 0, dstW > 0, dstH > 0 else { return .zero }
+        let scale = max(dstW / srcW, dstH / srcH)
+        let drawW = srcW * scale
+        let drawH = srcH * scale
+        return CGRect(x: (dstW - drawW) / 2, y: (dstH - drawH) / 2, width: drawW, height: drawH)
+    }
+
+    nonisolated static func jpegCover(_ cg: CGImage, width: Int, height: Int) -> Data? {
+        guard width > 0, height > 0 else { return nil }
+        let rect = coverDrawRect(srcW: CGFloat(cg.width), srcH: CGFloat(cg.height),
+                                 dstW: CGFloat(width), dstH: CGFloat(height))
+        guard let ctx = CGContext(
+            data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+        ) else { return nil }
+        ctx.interpolationQuality = .high
+        ctx.draw(cg, in: rect)
+        guard let out = ctx.makeImage() else { return nil }
+        let rep = NSBitmapImageRep(cgImage: out)
+        return rep.representation(using: .jpeg, properties: [.compressionFactor: 0.85])
+    }
+
+    /// 24 fps JPEG frames, cover-fit to the output grid, snapped to `8n+1`
+    /// and capped at 121. `editedFirstPath` replaces frame 0. Not the chat
+    /// sampler and not the H3 reference payload.
+    nonisolated static func guideFramePayload(path: String, width: Int, height: Int, editedFirstPath: String?) async -> [String]? {
+        let asset = AVURLAsset(url: URL(fileURLWithPath: path))
+        guard let duration = try? await asset.load(.duration) else { return nil }
+        let seconds = CMTimeGetSeconds(duration)
+        guard seconds.isFinite, seconds > 0 else { return nil }
+        let count = guideFrameCount(available: Int(seconds * 24.0))
+        guard count > 0 else { return nil }
+
+        let gen = AVAssetImageGenerator(asset: asset)
+        gen.appliesPreferredTrackTransform = true
+        gen.requestedTimeToleranceBefore = .zero
+        gen.requestedTimeToleranceAfter = .zero
+
+        var frames: [String] = []
+        frames.reserveCapacity(count)
+        for t in refFrameTimes(count: count, fps: 24) {
+            let time = CMTime(seconds: t, preferredTimescale: 24_000)
+            guard let cg = try? await gen.image(at: time).image,
+                  let jpeg = jpegCover(cg, width: width, height: height) else { return nil }
+            frames.append(jpeg.base64EncodedString())
+        }
+        if let edited = editedFirstPath, !edited.isEmpty {
+            guard let img = NSImage(contentsOfFile: edited),
+                  let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil),
+                  let jpeg = jpegCover(cg, width: width, height: height) else { return nil }
+            frames[0] = jpeg.base64EncodedString()
+        }
+        return frames
+    }
 
     /// How many frames of a reference clip to actually ship. H3's ladder is
     /// 17k+5 and the SERVER snaps DOWN, so anything past the snapped count is

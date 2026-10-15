@@ -5,7 +5,7 @@ Native Zig server running MLX-format LMs on Apple Silicon; OpenAI/Anthropic/Olla
 ## Detail map (read on demand)
 
 - `docs/reference.md` — deep detail: per-file contracts, media-gen schemas, API surfaces, LAN design, observability, embedded engines, arch numerics (dsv4/inkling/H3, Kokoro, runtime LoRA), website/tier list, licensing. Read its section BEFORE deep work on a subsystem.
-- `docs/gotchas/{tool-calling,server-http,engine-mlx,models-media,app}.md` — full war stories behind every rule in `## Rules`.
+- `docs/gotchas/{tool-calling,server-http,engine-mlx,models-media,app,repo-topology}.md` — full war stories behind every rule in `## Rules` (repo-topology: remotes/branches, sidecar, H3 Timeline dependency).
 - `tests/CLAUDE.md` — integration-test matrix. `app/CLAUDE.md` — Swift app layout + rules (auto-load in their dirs).
 - Skills: `/release` (pre-release checklist, CalVer, CHANGELOG), `/bench` (llmprobe methodology + comparison traps).
 - `containers/{agent-shell-mlxserve,guest-kernel}/` — Agent Sandbox guest image + kernel, two pinned artifacts that BUMP TOGETHER. Detail: `docs/reference.md`.
@@ -102,6 +102,12 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dslow-tests -
 
 - Process/CalVer/CHANGELOG: `/release`. Per-release perf gate = `./tests/bench.sh` on the FINAL tree vs the previous column in `benchmarks.md` (ONE new column per release).
 - Methodology: `/bench` (llmprobe measures; bench.sh drives mlx-serve, `--url` probes another engine). Only diff same-methodology cells (llmprobe from 26.8); spec cells are variance — sample across runs/boot-orders, same-session ratios only, name the engine in every win, and an A/B arm is proven by ENGAGEMENT lines in its log. Record = `benchmarks.md` + `~/claude-tmp/bench-<tag>/`.
+
+## Remotes & branch topology (READ FIRST before any git push)
+
+- `origin` = **ddalcu/mlx-serve upstream — NEVER push**. `fork` = j-srodka/mlx-serve; its `main` is the ddalcu-STAGING mirror (pull upstream there, review, then integrate into `local/ornith-h3`) — never push custom work to it; branch push targets only.
+- Custom/H3 work lives on `local/ornith-h3` and IS committed in the parent (intentional) + pushed to `fork/local/ornith-h3`; branch backups live at `fork/backup/*`; never `git clean -fd` without a pathspec.
+- Sidecar `~/Github/mlx-serve/local` (repo j-srodka/mlx-serve-local) = patch/overlay backup: `./local/export.sh` BEFORE a parent commit, again AFTER (bumps `BASE`); `./local/apply.sh` after upstream ff. Detail: `docs/gotchas/repo-topology.md`.
 
 ## Conventions
 

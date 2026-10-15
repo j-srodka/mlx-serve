@@ -627,6 +627,10 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// reference has no keyframe row to anchor, so on H3 this rides the same
     /// partition complement as Turbo and chaining.
     var supportsLastFrame: Bool = false
+    /// Source-video guide (`ref_video_frames`): an edited first frame plus the
+    /// clip, VAE-encoded as one in-context sequence. LTX only. H3's reference
+    /// clips are `ref_videos`, a different contract.
+    var supportsVideoInput: Bool = false
     /// Denoising-step range the Steps slider offers. LTX's is the default; a
     /// backend whose floor is higher declares it, because a slider that goes
     /// somewhere the model does not work is a dead range, not a fast option.
@@ -805,17 +809,29 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// Frame counts offerable at this canvas: the `8N+1` ladder trimmed to what
     /// one response can carry. Always returns at least the first rung, so the
     /// picker can never render blank.
-    func frameOptions(width: Int, height: Int, chainWindows: Int = 1) -> [Int] {
+    func frameOptions(width: Int, height: Int, chainWindows: Int = 1,
+                      latentPrefixFrames: Int = 0) -> [Int] {
         let fits = frameOptions.filter {
-            framePayloadFits(width: width, height: height, numFrames: $0, chainWindows: chainWindows)
+            framePayloadFits(width: width, height: height, numFrames: $0,
+                             chainWindows: chainWindows, latentPrefixFrames: latentPrefixFrames)
         }
         return fits.isEmpty ? Array(frameOptions.prefix(1)) : fits
     }
 
+    /// Source-frame overlap for FL2VA latent-tail chaining (22 px = 7 video-latent rows).
+    static let chainLatentPrefixOverlapFrames = 22
+
     /// Frames one request DELIVERS: chained windows join end to end and ride
-    /// back in a single response (#283).
-    static func deliveredFrames(perWindow: Int, chainWindows: Int) -> Int {
+    /// back in a single response (#283). With `latentPrefixFrames` > 0 each seam
+    /// drops that many delivered frames (latent pin) instead of one.
+    static func deliveredFrames(perWindow: Int, chainWindows: Int,
+                                latentPrefixFrames: Int = 0) -> Int {
         let w = max(1, chainWindows)
+        let overlap = latentPrefixFrames > 0 ? latentPrefixFrames : 1
+        guard w > 1 else { return perWindow }
+        if latentPrefixFrames > 0 {
+            return perWindow * w - (w - 1) * overlap
+        }
         return perWindow * w - (w - 1)
     }
 
@@ -823,9 +839,11 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// the length ladder AND by the Generate gate: the ladder alone is a gate
     /// that can be walked around, because raising the window count after
     /// choosing a length shortens the ladder under a value already set.
-    func framePayloadFits(width: Int, height: Int, numFrames: Int, chainWindows: Int) -> Bool {
+    func framePayloadFits(width: Int, height: Int, numFrames: Int, chainWindows: Int,
+                          latentPrefixFrames: Int = 0) -> Bool {
         let perFrame = max(1, width * height * 3)
-        return Self.deliveredFrames(perWindow: numFrames, chainWindows: chainWindows)
+        return Self.deliveredFrames(perWindow: numFrames, chainWindows: chainWindows,
+                                    latentPrefixFrames: latentPrefixFrames)
             <= Self.maxFramePayloadBytes / perFrame
     }
 
@@ -917,7 +935,8 @@ struct VideoModelPreset: Identifiable, Hashable {
             maxFrames: cap,
             frameOptions: frameLadder(maxFrames: cap),
             description: "Generates short video clips from a text prompt (and optionally a starting image or audio track), with sound built in. The heaviest model here — it also pulls a Gemma text encoder on first use.",
-            supportsLastFrame: true
+            supportsLastFrame: true,
+            supportsVideoInput: true
         )
     }()
 
@@ -956,6 +975,7 @@ struct VideoModelPreset: Identifiable, Hashable {
             frameOptions: frameLadder(maxFrames: cap),
             description: "The newest LTX. Generates short video clips with sound from a text prompt, and optionally a starting image or audio track. Ships its own text encoder, so nothing extra downloads on first use.",
             supportsLastFrame: true,
+            supportsVideoInput: true,
             shipsOwnTextEncoder: true
         )
     }()
@@ -994,6 +1014,7 @@ struct VideoModelPreset: Identifiable, Hashable {
             frameOptions: frameLadder(maxFrames: cap),
             description: "The sharpest LTX we ship. Same model as the 4-bit pack at twice the weight precision — noticeably more detail in faces, fur and fine texture, for about the same generation time. Needs a Mac with plenty of memory.",
             supportsLastFrame: true,
+            supportsVideoInput: true,
             shipsOwnTextEncoder: true,
             supportsDiffusionDecoder: true
         )
@@ -2109,6 +2130,9 @@ struct VideoGenRequest {
     /// first frame sets the geometry and this one follows it, so a pair with
     /// mismatched aspects still produces a clean landing.
     var lastFrameImagePath: String? = nil
+    /// LTX source clip for the in-context guide. Frames are extracted at 24 fps.
+    /// A first-frame image, when set, replaces frame 0 of that clip.
+    var guideVideoPath: String? = nil
     /// Optional speech/audio clip for audio-to-video: the soundtrack is frozen
     /// as conditioning (voices, lip sync and performance follow it) and the
     /// ORIGINAL clip is muxed into the mp4. Any AVFoundation-readable format;
@@ -2135,6 +2159,10 @@ struct VideoGenRequest {
     /// Chained windows (H3 fl2va): number of `numFrames`-frame windows joined
     /// by keyframe conditioning. 1 = a single ordinary window.
     var chainWindows: Int = 1
+    /// Latent-tail chain (H3 fl2va): pin the previous window's latent tail into
+    /// the next sample instead of re-encoding the last pixel. Sent as
+    /// `latent_prefix_frames` only with `chainWindows` > 1.
+    var latentPrefixChain: Bool = false
     /// Steps for LTX's two-stage refine pass (`stage2_steps`). 0 = Auto, which
     /// is the server's own "all 3" — sent only when the user picks a number,
     /// so the absent field keeps meaning the default everywhere.
