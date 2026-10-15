@@ -5239,6 +5239,9 @@ pub fn latentPrefixRequestError(
 }
 
 /// `supports_fl2va` as in `latentPrefixRequestError`.
+/// `chain_windows` no longer participates: a suffix pin has always required its
+/// path (the next check), and a path may now seed a chain's final window as
+/// well as a single one — so any chain depth is fine.
 pub fn latentSuffixRequestError(
     latent_suffix_frames: u32,
     chain_windows: u32,
@@ -5246,8 +5249,8 @@ pub fn latentSuffixRequestError(
     supports_fl2va: bool,
     has_latent_suffix_path: bool,
 ) ?[]const u8 {
+    _ = chain_windows;
     if (latent_suffix_frames == 0) return null;
-    if (chain_windows != 1) return "latent_suffix_frames requires chain_windows == 1";
     if (!has_latent_suffix_path) return "latent_suffix_frames requires latent_suffix_path";
     if (!supports_fl2va) return "latent_suffix_frames is FL2VA only — load an FL2VA checkpoint";
     if (window_frames == 1) return "num_frames 1 is a still and cannot use latent_suffix_frames";
@@ -5667,13 +5670,25 @@ fn generateChain(
         // seed+1 (video/audio).
         wreq.seed = req.seed +% 2 * @as(u64, @intCast(w));
         wreq.keyframes = kfs[0..nk];
+        // Prefix pin per window: the in-memory continuation for w > 0; a
+        // file-seeded head (sidecar path with a chain) lands on window 0 —
+        // it opens on the sidecar's tail held for latent_prefix_frames.
         if (latent_chain and w > 0) {
             wreq.chain_prefix_video_latent = prev_vlat;
             wreq.chain_prefix_audio_latent = prev_alat;
+        } else if (w == 0 and req.chain_prefix_video_latent != null) {
+            wreq.chain_prefix_video_latent = req.chain_prefix_video_latent;
+            wreq.chain_prefix_audio_latent = req.chain_prefix_audio_latent;
         } else {
             wreq.chain_prefix_video_latent = null;
             wreq.chain_prefix_audio_latent = null;
         }
+        // Suffix pins are a FINAL-window-only concern: `var wreq = req` would
+        // otherwise carry the file-seeded head pin into every window. The
+        // final window then finishes at the sidecar's head — its pinned rows
+        // are part of its grid, so the joined output ends at the file's
+        // content and the delivered-frame math (overlap-only, prefix-side) is
+        // untouched.
 
         var cp: ChainProgress = undefined;
         var wprog: ?gen_sse.Progress = null;
@@ -7836,8 +7851,13 @@ test "minimax h3: chain math — delivered frames, overlap width, cross-fade sea
     try testing.expect(latentPrefixRequestError(22, 2, 56, false, false) != null);
     try testing.expect(latentPrefixRequestError(22, 2, 56, true, false) == null);
     try testing.expect(latentPrefixRequestError(22, 1, 56, true, true) == null);
+    try testing.expect(latentPrefixRequestError(22, 2, 56, true, true) == null);
     try testing.expect(latentSuffixRequestError(22, 1, 56, true, true) == null);
-    try testing.expect(latentSuffixRequestError(22, 2, 56, true, true) != null);
+    // A suffix pin may now seed a chain's final window, not only single windows:
+    // the helper's chain_windows == 1 gate is gone (a suffix pin always requires
+    // its path; a path may bind at any chain depth).
+    try testing.expect(latentSuffixRequestError(22, 2, 56, true, true) == null);
+    try testing.expect(latentSuffixRequestError(22, 1, 56, true, false) != null);
     // A REF2VA-only pack refuses both pin kinds.
     try testing.expect(latentPrefixRequestError(22, 2, 56, false, true) != null);
     try testing.expect(latentSuffixRequestError(22, 1, 56, false, true) != null);

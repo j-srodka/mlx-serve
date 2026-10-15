@@ -4317,12 +4317,12 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         return sendError(conn, 400, msg);
     if (has_latent_prefix_path and latent_prefix_frames == 0)
         return sendError(conn, 400, "latent_prefix_path requires latent_prefix_frames");
-    if (has_latent_prefix_path and chain_windows != 1)
-        return sendError(conn, 400, "latent_prefix_path requires chain_windows == 1");
+    // A sidecar path may now seed a chain's ENDS in addition to single windows:
+    // prefix (window 0 opens on the file's tail) and suffix (the final window
+    // finishes at the file's head). The path-to-frame count requirements above
+    // still hold; pin depth is per window and validated by the helpers.
     if (has_latent_suffix_path and latent_suffix_frames == 0)
         return sendError(conn, 400, "latent_suffix_path requires latent_suffix_frames");
-    if (has_latent_suffix_path and chain_windows != 1)
-        return sendError(conn, 400, "latent_suffix_path requires chain_windows == 1");
     if (has_latent_out and !engine.supports_fl2va)
         return sendError(conn, 400, "latent_out is FL2VA only — load an FL2VA checkpoint");
     if (has_latent_out and shape.frame_count == 1)
