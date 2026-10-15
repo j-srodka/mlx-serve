@@ -2414,10 +2414,10 @@ pub const Model = struct {
 
     pub fn deinit(self: *Model) void {
         for ([_]mlx.mlx_array{
-            self.video_patch_w, self.video_patch_b, self.audio_patch_w, self.audio_patch_b,
-            self.condition_bias, self.te_in_w,      self.te_in_b,       self.te_out_w,
-            self.te_out_b,      self.inv_freq,      self.final_norm,    self.video_out_w,
-            self.video_out_b,   self.audio_out_w,   self.audio_out_b,   self.refiner_final_norm,
+            self.video_patch_w,  self.video_patch_b, self.audio_patch_w, self.audio_patch_b,
+            self.condition_bias, self.te_in_w,       self.te_in_b,       self.te_out_w,
+            self.te_out_b,       self.inv_freq,      self.final_norm,    self.video_out_w,
+            self.video_out_b,    self.audio_out_w,   self.audio_out_b,   self.refiner_final_norm,
         }) |a| _ = mlx.mlx_array_free(a);
         self.condition_proj.deinit();
         for (self.refiner) |*b| b.deinit();
@@ -2554,10 +2554,10 @@ pub const Model = struct {
             }
         };
         for ([_]mlx.mlx_array{
-            self.video_patch_w, self.video_patch_b, self.audio_patch_w, self.audio_patch_b,
-            self.condition_bias, self.te_in_w,      self.te_in_b,       self.te_out_w,
-            self.te_out_b,      self.inv_freq,      self.final_norm,    self.video_out_w,
-            self.video_out_b,   self.audio_out_w,   self.audio_out_b,   self.refiner_final_norm,
+            self.video_patch_w,  self.video_patch_b, self.audio_patch_w, self.audio_patch_b,
+            self.condition_bias, self.te_in_w,       self.te_in_b,       self.te_out_w,
+            self.te_out_b,       self.inv_freq,      self.final_norm,    self.video_out_w,
+            self.video_out_b,    self.audio_out_w,   self.audio_out_b,   self.refiner_final_norm,
         }) |x| push.arr(vec, x);
         push.lin(vec, &self.condition_proj);
         for (self.refiner) |*b| {
@@ -4266,7 +4266,7 @@ fn bindLoras(allocator: std.mem.Allocator, stack: *lora_mod.Stack, model: *Model
     for (stack.paths[0..stack.count], stack.scales[0..stack.count], counts[0..stack.count], 0..) |p, sc, n, i| {
         const is_turbo = turbo and i == 0;
         log.info("[minimax-h3] lora {d}/{d}: {d}/{d} modules, scale {d:.2}{s} — {s}\n", .{
-            i + 1,          stack.count, n, Model.LORA_TARGETS, sc,
+            i + 1,                            stack.count,             n, Model.LORA_TARGETS, sc,
             if (is_turbo) " (turbo)" else "", std.fs.path.basename(p),
         });
         // A style LoRA legitimately targets a subset, but matching NOTHING means the file is for
@@ -5256,6 +5256,30 @@ pub fn latentSuffixRequestError(
     return null;
 }
 
+/// Named refusal for the keyframe × latent-sidecar binding (HTTP 400, `null` = ok).
+/// Per side: the pin owns the row block at its edge of the window — the anchor for
+/// the same edge fights the pin for the same latent frames, and `generateOne` would
+/// just overlay them silently (pins are latent rows in `PackedLayout`; the anchor is
+/// pixel conditioning). The engine precedent (`generateChain`) pairs the FINAL
+/// window's user `.last` anchor with a prefix pin and window 0's user `.first` anchor
+/// with nothing, so the fighting combos are exactly these two; the mirror combos
+/// (`.last` + prefix pin, `.first` + suffix pin) are legal. Only pin PATHS are scoped
+/// here — `latent_prefix_frames` without a path is the in-memory chain, already proven
+/// with keyframes (window 0 takes the user anchor, later windows pin the previous
+/// window's latents).
+pub fn keyframeSidecarBindingError(
+    has_first_anchor: bool,
+    has_last_anchor: bool,
+    has_latent_prefix_path: bool,
+    has_latent_suffix_path: bool,
+) ?[]const u8 {
+    if (has_first_anchor and has_latent_prefix_path)
+        return "a first-frame anchor cannot combine with a prefix pin — the pin owns the window's opening";
+    if (has_last_anchor and has_latent_suffix_path)
+        return "a last-frame anchor cannot combine with a suffix pin — the pin owns the window's ending";
+    return null;
+}
+
 pub fn latentPinWindowError(
     latent_prefix_frames: u32,
     latent_suffix_frames: u32,
@@ -5889,8 +5913,8 @@ test "minimax h3 live: generates a clip" {
 
     const prompt = envStr("MINIMAX_H3_PROMPT") orelse
         "A calico cat sits on a sunlit windowsill, slowly blinking as it watches rain streak down the glass. " ++
-        "The camera holds steady in a close medium shot. Warm afternoon light rims the cat's fur against the cool grey outside. " ++
-        "overall_soundscape: steady rainfall against glass with a soft room tone and the cat's quiet purring.";
+            "The camera holds steady in a close medium shot. Warm afternoon light rims the cat's fur against the cool grey outside. " ++
+            "overall_soundscape: steady rainfall against glass with a soft room tone and the cat's quiet purring.";
 
     var res = try generate(a, io, .{
         .tokenizer_dir = tokdir,
@@ -6596,9 +6620,9 @@ test "minimax h3: reference sizing matches the reference node" {
         );
         testing.expectEqual(jsonU32(o.get("out_w").?), got.w) catch |e| {
             std.debug.print("image {d}x{d} gen {d}x{d} {s}: w {d}\n", .{
-                jsonU32(o.get("in_w").?), jsonU32(o.get("in_h").?),
+                jsonU32(o.get("in_w").?),  jsonU32(o.get("in_h").?),
                 jsonU32(o.get("gen_w").?), jsonU32(o.get("gen_h").?),
-                o.get("mode").?.string, got.w,
+                o.get("mode").?.string,    got.w,
             });
             return e;
         };
@@ -7819,6 +7843,25 @@ test "minimax h3: chain math — delivered frames, overlap width, cross-fade sea
     try testing.expect(latentSuffixRequestError(22, 1, 56, false, true) != null);
     try testing.expect(latentPinWindowError(22, 22, 73) == null);
     try testing.expect(latentPinWindowError(56, 56, 73) != null);
+    // Per-side pin × anchor binding (the guardrail split, keyframe x sidecar):
+    // the fighting edges are named 400s; the mirror combos and anchor-free
+    // requests pass; only pin PATHS participate.
+    try testing.expect(keyframeSidecarBindingError(true, false, true, false) != null);
+    try testing.expect(keyframeSidecarBindingError(false, true, false, true) != null);
+    try testing.expect(keyframeSidecarBindingError(true, true, true, true) != null);
+    try testing.expect(keyframeSidecarBindingError(false, true, true, false) == null); // .last + prefix pin
+    try testing.expect(keyframeSidecarBindingError(true, false, false, true) == null); // .first + suffix pin
+    try testing.expect(keyframeSidecarBindingError(true, false, false, false) == null); // anchor, no pin path
+    try testing.expect(keyframeSidecarBindingError(false, false, true, true) == null); // pins, no anchors
+    // The refusal messages carry the per-side ownership rationale (app surfaces them verbatim).
+    try testing.expectEqualStrings(
+        "a first-frame anchor cannot combine with a prefix pin — the pin owns the window's opening",
+        keyframeSidecarBindingError(true, false, true, false).?,
+    );
+    try testing.expectEqualStrings(
+        "a last-frame anchor cannot combine with a suffix pin — the pin owns the window's ending",
+        keyframeSidecarBindingError(false, true, false, true).?,
+    );
     // One video frame of audio at 32 kHz / 24 fps.
     try testing.expectEqual(@as(usize, 1333), CHAIN_OVERLAP_SAMPLES);
 

@@ -112,11 +112,11 @@ pub const Modality = enum {
 /// "unsupported model_type" while the engine that serves it was ready and
 /// waiting. The test at the bottom of this file pins them together.
 pub const media_model_types = [_][]const u8{
-    "flux2",     "krea",       "mage_flow",      "mageflow",
-    "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
-    "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image",
-    "laya",      "kev",        "clef",           "d1",
-    "stable_audio3", "yue2",      "nemotron_diarization",
+    "flux2",         "krea",       "mage_flow",            "mageflow",
+    "qwen3_tts",     "acestep",    "kokoro",               "AudioVideo",
+    "hunyuan3d",     "minimax_h3", "minimax_music3",       "qwen_image",
+    "laya",          "kev",        "clef",                 "d1",
+    "stable_audio3", "yue2",       "nemotron_diarization",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
@@ -3760,7 +3760,6 @@ fn stereoInterleavedToArray(allocator: std.mem.Allocator, pcm: []const f32) !mlx
 /// generation then succeeds while ignoring what the user asked it to follow.
 ///
 /// `err_buf` backs the messages that name an index; the rest are literals.
-
 /// Parse `ref_mod_paths` into pre-encoded RefMod latents (no PNG decode).
 fn parseH3RefMods(
     io: std.Io,
@@ -4367,6 +4366,8 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     // canvas (the geometry anchor), last = aspect-preserving center-COVER.
     var keyframes_buf: [2]minimax_h3.Keyframe = undefined;
     var n_kf: usize = 0;
+    var kf_has_first = false;
+    var kf_has_last = false;
     defer for (keyframes_buf[0..n_kf]) |kf| {
         _ = mlx.mlx_array_free(kf.pixels);
         if (kf.vision) |v| _ = mlx.mlx_array_free(v);
@@ -4380,6 +4381,10 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     const vision_differs = vfit.h != height or vfit.w != width;
     inline for (.{ .{ "first_frame_image", minimax_h3.KeyframeAnchor.first }, .{ "last_frame_image", minimax_h3.KeyframeAnchor.last } }) |spec| {
         if (extractJsonString(body, spec[0])) |raw_img| {
+            switch (spec[1]) {
+                .first => kf_has_first = true,
+                .last => kf_has_last = true,
+            }
             const b64 = try jsonUnescape(allocator, raw_img);
             defer allocator.free(b64);
             if (b64.len > 0) {
@@ -4453,8 +4458,15 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         return sendError(conn, 400, "latent_prefix_frames cannot be used with references or ref_mod_paths");
     if (latent_suffix_frames > 0 and (has_live_refs or has_ref_mod_fields or refs.items.len > 0))
         return sendError(conn, 400, "latent_suffix_frames cannot be used with references or ref_mod_paths");
-    if ((has_latent_out or has_latent_prefix_path or has_latent_suffix_path) and (has_live_refs or has_ref_mod_fields or refs.items.len > 0 or n_kf > 0))
-        return sendError(conn, 400, "latent sidecar fields cannot be used with references, ref_mod_paths, or keyframes");
+    // The keyframes part of the old lumped check was the conservative piece:
+    // anchors and sidecar pins bind disjoint row blocks EXCEPT the two fighting
+    // edges named below. `latent_out` stays orthogonal — it writes the finished
+    // run's latents after generation returns, nothing to do with conditioning.
+    if ((has_latent_out or has_latent_prefix_path or has_latent_suffix_path) and (has_live_refs or has_ref_mod_fields or refs.items.len > 0))
+        return sendError(conn, 400, "latent sidecar fields cannot be used with references or ref_mod_paths");
+    // Per-side pin × anchor binding — pure fn, hermetically tested in minimax_h3.zig.
+    if (minimax_h3.keyframeSidecarBindingError(kf_has_first, kf_has_last, has_latent_prefix_path, has_latent_suffix_path)) |msg|
+        return sendError(conn, 400, msg);
     if (has_latent_out) {
         const raw = latent_out_raw.?;
         const path = try jsonUnescape(allocator, raw);
@@ -4799,34 +4811,34 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
     // A guide owns frame 0. `first_frame_image` replaces that pixel and does
     // not also pin the canvas (the i2v path below).
     if (std.mem.indexOf(u8, body, "\"ref_video_frames\"") == null) {
-    if (extractJsonString(body, "first_frame_image")) |raw_img| {
-        if (engine.vae_encoder) |*ve| {
-            const b64 = try jsonUnescape(allocator, raw_img); // handles \/ from Swift JSONSerialization
-            defer allocator.free(b64);
-            if (b64.len > 0) {
-                if (imageB64Alloc(allocator, b64)) |img_bytes| {
-                    defer allocator.free(img_bytes);
-                    const enc_h = (height / 32) * 32;
-                    const enc_w = (width / 32) * 32;
-                    if (decodeImageToBCFHW(allocator, img_bytes, enc_h, enc_w, engine.s)) |arr| {
-                        cond_img = arr;
-                        enc_ptr = ve;
-                        log.info("[video] image-to-video: first frame {d}x{d}\n", .{ enc_h, enc_w });
-                    } else log.warn("[video] first_frame_image decode failed — text-to-video\n", .{});
-                    // Two-stage conditions stage 1 at the half-resolution grid
-                    // (the reference re-prepares the image per stage).
-                    if (pipeline != .one_stage and cond_img != null) {
-                        const half_h = ((height / 2) / 32) * 32;
-                        const half_w = ((width / 2) / 32) * 32;
-                        cond_img_half = decodeImageToBCFHW(allocator, img_bytes, half_h, half_w, engine.s);
-                        if (cond_img_half == null) log.warn("[video] half-res first frame decode failed — stage 1 unconditioned\n", .{});
-                    }
-                } else |e| log.warn("[video] first_frame_image base64 decode failed: {} — text-to-video\n", .{e});
+        if (extractJsonString(body, "first_frame_image")) |raw_img| {
+            if (engine.vae_encoder) |*ve| {
+                const b64 = try jsonUnescape(allocator, raw_img); // handles \/ from Swift JSONSerialization
+                defer allocator.free(b64);
+                if (b64.len > 0) {
+                    if (imageB64Alloc(allocator, b64)) |img_bytes| {
+                        defer allocator.free(img_bytes);
+                        const enc_h = (height / 32) * 32;
+                        const enc_w = (width / 32) * 32;
+                        if (decodeImageToBCFHW(allocator, img_bytes, enc_h, enc_w, engine.s)) |arr| {
+                            cond_img = arr;
+                            enc_ptr = ve;
+                            log.info("[video] image-to-video: first frame {d}x{d}\n", .{ enc_h, enc_w });
+                        } else log.warn("[video] first_frame_image decode failed — text-to-video\n", .{});
+                        // Two-stage conditions stage 1 at the half-resolution grid
+                        // (the reference re-prepares the image per stage).
+                        if (pipeline != .one_stage and cond_img != null) {
+                            const half_h = ((height / 2) / 32) * 32;
+                            const half_w = ((width / 2) / 32) * 32;
+                            cond_img_half = decodeImageToBCFHW(allocator, img_bytes, half_h, half_w, engine.s);
+                            if (cond_img_half == null) log.warn("[video] half-res first frame decode failed — stage 1 unconditioned\n", .{});
+                        }
+                    } else |e| log.warn("[video] first_frame_image base64 decode failed: {} — text-to-video\n", .{e});
+                }
+            } else {
+                log.warn("[video] vae_encoder not loaded — ignoring first_frame_image (text-to-video)\n", .{});
             }
-        } else {
-            log.warn("[video] vae_encoder not loaded — ignoring first_frame_image (text-to-video)\n", .{});
         }
-    }
     }
 
     // Last-frame anchor (#260): `last_frame_image` pins the LAST latent frame
@@ -4896,8 +4908,7 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
         const keep: usize = ltx.snapGuideFrameCount(@intCast(blobs.items.len));
         if (keep == 0) return sendError(conn, 400, "'ref_video_frames' is empty");
 
-        const ve = if (engine.vae_encoder) |*e| e else
-            return sendError(conn, 400, "ref_video_frames needs vae_encoder.safetensors — download it into the model dir");
+        const ve = if (engine.vae_encoder) |*e| e else return sendError(conn, 400, "ref_video_frames needs vae_encoder.safetensors — download it into the model dir");
         enc_ptr = ve;
 
         var replaced: ?[]u8 = null;
@@ -6524,11 +6535,11 @@ test "stable_audio3 is a sound backend on its own route, with named bounds" {
     try testing.expectEqual(SoundParams{ .seconds = 15, .steps = 8 }, parseSoundParams(a, "{\"duration_seconds\":1.5e1,\"steps\":8.0}").ok);
     // Every field the endpoint cannot honor is a 400 naming it, never a silent default.
     const bad = [_][2][]const u8{
-        .{ "{\"duration_seconds\":0}", "duration_seconds" },   .{ "{\"duration_seconds\":121}", "duration_seconds" },
+        .{ "{\"duration_seconds\":0}", "duration_seconds" },      .{ "{\"duration_seconds\":121}", "duration_seconds" },
         .{ "{\"duration_seconds\":\"10\"}", "duration_seconds" }, .{ "{\"steps\":0}", "steps" },
-        .{ "{\"steps\":51}", "steps" },                     .{ "{\"steps\":-5}", "steps" },
-        .{ "{\"steps\":4.9}", "steps" },                    .{ "{\"seed\":-1}", "seed" },
-        .{ "{\"seed\":\"x\"}", "seed" },                    .{ "not json", "JSON" },
+        .{ "{\"steps\":51}", "steps" },                           .{ "{\"steps\":-5}", "steps" },
+        .{ "{\"steps\":4.9}", "steps" },                          .{ "{\"seed\":-1}", "seed" },
+        .{ "{\"seed\":\"x\"}", "seed" },                          .{ "not json", "JSON" },
     };
     for (bad) |c| {
         const msg = parseSoundParams(a, c[0]).bad;
