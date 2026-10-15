@@ -211,6 +211,13 @@ const apiReference = [
   },
   {
     method: "POST",
+    path: "/v1/video/refmods",
+    description: N(
+      "MiniMax-H3. Generate reference-modulated extractions from a loaded H3 engine (FL2VA latent tooling)",
+    ),
+  },
+  {
+    method: "POST",
     path: "/v1/3d/generations",
     description: N(
       "Hunyuan3D-2.1 \u00b7 one photo \u2192 GLB mesh \u00b7 optional PBR texturing",

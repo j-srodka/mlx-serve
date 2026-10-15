@@ -156,6 +156,18 @@ they first speak (up to eight), a segment closing where the speaker changes. It
 needs the diarizer, a model with the `diarization` capability (the app downloads
 `mlx-community/Nemotron-3-Diarization-8bit` with the ASR); without it, a 400.
 
+## Video: `POST /v1/video/refmods`
+
+MiniMax-H3 reference-modulation extractions (FL2VA latent tooling):
+
+| field | notes |
+|---|---|
+| `ref_mod_paths` | on-disk paths to refmod packs; server-host only (like `lora_paths`) |
+
+The route answers 400 by name on anything an H3 engine without the refmod
+surface can serve; LTX-targeted requests are wrong-modality 400s. LAN callers
+can address it (model-gated, like `POST /v1/video/generations`).
+
 ## Video: `POST /v1/video/generations`
 
 | field | notes |

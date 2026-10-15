@@ -5153,7 +5153,7 @@ fn generateOne(
 /// each seam (1 = pixel keyframe chain; larger = latent-prefix overlap).
 pub fn chainDeliveredFrames(windows: u32, window_frames: u32, overlap: u32) u32 {
     const ov: u32 = if (overlap == 0) 1 else overlap;
-    return windows * window_frames - (windows - 1) * ov;
+    return windows *| window_frames -| (windows - 1) *| ov;
 }
 
 /// Legal overlap ladder steps for prefix/suffix pins (source frames).

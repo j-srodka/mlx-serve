@@ -8043,6 +8043,7 @@ fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: 
         .video => lm.video_engine != null,
         .mesh => lm.mesh_engine != null,
         .decision => lm.decision_engine != null,
+        .diarization => lm.diarization_engine != null,
     } and switch (route) {
         // The H3 extract route has no LTX counterpart. Without this gate the job
         // returns WrongModality after the modality check and genJobRun only logs
@@ -8051,7 +8052,6 @@ fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: 
             .h3 => true,
             .ltx => false,
         } else false,
-        .diarization => lm.diarization_engine != null,
         else => true,
     };
     if (!ok) {
