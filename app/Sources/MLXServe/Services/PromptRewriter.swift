@@ -15,6 +15,8 @@ enum PromptRewriter {
         var firstFrame: Data? = nil
         /// What the model must do with the picture; said only when it is sent.
         var firstFrameRule = ""
+        /// MOSS-Image: the canvas a layout draft in the reply compiles to (`finish`).
+        var layoutCanvas: MossLayout.Canvas? = nil
 
         /// The user message, with the picture's rule when the picture goes along.
         func user(seeingImage: Bool) -> String {
@@ -31,16 +33,73 @@ enum PromptRewriter {
         makes the video cut away from the picture.
         """
 
-    static func image(text: String, editing: Bool, groups: [ImagePromptExampleGroup]) -> Request {
+    /// `denseText`: the model renders whole layouts of text (`rendersDenseText`),
+    /// so a picture with text is written as Qwen's own prompt enhancer writes it.
+    /// `mossCanvas`: MOSS-Image, whose reply may be a pixel layout draft for
+    /// that canvas (compiled by `finish`).
+    static func image(text: String, editing: Bool, groups: [ImagePromptExampleGroup], denseText: Bool,
+                      mossCanvas: MossLayout.Canvas? = nil) -> Request {
         // An edit repertoire has up to eight groups: two each keeps the system prompt short.
         let examples = groups.flatMap { $0.examples.prefix(2) }.map(\.body)
-        return editing
-            ? request(noun: "image edit instruction",
-                      shape: "Write ONE imperative instruction about the attached picture, like the examples: what to change and what must stay the same.",
-                      examples: examples, text: text)
-            : request(noun: "image prompt",
-                      shape: "Write one or two sentences of plain prose like the examples: subject, setting, lighting, composition, medium. Quote any text that must appear in the picture.",
-                      examples: examples, text: text)
+        if editing {
+            return request(noun: "image edit instruction",
+                           shape: "Write ONE imperative instruction about the attached picture, like the examples: what to change and what must stay the same.",
+                           examples: examples, text: text)
+        }
+        if let canvas = mossCanvas {
+            var r = request(noun: "image prompt", shape: mossShape(canvas), examples: examples, text: text)
+            r.layoutCanvas = canvas
+            return r
+        }
+        return request(noun: "image prompt", shape: denseText ? textLayoutShape : proseShape,
+                       examples: examples, text: text)
+    }
+
+    /// The reply as it goes into the prompt field: cleaned, and a MOSS-Image
+    /// draft compiled to the model's layout form.
+    static func finish(_ reply: String, request: Request) -> String {
+        let text = clean(reply)
+        guard let canvas = request.layoutCanvas else { return text }
+        return MossLayout.compile(text, canvas: canvas) ?? text
+    }
+
+    private static let proseShape = """
+        Write one or two sentences of plain prose like the examples: subject, setting, lighting, composition, medium. \
+        Put any text that must appear in the picture in double quotes, word for word: never drop, shorten or reword it.
+        """
+
+    /// Condensed from the text-image rules of Qwen-Image's prompt enhancer
+    /// (QwenLM/Qwen-Image `prompt_utils_2512.py`, Apache-2.0; see NOTICE).
+    /// A label the prompt only implies is a label the model invents, and an
+    /// invented label renders as gibberish.
+    private static let textLayoutShape = """
+        First decide whether the picture shows text: an infographic, poster, slide, chart, menu, sign, label or screen.
+        If it shows no text, write one or two sentences of plain prose like the photographic examples: subject, setting, lighting, composition, medium.
+        If it shows text, describe the whole layout like the infographic examples:
+        - Open with the kind of image, its style, background, colour palette and how it is divided.
+        - Then describe each region in reading order (header, sections, cards, chart, footer), one paragraph each; a hyphen may start an item, written as a descriptive phrase.
+        - Put every piece of visible text in double quotation marks, word for word, and say where it sits and its font, weight, colour and size.
+        - Keep the user's own text exactly as written: names, numbers, punctuation and capitalization.
+        - Where the user implies text without giving it (a chart, steps, a list, prices), write the exact short labels, numbers and words yourself. Never write a vague placeholder such as "some statistics" or "a list of features".
+        - Keep every label short: headings and phrases, never paragraphs.
+        - End with: All text is crisp, correctly spelled and perfectly legible. There is no other text in the image.
+        """
+
+    /// Condensed from MOSS-Image's own prompt enhancer skill
+    /// (OpenMOSS/MOSS-Image `skills/moss-image-prompt-enhancer`, Apache-2.0;
+    /// see NOTICE). The model drafts top-left pixel boxes; `MossLayout` does
+    /// the coordinate arithmetic it should never do itself.
+    private static func mossShape(_ c: MossLayout.Canvas) -> String {
+        """
+        Choose the deliverable. For an ordinary scene, photograph or illustration write a caption: cohesive prose describing the subject and action, setting, framing, medium, lighting, materials, palette and mood, with spatial relations in words and any visible text in double quotes, word for word. \
+        When exact text placement, a poster, several panels or controlled object positions matter, write a layout instead: ONE JSON object on a \(c.width)x\(c.height) pixel canvas:
+        {"width":\(c.width),"height":\(c.height),"bbox_coord_space":"abs","bbox_format":"xyxy","summary":{"meta":["poster"],"canvas":"single","caption":"the whole scene and its style"},"items":[{"label":"text","caption":"its typography and colour","text":"the exact words","bbox":[x_min,y_min,x_max,y_max]},{"label":"object","caption":"how it looks","bbox":[x_min,y_min,x_max,y_max]}]}
+        - Boxes are pixels from the top-left corner: x in 0...\(c.width), y in 0...\(c.height).
+        - label is object, character or text; a text item carries the exact visible characters in "text", with \\n for a line break.
+        - Write the real copy, never placeholders; keep the user's own wording exactly, in its language; size each text box so its words stay legible.
+        - summary.canvas is single, multi_panel or collage.
+        Reply with the caption as plain prose, or with the layout JSON alone.
+        """
     }
 
     static func video(text: String, format: VideoPromptFormat, seconds: Int, firstFrame: Data? = nil) -> Request {
@@ -90,8 +149,8 @@ enum PromptRewriter {
 
     private static func request(noun: String, shape: String, examples: [String], text: String, note: String = "") -> Request {
         Request(system: """
-                You rewrite \(noun)s for a generative model. \(shape) \
-                Keep the user's intent; make it more specific and evocative. Reply with ONLY the rewritten \(noun), no preamble, no quotes, no markdown.
+                You rewrite \(noun)s for a generative model. \(shape)
+                Keep the user's intent; make it more specific and evocative. Reply with ONLY the rewritten \(noun), no preamble, no surrounding quotes, no markdown.
 
                 Examples of the expected format:
 
@@ -100,9 +159,16 @@ enum PromptRewriter {
                 user: "Rewrite this \(noun):\n\n\(text)" + (note.isEmpty ? "" : "\n\n\(note)"))
     }
 
-    /// Model replies sometimes wear a fence or quotes; the editor gets the bare text.
+    /// Model replies sometimes wear a fence or quotes; the editor gets the bare
+    /// text. Only a WRAPPING pair goes: a prompt that ends on quoted text keeps
+    /// its closing quote.
     static func clean(_ reply: String) -> String {
-        AgentWriter.stripFences(reply).trimmingCharacters(in: CharacterSet(charactersIn: "\"\u{201C}\u{201D}"))
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = AgentWriter.stripFences(reply).trimmingCharacters(in: .whitespacesAndNewlines)
+        let quotes = CharacterSet(charactersIn: "\"\u{201C}\u{201D}")
+        guard text.count >= 2, let first = text.unicodeScalars.first, let last = text.unicodeScalars.last,
+              quotes.contains(first), quotes.contains(last) else { return text }
+        let inner = text.dropFirst().dropLast()
+        guard inner.unicodeScalars.allSatisfy({ !quotes.contains($0) }) else { return text }
+        return inner.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

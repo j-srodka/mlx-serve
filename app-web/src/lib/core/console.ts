@@ -231,6 +231,13 @@ const apiReference = [
     ),
   },
   {
+    method: "GET",
+    path: "/v1/load-progress",
+    description: N(
+      "Each model loading now: phase, done of total and seconds left",
+    ),
+  },
+  {
     method: "POST",
     path: "/v1/unload-model",
     description: N("Free a model's memory now"),

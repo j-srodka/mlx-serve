@@ -2,6 +2,22 @@
 
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
+### ModelOpt's NVFP4 global scale is not MLX's (NVIDIA Flash Next FP4)
+
+NVIDIA's pack loaded and chatted, but every image read as "a blank white canvas". The vision tower's NVFP4 linears were dequantized with `weight_scale_2` passed as MLX's `global_scale`. ModelOpt stores `weight_scale_2 = amax / (448 x 6)`; MLX's kernels divide its `global_scale` by 448 x 6 themselves, so every weight came out 2688x too small. Fix: `modelopt_pack.dequantDense` multiplies by 448 x 6 first. Guard: `ModelOpt NVFP4 dense dequant` checks code x e4m3 x `weight_scale_2` exactly. The routed experts never meet MLX's convention: their per-expert scales ride the gate and the routing weight.
+
+### RADIO configuration and numerics must follow the checkpoint
+
+Defect: native omni packs loaded text-only. Cause: vision keyed on a private `radio_vision` flag instead of `vision_config.model_type: "radio"`. Fix: loader and discovery share `model_discovery.hasRadioVision`; preprocessing follows the official float32 antialiased bicubic and float32 CPE (PIL's uint8 step moved pixels). Guards: native RADIO config tests, format corpus, the executed fp32 fixtures (cosine plus RMS ratio).
+
+### Native Nemotron wrappers retain more than an architecture tag
+
+Defect: Super's `nemotron_h_omni` pack was hidden in the app and failed to load. Cause: exact type lists and flat `backbone`/`mlp1` names. Fix: the language wrapper and `mlp1.layers` projector resolve from the checkpoint's names, quantization per linear; the native config's final vision LayerNorm before pixel shuffle is required. Guards: picker/type parity tests, nested/flat forwards, Super RADIO fixtures.
+
+### A LiLiCorr drafter can own its output head
+
+Defect: Super's drafter proposed through the target's head. Cause: DFlash ignored `has_own_lm_head`. Fix: a declared head is loaded and validated (geometry, token space) and used only for proposals; verify keeps the target head. Separately, `/v1/messages` dropped DFlash because it checked only the Gemma slot: all four surfaces now share `requestEnableDrafter`. Guards: native config corpus, head forwards, malformed-head tests, HTTP defaults on all four APIs.
+
 ### Metaspace `prepend_scheme: "first"` read as "always" (Mistral v0.3)
 The laya port added HF `Metaspace` support and treated every scheme except `never` as `always`, so Mistral's SentencePiece tokenizer got a ▁ after every special token (`[INST]Use` -> `▁Use`; HF gives `Use`). HF's `first` only prepends to text at original offset 0, and `always` does it per segment after added-token extraction.
 - Found by the smoke matrix: every Mistral cell's prompt grew 11 tokens. Part of that was CORRECT: 26.9.5 dropped every `\n` on byte-fallback tokenizers (no `<0x0A>`), which the same port fixed.
@@ -2046,6 +2062,13 @@ Cause: `lora.delta` multiplied the bf16 low-rank product by an f32 scalar ARRAY,
 Fix: `lora.addTo` = one skinny GEMM per adapter and `mlx_addmm`, whose epilogue adds onto the base output in its own dtype. H3 now steps at ~10 s with Turbo. flux/krea/LTX still call `deltaSum` and pay the same tax at their own row counts.
 Guard: `addTo equals y + deltaSum in y's dtype` (lora.zig; the dtype assert is the promotion guard).
 
+## A LoRA at scale 0 still changed the image (2026-10-14)
+
+Defect: a Qwen-Image LoRA attached at `lora_scales: [0]` rendered a different picture from no adapter, so a user could not switch an adapter off by scale.
+Cause: `lora.addTo` called `mlx_addmm(y, xa, bt, alpha=scale, beta=1)`; at `alpha == 0` MLX's addmm does not return `beta*c` at DiT-sized shapes in bf16.
+Fix: `addTo` skips an adapter whose scale is 0 and hands back a copy of `y` when nothing remains. This also repairs H3, which shares `addTo`.
+Guard: `addTo with a zero or tiny scale returns y, at DiT-sized shapes` (lora.zig); live `tests/test_qwen_image_lora.sh` check 2 (scale 0 byte-identical to no adapter).
+
 ## Stable Audio 3: a fractional length came out as clipped noise (2026-10-05)
 
 Defect: a sound effect at any non-whole length (0.5, 0.9, 1.5 s) came out as near-constant full-scale noise; whole seconds sounded right.
@@ -2119,3 +2142,18 @@ Every boot of `beamster/MiMo-V2.6-Flash-Sushi-*` logged `[mimo-mtp] missing mode
 ## A speaker cache keeps one of many equal frames: past the first chunk, parity is the selection, not the output (Nemotron 3 Diarization, 2026-10-13)
 
 **Defect.** The diarizer agreed with mlx-audio to 0.04 inside its first 27.2 s chunk and drifted to 0.43 after it on the 8-bit pack. **Cause.** Every confidently spoken frame scores about the same in the Arrival-Order Speaker Cache's ranking, so a compression keeps one of many near-equal frames: a 0.036 difference in probabilities swapped 18 of 300 kept frames, and the chunks that attend to the cache moved with them (mlx-audio and the official model disagree the same way). Under it sat a real one: `Scope.geluErf` added an f32 scalar, so a bf16 caller's residual stream ran in f32 from the first feed-forward on. **Fix.** `geluErf` keeps its input's dtype (the ASR tower, f32, is unchanged); the compression runs on the host (`aoscKeep`) so it can be checked on its own. **Guard.** `nemotron diarization: features, speaker activity and the cache match the references` checks every compression against the official one on the same inputs and the activity against both references; on the test conversation the port puts 99.43% of speech frames on the right speaker, mlx-audio 99.48%, the official model 99.49%. A cached-selection model is judged by agreement and accuracy, never by frame-exact output past the first chunk.
+
+## The int8 copy sat BESIDE the packed weights, and the route ran where it could not (`w8a8`, 2026-10-16)
+
+**Defect.** `--w8a8` built an int8 copy of every DiT linear but left the packed weights resident (H3 held 77 GB, a 4-bit pack grew), and once it was the default its int8 ATTENTION ran on every machine: only the linears checked for NAX, so an M1-M4 would have launched a kernel written for the M5 matrix unit. **Cause.** Four paths still read the originals (row floor, LoRA on fused q/k/v and gate/up, the ANE seam, `outFeatures`); the loaders also held their weight maps, whose refs kept every packed buffer alive until the loader returned; the activation memo outlived its job. **Fix.** No row floor; fused q/k/v are row VIEWS (an interleaved gate/up runs the plain GEMM under a LoRA, `forwardPair`); `--ane-*` skip the conversion and the bill follows; a loader drops each converted block from its map (`Weights.dropBlock`); the memo drops at the end of every media job; `w8a8.nax()` gates the kernels (int8 attention included); the route is default-on only with NAX and 64 GiB RAM, since nothing falls back to packed once the copy exists. **Guard.** `int8 attention declines where the matrix unit is absent`, `w8a8 is on by default only with NAX and 64 GiB`, `w8a8 overlay converts the pack's own (bits, group)`, `w8a8 takeLinear`, `Weights.dropPrefix`, `residency bill:` tests, the Hunyuan3D arm's load-peak bound (red without `dropBlock`), and every engine arm (cosine AND rms vs the packed forward, resident bytes vs the bill).
+## A ModelOpt GLM answered with its own prompt: the `up` scale landed after the clamp (2026-10-17)
+
+**Defect.** `GLM-5.3-Flash-FP4-Local` loaded and served, then echoed the question back (12 of 39 `test_glm5_next.sh` checks failed). **Cause.** The loader folded each expert's `up` global scale into the routing weight, which is exact for Flash Next. GLM clamps `up` at +-10 BEFORE that point, and the scales are ~4.5e-5, so the unscaled `up` (~20,000x too large) saturated the clamp in every MoE layer. **Fix.** With a `swiglu_limit` the loader keeps `up_proj.expert_scale` apart (`MoeMlpWeights.up_expert_scale`, applied to `up` before the activation on the sorted path) and `expert_scale` is the down scale alone. **Rule.** A scale folds past an activation only if the activation is linear in that operand. **Guard.** `ModelOpt banks: a clamped SwiGLU keeps the up scale apart`; live `tests/test_glm5_next.sh` (39/39).
+
+## `F_NOCACHE` is ignored for an unaligned read: a 165 GB load filled 120 GB of page cache (2026-10-17)
+
+**Defect.** Loading GLM FP4-Local froze a 256 GB Mac for ~30 s at a time (kernel pressure warning, swap growing) and ended in SIGKILL or a watchdog kill. **Cause.** `F_NOCACHE` bypasses the cache only when file offset, length AND buffer are page-aligned. Expert tensors sit at arbitrary offsets, so every `pread` went through the cache (APFS, 4 GiB read: aligned +0.00 GiB cache, offset +512 +3.0 GiB, plain +4.0 GiB) beside 163 GiB of wired banks. **Fix.** `modelopt_pack.Reader` reads the covering aligned span (`alignedSpan`) through a page-aligned stage; banks are read 6 at a time and copied into MLX's own memory; `status.memoryPressureLevel` is read before each round and stops the load with `InsufficientMemory`; the resident bill adds the decoded scales (`bankExpansionBytes`). The pressure stop is the one place a load reads OS pressure: the next loader should join it, or the preflight absorb it. **Tell.** `File-backed pages` in `vm_stat` climbing as fast as the load. **Guard.** `ModelOpt reads`, `ModelOpt banks`, `residentModelDiskBytes: a ModelOpt pack is billed its decoded expert banks`.
+
+## An f32 norm weight widened a bf16 model's MoE input: GLM FP4 ran the slow chain everywhere (2026-10-17)
+
+**Defect.** `GLM-5.3-Flash-FP4-Local` decoded far slower than the 5.1bpw pack (6400 ops per forward). **Cause.** NVIDIA keeps `post_attention_layernorm` (and the final norm) in f32, and `rms_norm` promotes to the weight's dtype, so the MoE read f32: the fused hyper-connection read (`hcRowsServes` wants the norm dtype to equal the stream's) and the fp4 MoE kernels (16-bit only) both declined, and the clamped SwiGLU plus per-expert up scale had no fused path anyway. **Fix.** `narrowsLoadedF32Norm` casts the language trunk's f32 layer norms to bf16 at load, for ModelOpt packs only (the one reference measured; `MLX_SERVE_F16_NARROW_1D=0` restores them); `moe_fp4` takes the up scale and GLM's whole-number clamp (`Scales`); `moeFp4DecodeEligible` declines a non-16-bit stream instead of throwing. **Guard.** The predicate test (a vision tower's f32 norms stay: the RADIO f32-parity tests went red when it matched `vision_projector.*layernorm`), `loadWeightsOpt: an f32 trunk norm narrows ... for a ModelOpt pack` (any other pack keeps its dtype), `moe fp4 decode: a clamped SwiGLU ...` against fp32 truth, `ops/forward` and the `[moe] fp4 decode kernels engaged` line in `MLX_SERVE_DECODE_FWD_UBENCH`.

@@ -598,6 +598,22 @@ struct ModelInfo {
         return nil
     }
 
+    /// The engine serving it, for the tray's badge.
+    var engineBadge: String {
+        switch engineName {
+        case "ane": return "ANE"
+        case "sushi": return "Sushi"
+        case "mlx-stream": return "Stream"
+        default: break
+        }
+        switch engine {
+        case .mlx: return "MLX"
+        case .llama: return "GGUF"
+        case .dsv4: return "DS4"
+        case .mlxGguf: return "MLX GGUF"
+        }
+    }
+
     /// "KV4" / "KV8" while this model stores a quantized KV cache.
     var kvBadge: String? {
         kvQuant == "4" || kvQuant == "8" ? "KV\(kvQuant)" : nil
@@ -667,16 +683,6 @@ enum ServerEngine: String, CaseIterable {
     case dsv4
     /// A `.gguf` served on the MLX path by lib/mlx-serve-gguf (`--mlx-gguf`).
     case mlxGguf
-
-    /// Short human label for the running-model badge / section headings.
-    var label: String {
-        switch self {
-        case .mlx:     return "MLX"
-        case .llama:   return "llama.cpp (GGUF)"
-        case .dsv4:    return "ds4 (DSV4-Flash)"
-        case .mlxGguf: return "mlx-serve-gguf (GGUF on MLX)"
-        }
-    }
 
     /// The MLX forward, whatever the weights' container: MLX-only knobs
     /// (spec decode, kv-quant, prefix cache) apply here.
@@ -1050,6 +1056,9 @@ struct LocalModel: Identifiable, Hashable {
     /// the only place that can see the SIBLINGS, and so the only place that can
     /// tell two builds of one scheme apart. nil ⇒ derive it from the filename.
     var quantLabel: String? = nil
+
+    /// The files' size on disk, which `sizeFormatted` prints.
+    var sizeBytes: Int64 = 0
 
     /// Non-nil when this directory cannot serve as a model. See `ModelDefect`.
     /// A defective row is listed so you can see and remove it, and is excluded
