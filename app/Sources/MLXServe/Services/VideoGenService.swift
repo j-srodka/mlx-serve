@@ -989,7 +989,7 @@ final class VideoGenService: ObservableObject {
     /// Longest edge a reference frame is shipped at. The server normalizes a
     /// reference video to a 768 short edge anyway, so sending phone-native
     /// frames is pure payload — a 124-frame clip at 4K is hundreds of MB of
-    /// base64 against a 64 MB request cap.
+    /// base64 against the server's 512 MB request cap.
     nonisolated static let refFrameMaxEdge: CGFloat = 1024
 
     /// Ripple's guide slice. Independent of the output frame count.
