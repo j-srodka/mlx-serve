@@ -2619,8 +2619,10 @@ fn handleConnection(
         if (mlx.gpuContextLost()) return sendResponse(stream, "503 Service Unavailable", "application/json", "{\"status\":\"cuda context lost\"}");
         log.debug("GET  /health -> 200\n", .{});
         const h3 = @import("minimax_h3.zig");
-        var health_buf: [96]u8 = undefined;
-        const health_body = if (h3.latent_suffix_supported)
+        var health_buf: [128]u8 = undefined;
+        const health_body = if (h3.latent_suffix_supported and h3.ref_latent_out_supported)
+            std.fmt.bufPrint(&health_buf, "{{\"status\":\"ok\",\"latent_suffix\":true,\"ref_latent_out\":true}}", .{}) catch "{\"status\":\"ok\"}"
+        else if (h3.latent_suffix_supported)
             std.fmt.bufPrint(&health_buf, "{{\"status\":\"ok\",\"latent_suffix\":true}}", .{}) catch "{\"status\":\"ok\"}"
         else
             "{\"status\":\"ok\"}";

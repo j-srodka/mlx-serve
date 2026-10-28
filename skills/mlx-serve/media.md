@@ -222,12 +222,16 @@ Same prompt, seed, width, height, `num_frames`, and `steps` across windows.
 ### MiniMax H3 FL2VA: latent sidecar files + keyframes
 
 `latent_out` (absolute path to a `.safetensors` to receive the finished run's
-video/audio latents) combines freely with keyframe anchors — it is written
-after generation returns. A keyframe anchor can also ride a chain with
-`latent_prefix_frames` set. Two per-side refusals: `first_frame_image` +
-`latent_prefix_path` (the pin owns the window's opening), `last_frame_image` +
-`latent_suffix_path` (mirrored). The mirror combos are legal: `last_frame_image`
-+ prefix pin (the proven engine combo), `first_frame_image` + suffix pin.
+video/audio latents) combines freely with keyframe anchors and with refs /
+`ref_mod_paths` on a **hybrid** pack — it is written after generation returns
+(target latents only). Pin frame counts and `chain_windows`>1 with refs stay
+named 400s. `GET /health` `"ref_latent_out":true` is binary capability, not the
+loaded pack (pure REF2VA still refuses `latent_out`). A keyframe anchor can also
+ride a chain with `latent_prefix_frames` set. Two per-side refusals:
+`first_frame_image` + `latent_prefix_path` (the pin owns the window's opening),
+`last_frame_image` + `latent_suffix_path` (mirrored). The mirror combos are
+legal: `last_frame_image` + prefix pin (the proven engine combo),
+`first_frame_image` + suffix pin.
 `latent_prefix_path`/`latent_suffix_path` each require their overlap count
 (`latent_prefix_frames`/`latent_suffix_frames`, legal 5/22/39/56) and may seed
 a chain: prefix file → window 0 opens on its tail; suffix file → the final

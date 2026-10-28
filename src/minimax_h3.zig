@@ -234,7 +234,7 @@ pub const RefReject = enum {
         return switch (self) {
             .too_many_images => "too many reference images ('ref_images' takes at most 9)",
             .too_many_videos => "too many reference videos ('ref_videos' takes at most 3)",
-            .too_many_audios => "too many reference audios ('ref_audios' takes at most 3)",
+            .too_many_audios => "too many audio references: at most 3 across audio ref mods and 'ref_audios' combined",
             .too_many_refs => "too many references: at most 12 files across 'ref_images', 'ref_videos' and 'ref_audios' combined",
             .video_too_short => "a reference video needs at least 5 frames (~0.2s at 24 fps)",
             .empty_video => "a 'ref_videos' entry has no frames",
@@ -316,14 +316,15 @@ fn audioLatentFrames(samples: u32) u32 {
     return (samples + hop - 1) / hop;
 }
 
-/// Resolve a request's references into presentation order and DiT blocks.
+/// Resolve a request's LIVE references into presentation order and DiT blocks.
 ///
 /// The order is FIXED by the reference node and is not a preference: images,
 /// then videos (each soundtrack's `<Audio j>` label emitted immediately before
-/// its `<Video k>`), then standalone audio. Ordinals are 1-based per type, and
-/// a video's soundtrack consumes an `<Audio j>` ordinal — so a request with one
-/// soundtracked video and one standalone audio has `<Audio 1>` on the
-/// soundtrack and `<Audio 2>` standalone, not the other way round.
+/// its `<Video k>`), then standalone audio. Picture and video ordinals are
+/// 1-based per type; `<Audio j>` shares one counter starting at
+/// `audio_ordinal_base` (audio RefMods parsed earlier consume the low ordinals).
+/// A video's soundtrack consumes an `<Audio j>` ordinal but is not counted
+/// toward the three-file cap on audio ref mods plus `ref_audios`.
 pub fn resolveRefs(
     allocator: std.mem.Allocator,
     images: []const RefInput,
@@ -332,12 +333,13 @@ pub fn resolveRefs(
     gen_w: u32,
     gen_h: u32,
     mode: RefImageSizing,
+    audio_ordinal_base: u32,
 ) !union(enum) { ok: RefResolution, reject: RefReject } {
     // Per-type first: "too many images" is more actionable than "too many
     // files" when it is one list that is over.
     if (images.len > MAX_REF_IMAGES) return .{ .reject = .too_many_images };
     if (videos.len > MAX_REF_VIDEOS) return .{ .reject = .too_many_videos };
-    if (audios.len > MAX_REF_AUDIOS) return .{ .reject = .too_many_audios };
+    if (audio_ordinal_base + audios.len > MAX_REF_AUDIOS) return .{ .reject = .too_many_audios };
     if (images.len + videos.len + audios.len > MAX_REF_TOTAL) return .{ .reject = .too_many_refs };
     for (videos) |v| {
         if (v.frames == 0) return .{ .reject = .empty_video };
@@ -351,7 +353,7 @@ pub fn resolveRefs(
 
     var n_img: u32 = 0;
     var n_vid: u32 = 0;
-    var n_aud: u32 = 0;
+    var n_aud: u32 = audio_ordinal_base;
 
     for (images, 0..) |img, i| {
         n_img += 1;
@@ -5459,6 +5461,8 @@ pub const isLegalLatentSuffixFrames = isLegalLatentPrefixFrames;
 
 /// HTTP builds with suffix / both-ends pins expose this on `/health`.
 pub const latent_suffix_supported = true;
+/// This binary accepts `latent_out` together with refs on a hybrid pack (`/health`, pre-load).
+pub const ref_latent_out_supported = true;
 
 /// Video-latent tail length for a source-frame overlap.
 pub fn overlapVideoLatentT(overlap_src_frames: u32) u32 {
@@ -5574,6 +5578,24 @@ pub fn keyframeSidecarBindingError(
         return "a first-frame anchor cannot combine with a prefix pin — the pin owns the window's opening";
     if (has_last_anchor and has_latent_suffix_path)
         return "a last-frame anchor cannot combine with a suffix pin — the pin owns the window's ending";
+    return null;
+}
+
+/// Named refusal when references share a request with latent pins or chained
+/// windows (`null` = ok). `latent_out` with refs is intentionally allowed.
+pub fn refCompatError(
+    has_refs: bool,
+    chain_windows: u32,
+    latent_prefix_frames: u32,
+    latent_suffix_frames: u32,
+) ?[]const u8 {
+    if (!has_refs) return null;
+    if (chain_windows > 1)
+        return "chained windows cannot be used with references or ref_mod_paths";
+    if (latent_prefix_frames > 0)
+        return "latent_prefix_frames cannot be used with references or ref_mod_paths";
+    if (latent_suffix_frames > 0)
+        return "latent_suffix_frames cannot be used with references or ref_mod_paths";
     return null;
 }
 
@@ -6465,7 +6487,7 @@ test "minimax h3: a ref block is DERIVED from its resolved reference" {
         .{ .kind = .video, .w = 1920, .h = 1080, .frames = 56, .soundtrack_samples = 48000 },
     };
     const audios = [_]RefInput{.{ .kind = .audio, .audio_samples = 32000 }};
-    var res = switch (try resolveRefs(a, &images, &videos, &audios, 864, 480, .match)) {
+    var res = switch (try resolveRefs(a, &images, &videos, &audios, 864, 480, .match, 0)) {
         .ok => |r| r,
         .reject => return error.UnexpectedReject,
     };
@@ -7123,7 +7145,7 @@ test "minimax h3: ref2va request resolution orders and numbers references" {
     };
     const audios = [_]RefInput{.{ .kind = .audio, .audio_samples = 16000 }};
 
-    var res = switch (try resolveRefs(a, &images, &videos, &audios, 864, 480, .match)) {
+    var res = switch (try resolveRefs(a, &images, &videos, &audios, 864, 480, .match, 0)) {
         .ok => |r| r,
         .reject => |why| {
             std.debug.print("unexpected reject: {s}\n", .{why.message()});
@@ -7185,6 +7207,39 @@ test "minimax h3: ref2va request resolution orders and numbers references" {
     try testing.expect(img_false > 0);
 }
 
+test "minimax h3: live audio ordinals continue after audio ref mods" {
+    const a = testing.allocator;
+    const aud = RefInput{ .kind = .audio, .audio_samples = 16000 };
+    const vid_snd = RefInput{ .kind = .video, .w = 640, .h = 480, .frames = 22, .soundtrack_samples = 32000 };
+
+    var one = switch (try resolveRefs(a, &.{}, &.{}, &.{aud}, 864, 480, .match, 1)) {
+        .ok => |r| r,
+        .reject => return error.TestUnexpectedResult,
+    };
+    defer one.deinit();
+    try testing.expectEqual(@as(u32, 2), one.refs[0].ordinal);
+    var lbl: [32]u8 = undefined;
+    try testing.expectEqualStrings("<Audio 2>: ", try h3v.labelFor(&lbl, .audio, one.refs[0].ordinal));
+
+    var mix = switch (try resolveRefs(a, &.{}, &.{vid_snd}, &.{aud}, 864, 480, .match, 1)) {
+        .ok => |r| r,
+        .reject => return error.TestUnexpectedResult,
+    };
+    defer mix.deinit();
+    try testing.expectEqual(@as(u32, 2), mix.refs[0].audio_ordinal);
+    try testing.expectEqual(@as(u32, 3), mix.refs[1].ordinal);
+
+    const two_aud = [_]RefInput{ aud, aud };
+    switch (try resolveRefs(a, &.{}, &.{}, &two_aud, 864, 480, .match, 2)) {
+        .ok => |r| {
+            var rr = r;
+            rr.deinit();
+            return error.TestUnexpectedResult;
+        },
+        .reject => |why| try testing.expectEqual(RefReject.too_many_audios, why),
+    }
+}
+
 test "minimax h3: ref2va rejects what it cannot honor, by name" {
     const a = testing.allocator;
     const img = RefInput{ .kind = .image, .w = 512, .h = 512 };
@@ -7212,7 +7267,7 @@ test "minimax h3: ref2va rejects what it cannot honor, by name" {
         .{ .i = &.{}, .v = &empty, .au = &.{}, .want = .empty_video },
     };
     for (cases) |c| {
-        switch (try resolveRefs(a, c.i, c.v, c.au, 864, 480, .match)) {
+        switch (try resolveRefs(a, c.i, c.v, c.au, 864, 480, .match, 0)) {
             .ok => |r| {
                 var rr = r;
                 rr.deinit();
@@ -7229,7 +7284,7 @@ test "minimax h3: ref2va rejects what it cannot honor, by name" {
     // The caps are INCLUSIVE — exactly at the limit must be served.
     const at_cap_i = rep(MAX_REF_IMAGES, img);
     const at_cap_v = rep(MAX_REF_VIDEOS, vid);
-    var ok = switch (try resolveRefs(a, &at_cap_i, &at_cap_v, &.{}, 864, 480, .max)) {
+    var ok = switch (try resolveRefs(a, &at_cap_i, &at_cap_v, &.{}, 864, 480, .max, 0)) {
         .ok => |r| r,
         .reject => return error.TestUnexpectedResult,
     };
@@ -7261,7 +7316,7 @@ test "minimax h3: the reference set has a TOTAL cap, not just per-type ones" {
     const over_i = rep(9, img);
     const over_v = rep(3, vid);
     const over_a = rep(3, aud);
-    switch (try resolveRefs(a, &over_i, &over_v, &over_a, 864, 480, .max)) {
+    switch (try resolveRefs(a, &over_i, &over_v, &over_a, 864, 480, .max, 0)) {
         .ok => return error.TestUnexpectedResult,
         .reject => |r| {
             try testing.expectEqual(RefReject.too_many_refs, r);
@@ -7275,13 +7330,13 @@ test "minimax h3: the reference set has a TOTAL cap, not just per-type ones" {
     const twelve_i = rep(6, img);
     const three_v = rep(3, vid);
     const four_a = rep(4, aud); // over the per-type cap too — that wins, it is more specific
-    switch (try resolveRefs(a, &twelve_i, &three_v, &four_a, 864, 480, .max)) {
+    switch (try resolveRefs(a, &twelve_i, &three_v, &four_a, 864, 480, .max, 0)) {
         .ok => return error.TestUnexpectedResult,
         .reject => |r| try testing.expectEqual(RefReject.too_many_audios, r),
     }
     const six_i = rep(6, img);
     const three_a = rep(3, aud);
-    var ok = switch (try resolveRefs(a, &six_i, &three_v, &three_a, 864, 480, .max)) {
+    var ok = switch (try resolveRefs(a, &six_i, &three_v, &three_a, 864, 480, .max, 0)) {
         .ok => |r| r,
         .reject => return error.TestUnexpectedResult,
     };
@@ -8438,6 +8493,62 @@ test "minimax h3: chain math — delivered frames, overlap width, cross-fade sea
     const j3 = try crossfadeJoin(a, &.{&s1}, 2);
     defer a.free(j3);
     try testing.expectEqualSlices(f32, &s1, j3);
+}
+
+test "minimax h3: refCompatError truth table" {
+    try testing.expect(refCompatError(false, 2, 22, 0) == null);
+    try testing.expect(refCompatError(true, 2, 0, 0) != null);
+    try testing.expect(refCompatError(true, 1, 22, 0) != null);
+    try testing.expect(refCompatError(true, 1, 0, 22) != null);
+    try testing.expect(refCompatError(true, 1, 0, 0) == null);
+    try testing.expectEqualStrings(
+        "chained windows cannot be used with references or ref_mod_paths",
+        refCompatError(true, 2, 0, 0).?,
+    );
+    try testing.expectEqualStrings(
+        "latent_prefix_frames cannot be used with references or ref_mod_paths",
+        refCompatError(true, 1, 22, 0).?,
+    );
+    try testing.expectEqualStrings(
+        "latent_suffix_frames cannot be used with references or ref_mod_paths",
+        refCompatError(true, 1, 0, 22).?,
+    );
+}
+
+test "minimax h3: latent_out sidecar targets exclude reference rows" {
+    const a = testing.allocator;
+    const text_len: u32 = 64;
+    const latent_t: u32 = 17;
+    const lat_h: u32 = 30;
+    const lat_w: u32 = 54;
+    const audio_t: u32 = 93;
+    const frame_count: u32 = 56;
+    const frame_rows: u32 = (lat_h / PATCH_H) * (lat_w / PATCH_W);
+    const n_video_rows = latent_t * frame_rows;
+    const n_audio_rows = audio_t * 2;
+
+    var base = try PackedLayout.initFull(a, text_len, latent_t, lat_h, lat_w, audio_t, &.{}, frame_count, &.{}, 0, 0, 0, 0);
+    defer base.deinit();
+    const refs = [_]RefBlock{
+        .{ .kind = .image, .latent_h = lat_h, .latent_w = lat_w },
+        .{ .kind = .audio, .audio_t = 40 },
+    };
+    var with_refs = try PackedLayout.initFull(a, text_len, latent_t, lat_h, lat_w, audio_t, &.{}, frame_count, &refs, 0, 0, 0, 0);
+    defer with_refs.deinit();
+
+    const v_base = base.videoSegment().end - base.videoSegment().start;
+    const v_ref = with_refs.videoSegment().end - with_refs.videoSegment().start;
+    const a_base = base.audioSegment().end - base.audioSegment().start;
+    const a_ref = with_refs.audioSegment().end - with_refs.audioSegment().start;
+    try testing.expectEqual(v_base, v_ref);
+    try testing.expectEqual(a_base, a_ref);
+    try testing.expectEqual(n_video_rows, v_base);
+    try testing.expectEqual(n_audio_rows, a_base);
+    try testing.expect(with_refs.seq_len > base.seq_len);
+
+    var img_true: u32 = 0;
+    for (with_refs.img_update) |v| img_true += @intFromBool(v);
+    try testing.expectEqual(n_video_rows, img_true);
 }
 
 test "minimax h3: latent suffix — pin is the time-grid tail, denoise leads it" {

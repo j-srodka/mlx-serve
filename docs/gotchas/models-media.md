@@ -603,7 +603,11 @@ succeeds, and nothing reports it.
 The ordinals are a contract with the checkpoint for the same reason. The prompt
 refers to `<Picture 2>`, and a video's soundtrack consumes an `<Audio j>`
 ordinal emitted BEFORE its own `<Video k>` — so one soundtracked clip plus one
-standalone audio makes the standalone `<Audio 2>`, not `<Audio 1>`.
+standalone audio makes the standalone `<Audio 2>`, not `<Audio 1>`. Audio RefMods
+parsed from `ref_mod_paths` take the low `<Audio j>` ordinals; live refs continue
+that counter (`resolveRefs`'s `audio_ordinal_base`). The three-file cap applies
+to audio RefMods plus `ref_audios` only — video soundtracks are not counted toward
+it but still consume `<Audio j>` labels.
 
 One function decides order and ordinals (`resolveRefs`); the DiT block is
 DERIVED from a resolved reference through the same function `resolveRefs` itself

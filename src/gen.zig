@@ -4132,6 +4132,7 @@ fn parseH3Refs(
     gen_w: u32,
     gen_h: u32,
     gen_frames: u32,
+    audio_ordinal_base: u32,
     out: *std.ArrayList(minimax_h3.RefMedia),
     err_buf: []u8,
 ) !?[]const u8 {
@@ -4244,7 +4245,7 @@ fn parseH3Refs(
         inputs_a[i] = .{ .kind = .audio, .audio_samples = @intCast(pcm.len / 2) };
     }
 
-    var res = switch (try minimax_h3.resolveRefs(allocator, inputs_i, inputs_v, inputs_a, gen_w, gen_h, mode)) {
+    var res = switch (try minimax_h3.resolveRefs(allocator, inputs_i, inputs_v, inputs_a, gen_w, gen_h, mode, audio_ordinal_base)) {
         .ok => |r| r,
         .reject => |why| return why.message(),
     };
@@ -4564,21 +4565,20 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     }
     if (has_live_refs) {
         var err_buf: [256]u8 = undefined;
-        if (try parseH3Refs(allocator, body, width, height, shape.frame_count, &refs, &err_buf)) |msg|
+        var audio_ref_mods: u32 = 0;
+        for (refs.items) |m| {
+            if (m.latent != null and m.ref.kind == .audio) audio_ref_mods += 1;
+        }
+        if (try parseH3Refs(allocator, body, width, height, shape.frame_count, audio_ref_mods, &refs, &err_buf)) |msg|
             return sendError(conn, 400, msg);
     }
     if (refs.items.len > minimax_h3.MAX_REF_TOTAL)
         return sendError(conn, 400, "too many references: at most 12 files across live refs and ref_mod_paths combined");
-    if (latent_prefix_frames > 0 and (has_live_refs or has_ref_mod_fields or refs.items.len > 0))
-        return sendError(conn, 400, "latent_prefix_frames cannot be used with references or ref_mod_paths");
-    if (latent_suffix_frames > 0 and (has_live_refs or has_ref_mod_fields or refs.items.len > 0))
-        return sendError(conn, 400, "latent_suffix_frames cannot be used with references or ref_mod_paths");
-    // The keyframes part of the old lumped check was the conservative piece:
-    // anchors and sidecar pins bind disjoint row blocks EXCEPT the two fighting
-    // edges named below. `latent_out` stays orthogonal — it writes the finished
-    // run's latents after generation returns, nothing to do with conditioning.
-    if ((has_latent_out or has_latent_prefix_path or has_latent_suffix_path) and (has_live_refs or has_ref_mod_fields or refs.items.len > 0))
-        return sendError(conn, 400, "latent sidecar fields cannot be used with references or ref_mod_paths");
+    const has_refs = has_live_refs or has_ref_mod_fields or refs.items.len > 0;
+    // `latent_out` writes post-generation target latents only — orthogonal to
+    // refs and keyframes. Pin frame counts and chained windows still fight refs.
+    if (minimax_h3.refCompatError(has_refs, chain_windows, latent_prefix_frames, latent_suffix_frames)) |msg|
+        return sendError(conn, 400, msg);
     // Per-side pin × anchor binding — pure fn, hermetically tested in minimax_h3.zig.
     if (minimax_h3.keyframeSidecarBindingError(kf_has_first, kf_has_last, has_latent_prefix_path, has_latent_suffix_path)) |msg|
         return sendError(conn, 400, msg);
@@ -4773,6 +4773,7 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
             error.TurboLoraIncomplete => "turbo_lora.safetensors ships modules MiniMax-H3's DiT does not have — replace it with minimax_h3_turbo_4step_ema_ckpt850.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora",
             error.StillNoChain => "num_frames 1 is a still and cannot chain windows",
             error.StillNoKeyframe => "num_frames 1 is a still and cannot take a first or last frame; attach a ref image",
+            error.ChainWithRefs => "chained windows cannot be used with references or ref_mod_paths",
             else => null,
         };
         if (named) |msg| {
@@ -7888,7 +7889,7 @@ test "a named-400 on a reference set frees everything decoded before it" {
             for (out.items) |*m| m.deinit();
             out.deinit(a);
         }
-        const msg = (try parseH3Refs(a, c.body, 864, 480, 124, &out, &buf)) orelse {
+        const msg = (try parseH3Refs(a, c.body, 864, 480, 124, 0, &out, &buf)) orelse {
             std.debug.print("expected a rejection for {s}\n", .{c.body});
             return error.ExpectedRejection;
         };
@@ -7897,7 +7898,7 @@ test "a named-400 on a reference set frees everything decoded before it" {
     // No reference fields at all is not a rejection — the feature is simply off.
     var none: std.ArrayList(minimax_h3.RefMedia) = .empty;
     defer none.deinit(a);
-    try testing.expect((try parseH3Refs(a, "{\"prompt\":\"x\"}", 864, 480, 124, &none, &buf)) == null);
+    try testing.expect((try parseH3Refs(a, "{\"prompt\":\"x\"}", 864, 480, 124, 0, &none, &buf)) == null);
     try testing.expectEqual(@as(usize, 0), none.items.len);
 }
 

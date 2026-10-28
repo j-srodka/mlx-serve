@@ -47,6 +47,13 @@ case ",$TASKS," in (*,fl2va,*) HAS_FL2VA=yes;; (*) HAS_FL2VA=no;; esac
 case ",$TASKS," in (*,ref2va,*) HAS_REF2VA=yes;; (*) HAS_REF2VA=no;; esac
 echo "pack tasks: [$TASKS]"
 
+HEALTH=$(curl -sf "http://127.0.0.1:$PORT/health" || true)
+if echo "$HEALTH" | grep -q '"ref_latent_out":true' && echo "$HEALTH" | grep -q '"latent_suffix":true'; then
+  echo "PASS: /health advertises latent_suffix and ref_latent_out"
+else
+  echo "FAIL: /health missing ref_latent_out or latent_suffix ($HEALTH)"; rc=1
+fi
+
 # [1] capability + staged preflight engagement
 curl -s "http://127.0.0.1:$PORT/v1/models" | grep -q '"video"' \
   && echo "PASS: /v1/models advertises video" \
@@ -125,6 +132,91 @@ if [ "$code" = "400" ] && grep -q "latent_prefix_path" /tmp/h3_latpath_noframes.
   echo "PASS: latent_prefix_path without latent_prefix_frames -> named 400"
 else
   echo "FAIL: latent_prefix_path alone returned $code ($(head -c 160 /tmp/h3_latpath_noframes.json))"; rc=1
+fi
+
+# Refs × latent_out / pins. Default H3_MODEL is FL2VA-only; zig tests are the
+# revert bar. Hybrid HTTP rows need a pack that declares both tasks.
+TINY_PNG=$(python3 - <<'PY'
+import base64, struct, zlib
+def chunk(t, d): return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+raw = bytes([0, 20, 20, 20])
+png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+png += chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b"")
+print(base64.b64encode(png).decode())
+PY
+)
+if [ "$HAS_REF2VA" != "yes" ] || [ "$HAS_FL2VA" != "yes" ]; then
+  echo "SKIP: hybrid latent_out+refs (set H3_HYBRID_MODEL=<hybrid pack dir> and H3_MODEL to that pack)"
+fi
+if [ "$HAS_REF2VA" = "yes" ]; then
+  code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+    -d "{\"prompt\":\"x\",\"num_frames\":56,\"width\":64,\"height\":64,\"ref_images\":[\"$TINY_PNG\"],\"chain_windows\":2}" \
+    -o /tmp/h3_ref_chain.json -w "%{http_code}")
+  if [ "$code" = "400" ] && grep -q "chained windows cannot be used with references" /tmp/h3_ref_chain.json; then
+    echo "PASS: chain_windows>1 + refs -> named 400"
+  else
+    echo "FAIL: chain+refs returned $code ($(head -c 160 /tmp/h3_ref_chain.json))"; rc=1
+  fi
+  code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+    -d "{\"prompt\":\"x\",\"num_frames\":56,\"width\":64,\"height\":64,\"ref_images\":[\"$TINY_PNG\"],\"latent_prefix_path\":\"/tmp/x.safetensors\",\"latent_prefix_frames\":22}" \
+    -o /tmp/h3_ref_prefixpin.json -w "%{http_code}")
+  if [ "$code" = "400" ] && grep -q "latent_prefix_frames cannot be used with references" /tmp/h3_ref_prefixpin.json; then
+    echo "PASS: refs + latent_prefix_frames -> named 400"
+  else
+    echo "FAIL: refs+prefix_frames returned $code ($(head -c 160 /tmp/h3_ref_prefixpin.json))"; rc=1
+  fi
+  if [ "$HAS_FL2VA" = "yes" ]; then
+    code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+      -d "{\"prompt\":\"x\",\"num_frames\":56,\"width\":64,\"height\":64,\"ref_images\":[\"$TINY_PNG\"],\"latent_out\":\"/tmp/no_such_parent_dir_zz/latents.safetensors\"}" \
+      -o /tmp/h3_ref_latout_parent.json -w "%{http_code}")
+    if [ "$code" = "400" ] && grep -q "latent_out" /tmp/h3_ref_latout_parent.json && ! grep -q "latent sidecar fields cannot" /tmp/h3_ref_latout_parent.json; then
+      echo "PASS: refs + latent_out passes refs gate (parent-dir 400)"
+    else
+      echo "FAIL: refs+latent_out returned $code ($(head -c 160 /tmp/h3_ref_latout_parent.json))"; rc=1
+    fi
+    code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+      -d '{"prompt":"x","num_frames":56,"width":64,"height":64,"ref_images":[],"latent_out":"/tmp/no_such_parent_dir_zz/latents.safetensors"}' \
+      -o /tmp/h3_empty_ref_latout.json -w "%{http_code}")
+    if [ "$code" = "400" ] && grep -q "latent_out" /tmp/h3_empty_ref_latout.json; then
+      echo "PASS: empty ref_images + latent_out -> parent-dir 400 (not a ref)"
+    else
+      echo "FAIL: empty ref_images+latent_out returned $code ($(head -c 160 /tmp/h3_empty_ref_latout.json))"; rc=1
+    fi
+    # Optional tiny hybrid write: current pack is already hybrid, or H3_HYBRID_MODEL
+    # points at the running model.
+    if [ -z "${H3_HYBRID_MODEL:-}" ] || [ "$H3_HYBRID_MODEL" = "$MODEL" ]; then
+      SIDE=/tmp/h3_hybrid_latent_out.safetensors
+      rm -f "$SIDE"
+      python3 -c "import json,sys; json.dump({'prompt':'x','num_frames':5,'width':64,'height':64,'steps':2,'seed':3,'ref_images':[sys.argv[1]],'latent_out':sys.argv[2]}, open('/tmp/h3_hybrid_latout_req.json','w'))" "$TINY_PNG" "$SIDE"
+      code=$(curl -s --max-time 900 -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+        --data @/tmp/h3_hybrid_latout_req.json -o /tmp/h3_hybrid_latout.json -w "%{http_code}")
+      if [ "$code" = "200" ] && [ -f "$SIDE" ]; then
+        python3 - "$SIDE" <<'PY'
+import json, struct, sys
+from pathlib import Path
+data = Path(sys.argv[1]).read_bytes()
+n = struct.unpack_from("<Q", data, 0)[0]
+header = json.loads(data[8:8 + n])
+assert header.get("__metadata__", {}).get("pack") == "fl2va", header.get("__metadata__")
+shape = header["video_latent"]["shape"]
+assert shape[2] == 1, f"video T {shape} != temporalShape(5).latent_t"
+print("PASS: hybrid latent_out sidecar pack=fl2va video T=1")
+PY
+        [ $? -eq 0 ] || rc=1
+      else
+        echo "FAIL: hybrid latent_out write http $code ($(head -c 160 /tmp/h3_hybrid_latout.json))"; rc=1
+      fi
+    fi
+  else
+    code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+      -d '{"prompt":"x","num_frames":56,"width":64,"height":64,"latent_out":"/tmp/h3_latout_abs.safetensors"}' \
+      -o /tmp/h3_latout_ref2va_only.json -w "%{http_code}")
+    if [ "$code" = "400" ] && grep -q "latent_out is FL2VA only" /tmp/h3_latout_ref2va_only.json; then
+      echo "PASS: latent_out on REF2VA-only pack -> named 400"
+    else
+      echo "FAIL: REF2VA-only latent_out returned $code ($(head -c 160 /tmp/h3_latout_ref2va_only.json))"; rc=1
+    fi
+  fi
 fi
 
 code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
