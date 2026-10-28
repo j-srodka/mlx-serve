@@ -3,13 +3,39 @@ const std = @import("std");
 const preview = @import("preview.zig");
 const jpeg = @import("jpeg.zig");
 
-const c = @cImport({
-    @cInclude("h3_tae_preview.h");
-});
+const h3_tae_ctx = opaque {};
+
+extern fn h3_tae_preview_available() c_int;
+extern fn h3_tae_preview_open(
+    bundle_dir: [*:0]const u8,
+    use_ane: c_int,
+    err_out: [*]u8,
+    error_size: usize,
+) ?*h3_tae_ctx;
+extern fn h3_tae_preview_close(ctx: ?*h3_tae_ctx) void;
+extern fn h3_tae_preview_decode_frame(
+    ctx: ?*h3_tae_ctx,
+    latent: [*]const f32,
+    t: c_int,
+    h: c_int,
+    w: c_int,
+    c_ch: c_int,
+    t_idx: c_int,
+    out_rgb: [*]u8,
+    out_pw: *c_int,
+    out_ph: *c_int,
+    err_out: [*]u8,
+    error_size: usize,
+) c_int;
 
 const ErrBuf = [512]u8;
 
-var session: ?*c.h3_tae_ctx = null;
+pub const JpegTimings = struct {
+    coreml_ms: u64 = 0,
+    jpeg_ms: u64 = 0,
+};
+
+var session: ?*h3_tae_ctx = null;
 var session_path: [512]u8 = undefined;
 var session_path_len: usize = 0;
 
@@ -53,7 +79,7 @@ fn resolveModelPath(allocator: std.mem.Allocator, lat_h: u32, lat_w: u32) ![]con
     return std.fmt.allocPrint(allocator, "{s}/{s}.mlmodelc", .{ base, variant });
 }
 
-fn ensureSession(allocator: std.mem.Allocator, lat_h: u32, lat_w: u32) !*c.h3_tae_ctx {
+fn ensureSession(allocator: std.mem.Allocator, lat_h: u32, lat_w: u32) !*h3_tae_ctx {
     const path = try resolveModelPath(allocator, lat_h, lat_w);
     defer allocator.free(path);
 
@@ -61,15 +87,15 @@ fn ensureSession(allocator: std.mem.Allocator, lat_h: u32, lat_w: u32) !*c.h3_ta
         if (session_path_len == path.len and std.mem.eql(u8, session_path[0..session_path_len], path)) {
             return s;
         }
-        c.h3_tae_preview_close(s);
+        h3_tae_preview_close(s);
         session = null;
         session_path_len = 0;
     }
 
-    if (c.h3_tae_preview_available() == 0) return error.Unavailable;
+    if (h3_tae_preview_available() == 0) return error.Unavailable;
 
     var errbuf: ErrBuf = undefined;
-    const s = c.h3_tae_preview_open(path.ptr, if (useAne()) 1 else 0, &errbuf, errbuf.len) orelse {
+    const s = h3_tae_preview_open(path[0..path.len :0].ptr, if (useAne()) 1 else 0, &errbuf, errbuf.len) orelse {
         const msg = std.mem.sliceTo(&errbuf, 0);
         std.log.warn("[h3-tae] open failed: {s}\n", .{msg});
         return error.OpenFailed;
@@ -81,7 +107,7 @@ fn ensureSession(allocator: std.mem.Allocator, lat_h: u32, lat_w: u32) !*c.h3_ta
     return s;
 }
 
-/// Channel-major `[C,T,H,W]` f32 → JPEG via Core ML decode (one temporal index).
+/// Channel-major `[C,T,H,W]` f32 (MLX `[1,C,T,H,W]` eval order) → JPEG via Core ML.
 pub fn jpegFromLatent(
     allocator: std.mem.Allocator,
     latent: []const f32,
@@ -91,6 +117,21 @@ pub fn jpegFromLatent(
     c_ch: u32,
     t_idx: u32,
     opts: preview.Opts,
+) !preview.Encoded {
+    return jpegFromLatentProfiled(allocator, latent, t, h, w, c_ch, t_idx, opts, null, null);
+}
+
+pub fn jpegFromLatentProfiled(
+    allocator: std.mem.Allocator,
+    latent: []const f32,
+    t: u32,
+    h: u32,
+    w: u32,
+    c_ch: u32,
+    t_idx: u32,
+    opts: preview.Opts,
+    io: ?std.Io,
+    timings: ?*JpegTimings,
 ) !preview.Encoded {
     const s = try ensureSession(allocator, h, w);
 
@@ -119,7 +160,12 @@ pub fn jpegFromLatent(
     var errbuf: ErrBuf = undefined;
     var out_pw: c_int = 0;
     var out_ph: c_int = 0;
-    const rc = c.h3_tae_preview_decode_frame(
+
+    var prof_mark: u64 = 0;
+    var prof_start: ?std.Io.Timestamp = null;
+    if (timings != null and io != null) prof_start = std.Io.Timestamp.now(io.?, .boot);
+
+    const rc = h3_tae_preview_decode_frame(
         s,
         nhwc.ptr,
         @intCast(t),
@@ -139,11 +185,29 @@ pub fn jpegFromLatent(
         return error.DecodeFailed;
     }
 
+    if (timings) |tm| {
+        if (prof_start) |ps| {
+            const io_ref = io.?;
+            const cum: u64 = @intCast(ps.untilNow(io_ref, .boot).nanoseconds);
+            tm.coreml_ms = (cum - prof_mark) / 1_000_000;
+            prof_mark = cum;
+        }
+    }
+
     const o = opts.normalize();
     const resized = try resizeMaxSide(allocator, rgb, @intCast(out_pw), @intCast(out_ph), o.max_side);
     defer if (resized.owned) allocator.free(resized.rgb);
 
     const jpg = try jpeg.encodeRgb(allocator, resized.rgb, resized.w, resized.h, 72);
+
+    if (timings) |tm| {
+        if (prof_start) |ps| {
+            const io_ref = io.?;
+            const cum: u64 = @intCast(ps.untilNow(io_ref, .boot).nanoseconds);
+            tm.jpeg_ms = (cum - prof_mark) / 1_000_000;
+        }
+    }
+
     return .{ .jpeg = jpg, .w = resized.w, .h = resized.h };
 }
 

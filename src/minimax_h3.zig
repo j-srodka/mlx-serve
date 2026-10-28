@@ -4469,6 +4469,36 @@ fn renderH3Preview(
     const n: u32 = @intCast(idx.len);
     const hw: usize = @as(usize, lat_h) * @as(usize, lat_w);
     const c: usize = preview_mod.minimax_h3.channels();
+
+    const h3_tae_mod = @import("h3_tae.zig");
+    if (n == 1 and h3_tae_mod.enabled()) {
+        var vol_copy_ms: u64 = 0;
+        const cpu_vol = copyArrayF32(allocator, vol, s) catch null;
+        if (cpu_vol) |cv| {
+            defer allocator.free(cv);
+            if (prof) vol_copy_ms = clk.lapMs();
+            const need = c * @as(usize, latent_t) * hw;
+            if (cv.len >= need) {
+                var tae_timings: h3_tae_mod.JpegTimings = .{};
+                if (h3_tae_mod.jpegFromLatentProfiled(allocator, cv[0..need], latent_t, lat_h, lat_w, @intCast(c), idx[0], .{
+                    .enabled = true,
+                    .frames = 1,
+                    .max_side = opts.max_side,
+                }, if (prof) io else null, if (prof) &tae_timings else null)) |tae_enc| {
+                    if (prof) {
+                        const total = dit_ready_ms + unpatchify_build_ms + sync_ms + vol_copy_ms + tae_timings.coreml_ms +
+                            tae_timings.jpeg_ms;
+                        log.info(
+                            "[h3-preview-prof] step={d} path=tae dit_ready_ms={d} unpatchify_build_ms={d} sync_ms={d} vol_copy_ms={d} coreml_ms={d} jpeg_ms={d} preview_total_ms={d}\n",
+                            .{ step, dit_ready_ms, unpatchify_build_ms, sync_ms, vol_copy_ms, tae_timings.coreml_ms, tae_timings.jpeg_ms, total },
+                        );
+                    }
+                    return tae_enc;
+                } else |_| {}
+            }
+        }
+    }
+
     const packed_lat = try allocator.alloc(f32, c * @as(usize, n) * hw);
     defer allocator.free(packed_lat);
     var slice_ms: u64 = 0;
@@ -4486,19 +4516,6 @@ fn renderH3Preview(
     }
 
     var jpeg_timings: preview_mod.JpegTimings = .{};
-    const h3_tae_mod = @import("h3_tae.zig");
-    if (n == 1 and h3_tae_mod.enabled()) {
-        if (h3_tae_mod.jpegFromLatent(allocator, packed_lat, n, lat_h, lat_w, @intCast(c), idx[0], .{
-            .enabled = true,
-            .frames = n,
-            .max_side = opts.max_side,
-        })) |tae_enc| {
-            if (prof) {
-                log.info("[h3-preview-prof] step={d} path=tae_ane jpeg_only (see MINIMAX_H3_PREVIEW_PROF)\n", .{step});
-            }
-            return tae_enc;
-        } else |_| {}
-    }
 
     const enc = if (prof)
         try preview_mod.jpegFromLatentProfiled(allocator, preview_mod.minimax_h3, packed_lat, n, lat_h, lat_w, .{
