@@ -83,6 +83,11 @@ pub fn temporalIndices(out: []u32, t: u32, n_want: u32, first_frame: bool) []u32
 /// Callers that can slice on the GPU should pass only the frames they want
 /// (`t` = the slice count, `frames` = the same number): copying a whole
 /// 128-channel volume to the host every step is the expensive part, not this.
+pub const JpegTimings = struct {
+    decode_ms: u64 = 0,
+    jpeg_ms: u64 = 0,
+};
+
 pub fn jpegFromLatent(
     allocator: std.mem.Allocator,
     map: Map,
@@ -93,6 +98,21 @@ pub fn jpegFromLatent(
     opts: Opts,
     first_frame: bool,
 ) !Encoded {
+    return jpegFromLatentProfiled(allocator, map, latent, t, h, w, opts, first_frame, null, null);
+}
+
+pub fn jpegFromLatentProfiled(
+    allocator: std.mem.Allocator,
+    map: Map,
+    latent: []const f32,
+    t: u32,
+    h: u32,
+    w: u32,
+    opts: Opts,
+    first_frame: bool,
+    io: ?std.Io,
+    timings: ?*JpegTimings,
+) !Encoded {
     const o = opts.normalize();
     const c = map.channels();
     const need = @as(usize, c) * @as(usize, t) * @as(usize, h) * @as(usize, w);
@@ -101,10 +121,23 @@ pub fn jpegFromLatent(
     var idx_buf: [Opts.max_frames]u32 = undefined;
     const idx = temporalIndices(&idx_buf, t, o.frames, first_frame);
 
+    var prof_mark: u64 = 0;
+    var prof_start: ?std.Io.Timestamp = null;
+    if (timings != null and io != null) prof_start = std.Io.Timestamp.now(io.?, .boot);
+
     const rgb_native = try allocator.alloc(u8, @as(usize, idx.len) * @as(usize, h) * @as(usize, w) * 3);
     defer allocator.free(rgb_native);
     for (idx, 0..) |ti, fi| {
         latentSliceToRgb(map, latent, t, h, w, ti, rgb_native[fi * @as(usize, h) * @as(usize, w) * 3 ..][0 .. @as(usize, h) * @as(usize, w) * 3]);
+    }
+
+    if (timings) |tm| {
+        if (prof_start) |ps| {
+            const io_ref = io.?;
+            const cum: u64 = @intCast(ps.untilNow(io_ref, .boot).nanoseconds);
+            tm.decode_ms = (cum - prof_mark) / 1_000_000;
+            prof_mark = cum;
+        }
     }
 
     const strip_w = w * @as(u32, @intCast(idx.len));
@@ -113,6 +146,15 @@ pub fn jpegFromLatent(
     defer if (resized.owned) allocator.free(resized.rgb);
 
     const jpg = try jpeg.encodeRgb(allocator, resized.rgb, resized.w, resized.h, 72);
+
+    if (timings) |tm| {
+        if (prof_start) |ps| {
+            const io_ref = io.?;
+            const cum: u64 = @intCast(ps.untilNow(io_ref, .boot).nanoseconds);
+            tm.jpeg_ms = (cum - prof_mark) / 1_000_000;
+        }
+    }
+
     return .{ .jpeg = jpg, .w = resized.w, .h = resized.h };
 }
 

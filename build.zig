@@ -211,6 +211,7 @@ pub fn build(b: *std.Build) void {
     // returns unavailable on machines/OSes without it) + the per-layer MLP
     // MIL program builder. See lib/ane/ + src/ane.zig; provenance in NOTICE.
     addAneSources(b, mod);
+    addH3TaeSources(b, mod);
 
     // llama.cpp libllama for generic GGUF models (Metal backend, macOS only).
     // Staged by `scripts/fetch-llama.sh` into lib/llama/ (a single self-contained
@@ -241,6 +242,7 @@ pub fn build(b: *std.Build) void {
     mod.linkFramework("Foundation", .{});
     mod.linkFramework("Metal", .{});
     mod.linkFramework("IOSurface", .{});
+    mod.linkFramework("CoreML", .{});
 
     const exe = b.addExecutable(.{
         .name = "mlx-serve",
@@ -291,6 +293,7 @@ pub fn build(b: *std.Build) void {
     addDs4Sources(b, test_mod);
     test_mod.addIncludePath(b.path("lib/ds4"));
     addAneSources(b, test_mod);
+    addH3TaeSources(b, test_mod);
     addLlamaLib(b, test_mod);
     addGgufModule(b, test_mod, target, optimize);
     addExl3Module(b, test_mod, target, optimize);
@@ -310,6 +313,7 @@ pub fn build(b: *std.Build) void {
     test_mod.linkFramework("Foundation", .{});
     test_mod.linkFramework("Metal", .{});
     test_mod.linkFramework("IOSurface", .{});
+    test_mod.linkFramework("CoreML", .{});
 
     const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this substring");
     const qwen_preprocess_fixture = b.option(
@@ -863,6 +867,16 @@ fn addAneSources(b: *std.Build, module: *std.Build.Module) void {
     module.addCSourceFile(.{ .file = b.path("lib/ane/ane_bridge.m"), .flags = objc_flags });
     module.addCSourceFile(.{ .file = b.path("lib/ane/ane_mlp.m"), .flags = objc_flags });
     module.addIncludePath(b.path("lib/ane"));
+}
+
+fn addH3TaeSources(b: *std.Build, module: *std.Build.Module) void {
+    const objc_flags = &[_][]const u8{
+        "-O3",
+        "-fobjc-arc",
+        "-Wno-deprecated-declarations",
+    };
+    module.addCSourceFile(.{ .file = b.path("lib/h3_tae/h3_tae_preview.m"), .flags = objc_flags });
+    module.addIncludePath(b.path("lib/h3_tae"));
 }
 
 fn buildRootHandle(b: *std.Build) std.Io.Dir {

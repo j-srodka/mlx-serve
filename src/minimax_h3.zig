@@ -4390,7 +4390,13 @@ fn audioLayoutToChannelMajor(rows: mlx.mlx_array, audio_t: u32, pin_pre_t: u32, 
 /// Predicted clean video x0 = x - sigma * v (rectified-flow, sigma 1→0).
 /// Failures fall back to a preview-less progress event so a bad JPEG never
 /// kills a 50-minute job.
+fn previewProfEnabled() bool {
+    const raw = envStr("MINIMAX_H3_PREVIEW_PROF") orelse return false;
+    return !std.mem.eql(u8, raw, "0");
+}
+
 fn tryEmitH3Preview(
+    io: std.Io,
     p: gen_sse.Progress,
     allocator: std.mem.Allocator,
     stage: []const u8,
@@ -4409,7 +4415,7 @@ fn tryEmitH3Preview(
         p.emit(stage, step, total);
         return;
     }
-    const frame = renderH3Preview(allocator, p.preview_opts, video_x, velocity, sigma, latent_t, lat_h, lat_w, first_frame, s) catch {
+    const frame = renderH3Preview(io, allocator, p.preview_opts, video_x, velocity, sigma, latent_t, lat_h, lat_w, first_frame, step, s) catch {
         p.emit(stage, step, total);
         return;
     };
@@ -4418,6 +4424,7 @@ fn tryEmitH3Preview(
 }
 
 fn renderH3Preview(
+    io: std.Io,
     allocator: std.mem.Allocator,
     opts: @import("preview.zig").Opts,
     video_x: mlx.mlx_array,
@@ -4427,9 +4434,20 @@ fn renderH3Preview(
     lat_h: u32,
     lat_w: u32,
     first_frame: bool,
+    step: u32,
     s: S,
 ) !@import("preview.zig").Encoded {
     const preview_mod = @import("preview.zig");
+    const prof = previewProfEnabled();
+    var clk: LapClock = if (prof) LapClock.init(io) else undefined;
+    var dit_ready_ms: u64 = 0;
+
+    if (prof) {
+        try mlx.check(mlx.mlx_array_eval(video_x));
+        try mlx.check(mlx.mlx_array_eval(velocity));
+        dit_ready_ms = clk.lapMs();
+    }
+
     const sv = try scalarLike(@floatCast(sigma), velocity, s);
     defer _ = mlx.mlx_array_free(sv);
     const scaled = try mulA(velocity, sv, s);
@@ -4438,6 +4456,13 @@ fn renderH3Preview(
     defer _ = mlx.mlx_array_free(x0);
     const vol = try unpatchifyVideoRows(x0, latent_t, lat_h, lat_w, s);
     defer _ = mlx.mlx_array_free(vol);
+    const unpatchify_build_ms: u64 = if (prof) clk.lapMs() else 0;
+
+    var sync_ms: u64 = 0;
+    if (prof) {
+        try mlx.check(mlx.mlx_array_eval(vol));
+        sync_ms = clk.lapMs();
+    }
 
     var idx_buf: [preview_mod.Opts.max_frames]u32 = undefined;
     const idx = preview_mod.temporalIndices(&idx_buf, latent_t, opts.frames, first_frame);
@@ -4446,22 +4471,57 @@ fn renderH3Preview(
     const c: usize = preview_mod.minimax_h3.channels();
     const packed_lat = try allocator.alloc(f32, c * @as(usize, n) * hw);
     defer allocator.free(packed_lat);
+    var slice_ms: u64 = 0;
     for (idx, 0..) |ti, fi| {
         const sl = try sliceLatentT(vol, @intCast(ti), s);
         defer _ = mlx.mlx_array_free(sl);
         const cpu = try copyArrayF32(allocator, sl, s);
         defer allocator.free(cpu);
+        if (prof) slice_ms += clk.lapMs();
         // sl is [1,24,1,H,W] → C*H*W channel-major.
         if (cpu.len < c * hw) return error.BadLatentShape;
         for (0..c) |ci| {
             @memcpy(packed_lat[ci * @as(usize, n) * hw + fi * hw ..][0..hw], cpu[ci * hw ..][0..hw]);
         }
     }
-    return preview_mod.jpegFromLatent(allocator, preview_mod.minimax_h3, packed_lat, n, lat_h, lat_w, .{
-        .enabled = true,
-        .frames = n,
-        .max_side = opts.max_side,
-    }, false);
+
+    var jpeg_timings: preview_mod.JpegTimings = .{};
+    const h3_tae_mod = @import("h3_tae.zig");
+    if (n == 1 and h3_tae_mod.enabled()) {
+        if (h3_tae_mod.jpegFromLatent(allocator, packed_lat, n, lat_h, lat_w, @intCast(c), idx[0], .{
+            .enabled = true,
+            .frames = n,
+            .max_side = opts.max_side,
+        })) |tae_enc| {
+            if (prof) {
+                log.info("[h3-preview-prof] step={d} path=tae_ane jpeg_only (see MINIMAX_H3_PREVIEW_PROF)\n", .{step});
+            }
+            return tae_enc;
+        } else |_| {}
+    }
+
+    const enc = if (prof)
+        try preview_mod.jpegFromLatentProfiled(allocator, preview_mod.minimax_h3, packed_lat, n, lat_h, lat_w, .{
+            .enabled = true,
+            .frames = n,
+            .max_side = opts.max_side,
+        }, false, io, &jpeg_timings)
+    else
+        try preview_mod.jpegFromLatent(allocator, preview_mod.minimax_h3, packed_lat, n, lat_h, lat_w, .{
+            .enabled = true,
+            .frames = n,
+            .max_side = opts.max_side,
+        }, false);
+
+    if (prof) {
+        const unpatchify_ms = unpatchify_build_ms + slice_ms;
+        const total = dit_ready_ms + unpatchify_build_ms + sync_ms + slice_ms + jpeg_timings.decode_ms + jpeg_timings.jpeg_ms;
+        log.info(
+            "[h3-preview-prof] step={d} dit_ready_ms={d} unpatchify_build_ms={d} sync_ms={d} slice_ms={d} decode_ms={d} jpeg_ms={d} preview_total_ms={d} (rollup unpatchify+slice={d})\n",
+            .{ step, dit_ready_ms, unpatchify_build_ms, sync_ms, slice_ms, jpeg_timings.decode_ms, jpeg_timings.jpeg_ms, total, unpatchify_ms },
+        );
+    }
+    return enc;
 }
 
 /// Text-to-audio-video. Dispatches: `chain_windows > 1` runs N single-window
@@ -5313,7 +5373,7 @@ fn generateOne(
             // above without a preview. A failed JPEG never fails the job.
             if (progress) |p| {
                 if (p.boundary()) return error.Cancelled;
-                tryEmitH3Preview(p, allocator, "Generating", @intCast(i + 1), req.steps, video_x, out.video, sigma, shape.latent_t, lat_h, lat_w, preview_first_frame, s);
+                tryEmitH3Preview(io, p, allocator, "Generating", @intCast(i + 1), req.steps, video_x, out.video, sigma, shape.latent_t, lat_h, lat_w, preview_first_frame, s);
             }
 
             // Euler on the flat ODE: x += model_output * dsigma. The audio
