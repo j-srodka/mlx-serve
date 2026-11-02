@@ -4651,7 +4651,7 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         var active: usize = 0;
         _ = mlx.mlx_get_active_memory(&active);
         const bill = h3CanvasBill(dit, activations, metrics.getAvailableMemBytes(), mlx.maxRecommendedWorkingSet(), active, mlx.cudaAvailable());
-        if (dit > 0 and bill.avail > 0 and bill.need > bill.avail) {
+        if (dit > 0 and bill.avail > 0 and bill.need > bill.avail and !h3SkipCanvasBill()) {
             const gb = 1024.0 * 1024.0 * 1024.0;
             var buf: [320]u8 = undefined;
             const with_cache = bcast_row > 0;
@@ -4669,6 +4669,16 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
                 if (with_cache) ", or \"turbo\", which keeps no attention cache" else "",
             }) catch "the canvas does not fit in memory: use a smaller canvas or fewer frames";
             return sendError(conn, 400, msg);
+        }
+        if (dit > 0 and bill.avail > 0 and bill.need > bill.avail and h3SkipCanvasBill()) {
+            const gb: f64 = 1024.0 * 1024.0 * 1024.0;
+            log.warn("[minimax-h3] canvas bill skipped ({d}x{d} x {d}f billed ~{d:.1} GB, {d:.1} GB available): --skip-mem-preflight or MLX_SERVE_H3_SKIP_CANVAS_BILL=1 — uncatchable OOM mid-step is possible\n", .{
+                width,
+                height,
+                shape.frame_count,
+                @as(f64, @floatFromInt(bill.need)) / gb,
+                @as(f64, @floatFromInt(bill.avail)) / gb,
+            });
         }
     }
 
@@ -6019,6 +6029,17 @@ pub fn h3ResidentMargin(total_ram: u64) u64 {
 fn h3ResidentEnabled() bool {
     const raw = std.c.getenv("MLX_SERVE_H3_RESIDENT") orelse return true;
     return !std.mem.eql(u8, std.mem.span(raw), "0");
+}
+
+/// Skip the per-request H3 canvas bill in `handleVideoH3`. Same escape hatch as
+/// model-load preflight: Draw Things and other engines may peak below this
+/// conservative row model, and `h3AvailBytes` can under-report when a chat
+/// model holds GPU working set — but turning this on admits uncatchable Metal
+/// OOM mid-step (#764).
+fn h3SkipCanvasBill() bool {
+    if (@import("scheduler.zig").skip_mem_preflight) return true;
+    const raw = std.c.getenv("MLX_SERVE_H3_SKIP_CANVAS_BILL") orelse return false;
+    return std.mem.eql(u8, std.mem.span(raw), "1");
 }
 
 /// Keep H3 resident only while it fits: what is free right now plus what the cache already holds
