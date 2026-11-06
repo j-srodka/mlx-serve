@@ -1,0 +1,16 @@
+#!/bin/bash
+# Block staging the mlx-c submodule gitlink; build scripts patch it in-tree.
+# See docs/gotchas/repo-topology.md and scripts/build-mlx.sh.
+set -euo pipefail
+
+while IFS= read -r path; do
+  case "$path" in
+  lib/mlxc-src)
+    echo "PRE-COMMIT BLOCKED: do not stage lib/mlxc-src (dirty mlx-c is intentional; build-mlx.sh patches it)." >&2
+    echo "See docs/gotchas/repo-topology.md — never commit inside lib/mlxc-src or its gitlink." >&2
+    exit 1
+    ;;
+  esac
+done < <(git diff --cached --name-only)
+
+exit 0
