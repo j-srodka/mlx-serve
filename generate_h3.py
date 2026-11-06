@@ -65,6 +65,8 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg"}
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
 MAX_LORA = 8
+# POST /v1/video/refmods stills extract (ornith): higher than Ref2VA generation (9); see minimax_h3 RefLimits.refmods_visual.
+MAX_REFMODS_STILL_IMAGES = 16
 ASPECT_WARN_FRAC = 0.01
 VAE_SPATIAL = 16
 PATCH_H = 2
@@ -536,6 +538,11 @@ def request_extract_refmod(
         "height": height,
     }
     if ref_images:
+        if len(ref_images) > MAX_REFMODS_STILL_IMAGES:
+            raise SystemExit(
+                f"at most {MAX_REFMODS_STILL_IMAGES} reference images for RefMod extract "
+                f"(server POST /v1/video/refmods stills cap)"
+            )
         body["ref_images"] = [encode_image_b64(p) for p in ref_images]
         if ref_image_size is not None:
             if ref_image_size not in ("match", "max"):

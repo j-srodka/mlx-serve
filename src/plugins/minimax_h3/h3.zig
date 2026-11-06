@@ -188,6 +188,31 @@ pub const MAX_REF_AUDIOS: usize = 3;
 /// caps do not express — they sum to 15, so a set can clear every one of them
 /// and still be a set the model was never given.
 pub const MAX_REF_TOTAL: usize = 12;
+
+/// Per-request caps for `resolveRefs`. Ref2VA **generation** uses
+/// `RefLimits.generation` (MiniMax card). `/v1/video/refmods` still-image extract
+/// uses `RefLimits.refmods_visual` so ornith can stack more stills into one
+/// `.safetensors` without raising live generation limits.
+pub const RefLimits = struct {
+    max_images: usize,
+    max_videos: usize,
+    max_audios: usize,
+    max_total: usize,
+
+    pub const generation = RefLimits{
+        .max_images = MAX_REF_IMAGES,
+        .max_videos = MAX_REF_VIDEOS,
+        .max_audios = MAX_REF_AUDIOS,
+        .max_total = MAX_REF_TOTAL,
+    };
+
+    pub const refmods_visual = RefLimits{
+        .max_images = 16,
+        .max_videos = MAX_REF_VIDEOS,
+        .max_audios = MAX_REF_AUDIOS,
+        .max_total = 16,
+    };
+};
 /// The reference node's floor: below 5 frames (~0.2 s at 24 fps) there is not
 /// one latent frame to condition on.
 pub const MIN_REF_VIDEO_FRAMES: u32 = 5;
@@ -305,13 +330,14 @@ pub fn resolveRefs(
     gen_w: u32,
     gen_h: u32,
     mode: RefImageSizing,
+    limits: RefLimits,
 ) !union(enum) { ok: RefResolution, reject: RefReject } {
     // Per-type first: "too many images" is more actionable than "too many
     // files" when it is one list that is over.
-    if (images.len > MAX_REF_IMAGES) return .{ .reject = .too_many_images };
-    if (videos.len > MAX_REF_VIDEOS) return .{ .reject = .too_many_videos };
-    if (audios.len > MAX_REF_AUDIOS) return .{ .reject = .too_many_audios };
-    if (images.len + videos.len + audios.len > MAX_REF_TOTAL) return .{ .reject = .too_many_refs };
+    if (images.len > limits.max_images) return .{ .reject = .too_many_images };
+    if (videos.len > limits.max_videos) return .{ .reject = .too_many_videos };
+    if (audios.len > limits.max_audios) return .{ .reject = .too_many_audios };
+    if (images.len + videos.len + audios.len > limits.max_total) return .{ .reject = .too_many_refs };
     for (videos) |v| {
         if (v.frames == 0) return .{ .reject = .empty_video };
         if (v.frames < MIN_REF_VIDEO_FRAMES) return .{ .reject = .video_too_short };
@@ -5226,7 +5252,7 @@ test "minimax h3: a ref block is DERIVED from its resolved reference" {
         .{ .kind = .video, .w = 1920, .h = 1080, .frames = 56, .soundtrack_samples = 48000 },
     };
     const audios = [_]RefInput{.{ .kind = .audio, .audio_samples = 32000 }};
-    var res = switch (try resolveRefs(a, &images, &videos, &audios, 864, 480, .match)) {
+    var res = switch (try resolveRefs(a, &images, &videos, &audios, 864, 480, .match, RefLimits.generation)) {
         .ok => |r| r,
         .reject => return error.UnexpectedReject,
     };
@@ -5861,7 +5887,7 @@ test "minimax h3: ref2va request resolution orders and numbers references" {
     };
     const audios = [_]RefInput{.{ .kind = .audio, .audio_samples = 16000 }};
 
-    var res = switch (try resolveRefs(a, &images, &videos, &audios, 864, 480, .match)) {
+    var res = switch (try resolveRefs(a, &images, &videos, &audios, 864, 480, .match, RefLimits.generation)) {
         .ok => |r| r,
         .reject => |why| {
             std.debug.print("unexpected reject: {s}\n", .{why.message()});
@@ -5950,7 +5976,7 @@ test "minimax h3: ref2va rejects what it cannot honor, by name" {
         .{ .i = &.{}, .v = &empty, .au = &.{}, .want = .empty_video },
     };
     for (cases) |c| {
-        switch (try resolveRefs(a, c.i, c.v, c.au, 864, 480, .match)) {
+        switch (try resolveRefs(a, c.i, c.v, c.au, 864, 480, .match, RefLimits.generation)) {
             .ok => |r| {
                 var rr = r;
                 rr.deinit();
@@ -5967,7 +5993,7 @@ test "minimax h3: ref2va rejects what it cannot honor, by name" {
     // The caps are INCLUSIVE — exactly at the limit must be served.
     const at_cap_i = rep(MAX_REF_IMAGES, img);
     const at_cap_v = rep(MAX_REF_VIDEOS, vid);
-    var ok = switch (try resolveRefs(a, &at_cap_i, &at_cap_v, &.{}, 864, 480, .max)) {
+    var ok = switch (try resolveRefs(a, &at_cap_i, &at_cap_v, &.{}, 864, 480, .max, RefLimits.generation)) {
         .ok => |r| r,
         .reject => return error.TestUnexpectedResult,
     };
@@ -5999,7 +6025,7 @@ test "minimax h3: the reference set has a TOTAL cap, not just per-type ones" {
     const over_i = rep(9, img);
     const over_v = rep(3, vid);
     const over_a = rep(3, aud);
-    switch (try resolveRefs(a, &over_i, &over_v, &over_a, 864, 480, .max)) {
+    switch (try resolveRefs(a, &over_i, &over_v, &over_a, 864, 480, .max, RefLimits.generation)) {
         .ok => return error.TestUnexpectedResult,
         .reject => |r| {
             try testing.expectEqual(RefReject.too_many_refs, r);
@@ -6013,18 +6039,47 @@ test "minimax h3: the reference set has a TOTAL cap, not just per-type ones" {
     const twelve_i = rep(6, img);
     const three_v = rep(3, vid);
     const four_a = rep(4, aud); // over the per-type cap too — that wins, it is more specific
-    switch (try resolveRefs(a, &twelve_i, &three_v, &four_a, 864, 480, .max)) {
+    switch (try resolveRefs(a, &twelve_i, &three_v, &four_a, 864, 480, .max, RefLimits.generation)) {
         .ok => return error.TestUnexpectedResult,
         .reject => |r| try testing.expectEqual(RefReject.too_many_audios, r),
     }
     const six_i = rep(6, img);
     const three_a = rep(3, aud);
-    var ok = switch (try resolveRefs(a, &six_i, &three_v, &three_a, 864, 480, .max)) {
+    var ok = switch (try resolveRefs(a, &six_i, &three_v, &three_a, 864, 480, .max, RefLimits.generation)) {
         .ok => |r| r,
         .reject => return error.TestUnexpectedResult,
     };
     defer ok.deinit();
     try testing.expectEqual(@as(usize, 12), ok.refs.len);
+}
+
+test "minimax h3: refmods visual profile allows 16 images; generation profile does not" {
+    const a = testing.allocator;
+    const img = RefInput{ .kind = .image, .w = 512, .h = 512 };
+    const rep = struct {
+        fn f(comptime n: usize, v: RefInput) [n]RefInput {
+            var b: [n]RefInput = undefined;
+            for (&b) |*e| e.* = v;
+            return b;
+        }
+    }.f;
+    const sixteen = rep(16, img);
+    switch (try resolveRefs(a, &sixteen, &.{}, &.{}, 864, 480, .match, RefLimits.generation)) {
+        .ok => return error.TestUnexpectedResult,
+        .reject => |r| try testing.expectEqual(RefReject.too_many_images, r),
+    }
+    var ok16 = switch (try resolveRefs(a, &sixteen, &.{}, &.{}, 864, 480, .match, RefLimits.refmods_visual)) {
+        .ok => |r| r,
+        .reject => return error.TestUnexpectedResult,
+    };
+    defer ok16.deinit();
+    try testing.expectEqual(@as(usize, 16), ok16.refs.len);
+
+    const seventeen = rep(17, img);
+    switch (try resolveRefs(a, &seventeen, &.{}, &.{}, 864, 480, .match, RefLimits.refmods_visual)) {
+        .ok => return error.TestUnexpectedResult,
+        .reject => |r| try testing.expectEqual(RefReject.too_many_images, r),
+    }
 }
 
 test "h3 vsa: the packed layout hands VSA every segment in order, video segments as grids" {

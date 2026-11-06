@@ -234,7 +234,7 @@ fn videoFrames(frames: []const []u8, th: u32, tw: u32, stride: u32, cat_axis: c_
 
 /// The REF2VA references decoded into `out` in `resolveRefs` order; a reference the server cannot use is a named
 /// refusal, never dropped (the generation would succeed and ignore what the user asked it to follow).
-fn references(req: *const abi.Request, b: *const job.Body, gen_w: u32, gen_h: u32, gen_frames: u32, s: mlx.mlx_stream, out: *std.ArrayList(h3.RefMedia)) !?Verdict {
+fn references(req: *const abi.Request, b: *const job.Body, gen_w: u32, gen_h: u32, gen_frames: u32, s: mlx.mlx_stream, out: *std.ArrayList(h3.RefMedia), limits: h3.RefLimits) !?Verdict {
     const mode: h3.RefImageSizing = blk: {
         const raw = b.str("ref_image_size") orelse break :blk .match;
         if (std.mem.eql(u8, raw, "match")) break :blk .match;
@@ -295,9 +295,17 @@ fn references(req: *const abi.Request, b: *const job.Body, gen_w: u32, gen_h: u3
     const in_a = try a.alloc(h3.RefInput, audios.items.len);
     for (audios.items, in_a) |pcm, *r| r.* = .{ .kind = .audio, .audio_samples = @intCast(pcm.len / 2) };
 
-    var res = switch (try h3.resolveRefs(gpa, in_i, in_v, in_a, gen_w, gen_h, mode)) {
+    var res = switch (try h3.resolveRefs(gpa, in_i, in_v, in_a, gen_w, gen_h, mode, limits)) {
         .ok => |r| r,
-        .reject => |why| return Verdict.named(.unsupported, why.message()),
+        .reject => |why| {
+            return switch (why) {
+                .too_many_images => req.refuseFmt(.unsupported, "too many reference images", "too many reference images ('ref_images' takes at most {d})", .{limits.max_images}),
+                .too_many_videos => req.refuseFmt(.unsupported, "too many reference videos", "too many reference videos ('ref_videos' takes at most {d})", .{limits.max_videos}),
+                .too_many_audios => req.refuseFmt(.unsupported, "too many reference audios", "too many reference audios ('ref_audios' takes at most {d})", .{limits.max_audios}),
+                .too_many_refs => req.refuseFmt(.unsupported, "too many references", "too many references: at most {d} files across 'ref_images', 'ref_videos' and 'ref_audios' combined", .{limits.max_total}),
+                else => Verdict.named(.unsupported, why.message()),
+            };
+        },
     };
     defer res.deinit();
     // Decoded at the canvases the resolver picked: the VAE canvas for the DiT, the Qwen canvas for the tower.
@@ -398,7 +406,7 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     }
     const has_refs = fieldSet(&b, "ref_images") or fieldSet(&b, "ref_videos") or fieldSet(&b, "ref_audios");
     if (has_refs and !e.supports_refs) return bad("this MiniMax-H3 pack does not support references (it declares no 'ref2va' task) — load a REF2VA checkpoint");
-    if (has_refs) if (references(req, &b, width, height, shape.frame_count, s, &refs) catch |err| return job.failure(err, "MiniMax-H3 generation failed")) |v| return v;
+    if (has_refs) if (references(req, &b, width, height, shape.frame_count, s, &refs, h3.RefLimits.generation) catch |err| return job.failure(err, "MiniMax-H3 generation failed")) |v| return v;
     if (e.supports_refs and !e.supports_t2va) {
         const visual = for (refs.items) |m| {
             if (m.ref.kind != .audio) break true;
@@ -640,7 +648,7 @@ fn runRefmodsExtract(e: *Engine, req: *const abi.Request) Verdict {
         for (refs.items) |*m| m.deinit();
         refs.deinit(gpa);
     }
-    if (references(req, &b, width, height, gen_frames, s, &refs) catch |err| return job.failure(err, "MiniMax-H3 refmods: reference decode failed")) |v| return v;
+    if (references(req, &b, width, height, gen_frames, s, &refs, h3.RefLimits.refmods_visual) catch |err| return job.failure(err, "MiniMax-H3 refmods: reference decode failed")) |v| return v;
     if (refs.items.len == 0)
         return req.refuseFmt(.unsupported, "attach reference images or one reference video", "attach 'ref_images' or one 'ref_videos' entry", .{});
 
@@ -893,7 +901,7 @@ test "minimax_h3 plugin: a reference the server cannot use is refused by name, n
             out.deinit(gpa);
         }
         len = 0;
-        const v = (try references(&req, &b, 864, 480, 124, s, &out)) orelse return error.ExpectedRejection;
+        const v = (try references(&req, &b, 864, 480, 124, s, &out, h3.RefLimits.generation)) orelse return error.ExpectedRejection;
         const msg = if (len > 0) buf[0..len] else v.why.slice();
         testing.expect(std.mem.indexOf(u8, msg, c.needle) != null) catch |e| {
             std.debug.print("{s}: {s}\n", .{ c.body, msg });
@@ -905,7 +913,7 @@ test "minimax_h3 plugin: a reference the server cannot use is refused by name, n
     defer none_b.deinit();
     var none: std.ArrayList(h3.RefMedia) = .empty;
     defer none.deinit(gpa);
-    try testing.expect((try references(&req, &none_b, 864, 480, 124, s, &none)) == null);
+    try testing.expect((try references(&req, &none_b, 864, 480, 124, s, &none, h3.RefLimits.generation)) == null);
     try testing.expectEqual(@as(usize, 0), none.items.len);
 }
 

@@ -64,3 +64,6 @@ Local `main` is a throwaway pointer that was fast-forwarded to `fork/main`
   commits combined). The local `feature/*` branches were deleted
   (oct 2026) once those landed; old stash `h3-wip-before-v26.9.1` kept
   until H3 Timeline verifies against the new build.
+- **Ornith: RefMod extract accepts more stills than Ref2VA generation** — H3
+  `POST /v1/video/refmods` (stills) allows **16** `ref_images` (`h3.RefLimits.refmods_visual`);
+  live `/v1/video/generations` ref2va stays at **9 / 12** file caps.
