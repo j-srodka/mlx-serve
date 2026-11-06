@@ -182,6 +182,7 @@ can address it (model-gated, like `POST /v1/video/generations`).
 | `width`, `height` | set them: LTX defaults to a 384x256 preview; multiples of 32 |
 | `num_frames` | LTX default 9 (a preview); MiniMax-H3 default 56 |
 | `seed`, `steps` | |
+| `preview`, `preview_frames`, `preview_max_side` | MiniMax-H3 only: SSE JPEG of predicted x0 per step (`preview_frames:1`). On macOS, install `scripts/fetch_minimax_h3_tae.sh` (or put `minimax_h3_tae/` next to the pack) for sharp ANE previews; else linear 44×44 Latent2RGB. `MINIMAX_H3_TAE=0` forces linear. |
 | `first_frame_image`, `last_frame_image` | LTX: base64 PNG/JPEG keyframes (image-to-video) |
 | `audio` | LTX: base64 WAV to drive the video (audio-to-video) |
 

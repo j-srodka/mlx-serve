@@ -38,6 +38,7 @@ const w8a8 = @import("w8a8.zig");
 const int8_attn = @import("int8_attn.zig");
 const h3_glue = @import("h3_glue.zig");
 const h3_split = @import("h3_split.zig");
+const h3_tae = @import("h3_tae.zig");
 const h3_vsa = @import("h3_vsa.zig");
 const add_norm = @import("add_norm.zig");
 const ane = @import("ane.zig");
@@ -4470,8 +4471,7 @@ fn renderH3Preview(
     const hw: usize = @as(usize, lat_h) * @as(usize, lat_w);
     const c: usize = preview_mod.minimax_h3.channels();
 
-    const h3_tae_mod = @import("h3_tae.zig");
-    if (n == 1 and h3_tae_mod.enabled()) {
+    if (n == 1 and h3_tae.enabled()) {
         var vol_copy_ms: u64 = 0;
         const cpu_vol = copyArrayF32(allocator, vol, s) catch null;
         if (cpu_vol) |cv| {
@@ -4479,8 +4479,8 @@ fn renderH3Preview(
             if (prof) vol_copy_ms = clk.lapMs();
             const need = c * @as(usize, latent_t) * hw;
             if (cv.len >= need) {
-                var tae_timings: h3_tae_mod.JpegTimings = .{};
-                if (h3_tae_mod.jpegFromLatentProfiled(allocator, cv[0..need], latent_t, lat_h, lat_w, @intCast(c), idx[0], .{
+                var tae_timings: h3_tae.JpegTimings = .{};
+                if (h3_tae.jpegFromLatentProfiled(allocator, cv[0..need], latent_t, lat_h, lat_w, @intCast(c), idx[0], .{
                     .enabled = true,
                     .frames = 1,
                     .max_side = opts.max_side,
@@ -4552,6 +4552,7 @@ pub fn generate(
     progress: ?gen_sse.Progress,
     s: S,
 ) !GenResult {
+    if (std.fs.path.dirname(paths.dit)) |dir| h3_tae.setPackDir(dir);
     const shape = temporalShape(req.frames);
     if (shape.frame_count == 1) {
         if (req.chain_windows > 1) return error.StillNoChain;
@@ -7427,7 +7428,7 @@ test "h3 vsa: the packed layout hands VSA every segment in order, video segments
         .{ .kind = .image, .latent_h = 4, .latent_w = 4 },
         .{ .kind = .video, .latent_h = 4, .latent_w = 8, .latent_t = 2, .audio_t = 3 },
     };
-    var lay = try PackedLayout.initFull(a, 10, 3, 8, 12, 4, &.{}, 9, &refs);
+    var lay = try PackedLayout.initFull(a, 10, 3, 8, 12, 4, &.{}, 9, &refs, 0, 0, 0, 0);
     defer lay.deinit();
     const segs = try lay.vsaSegments(a);
     defer a.free(segs);

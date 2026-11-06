@@ -6,11 +6,13 @@ Created 2026-10-28 from the h3-timeline session (decision D-59 in
 changes in docs/reference.md, skills/mlx-serve/media.md, src/gen.zig, src/minimax_h3.zig,
 lib/mlxc-src — not part of this handoff, leave them alone). Check for drift first.
 
-**Status (2026-10-28): Phase 0 + 0b PASSED.** Core ML ANE warm ~23 ms/chunk at 704²
-(artifacts: `~/Github/h3-timeline/.pi-work/stream-preview/PHASE0B_REPORT.md`).
-Phase 1 scaffold in mlx-serve: `lib/h3_tae/` + env `MINIMAX_H3_TAE_MODEL` (linear arm:
-`MINIMAX_H3_TAE=0`). Shipping still needs your own coremltools build from MIT `taeh3` —
-never redistribute Draw Things' zip.
+**Status (2026-10-28): Phase 0 + 0b PASSED; Phase 1 runtime SHIPPED on branch
+`cursor/h3-tae-ane-preview-32b0`.** macOS uses MIT **taeh3** Core ML on ANE for
+`preview_frames:1` when `minimax_h3_tae/` is beside the pack or in
+`~/.mlx-serve/shared/minimax_h3_tae` (`scripts/fetch_minimax_h3_tae.sh`). Override:
+`MINIMAX_H3_TAE_MODEL`; linear A/B: `MINIMAX_H3_TAE=0`. Full torch→Core ML export
+still dev-only (`scripts/convert_taeh3_coreml.py --import-tree`); never redistribute
+Draw Things' zip.
 
 **Was: TEST FIRST.** Phase 0 was a throwaway probe with no server code before Phase 1.
 
@@ -125,4 +127,17 @@ LATER.md) is moot for this path.
   768×1344). Quality: "slightly lower" than the full VAE; much cheaper.
 - Lower-quality alternative, not recommended: Kijai/MiniMax-H3-TAE (Apache-2.0).
 - Full brief: `~/Github/h3-timeline/.pi-work/stream-preview/RESEARCH_TAE.md`.
+
+## TAE preview stride fix (Core ML `image` output)
+
+ANE `MLMultiArray` outputs use padded strides (e.g. x stride 32, not 3); dense
+indexing in `lib/h3_tae/h3_tae_preview.m` caused vertical stripe JPEGs. Fix:
+stride-aware `f16_at` on `(0, frame, y, x, k)`. Debug: `MINIMAX_H3_TAE_DEBUG=1`
+logs shape/strides; bridge guard in `./tests/test_h3_tae_preview.sh` (fail if
+≥30% columns have mean luminance &lt; 8). Optional PPM: `H3_TAE_DUMP_PPM=1`.
+
+**Sign-off after rebuild:** `zig build -Doptimize=ReleaseFast`, then one streamed
+544² run with `preview_frames:1`, `preview_max_side:1024`; log should show
+`path=tae`, preview JPEG at `/tmp/h3_tae_live_preview.jpg` (or extract first SSE
+`preview` field) — no vertical comb.
 

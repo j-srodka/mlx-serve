@@ -39,11 +39,20 @@ var session: ?*h3_tae_ctx = null;
 var session_path: [512]u8 = undefined;
 var session_path_len: usize = 0;
 
-pub fn enabled() bool {
-    if (envStr("MINIMAX_H3_TAE")) |raw| {
-        if (std.mem.eql(u8, raw, "0")) return false;
-    }
-    return modelPath() != null;
+var open_failed_path: [512]u8 = undefined;
+var open_failed_path_len: usize = 0;
+
+var pack_dir: [512]u8 = undefined;
+var pack_dir_len: usize = 0;
+
+var model_path_buf: [640]u8 = undefined;
+var model_path_len: usize = 0;
+
+/// H3 pack root (directory containing `transformer.safetensors`). Set at generate entry.
+pub fn setPackDir(dir: []const u8) void {
+    const n = @min(dir.len, pack_dir.len);
+    @memcpy(pack_dir[0..n], dir[0..n]);
+    pack_dir_len = n;
 }
 
 fn envStr(name: [:0]const u8) ?[]const u8 {
@@ -52,9 +61,56 @@ fn envStr(name: [:0]const u8) ?[]const u8 {
     return if (slice.len == 0) null else slice;
 }
 
-/// Path to a `.mlmodelc` directory, or a bundle root containing size variants.
+fn bundleLooksValid(root: []const u8) bool {
+    if (root.len == 0 or !std.fs.path.isAbsolute(root)) return false;
+    var buf: [640]u8 = undefined;
+    const sub = std.fmt.bufPrint(&buf, "{s}/768.mlmodelc", .{root}) catch return false;
+    buf[sub.len] = 0;
+    if (std.c.access(buf[0..sub.len :0].ptr, 0) != 0) return false;
+    return true;
+}
+
+fn sharedCacheRoot(out_buf: []u8) ?[]const u8 {
+    if (envStr("MINIMAX_H3_TAE_DIR")) |d| return d;
+    const home = std.c.getenv("HOME") orelse return null;
+    const home_slice = std.mem.span(home);
+    const suffix = "/.mlx-serve/shared/minimax_h3_tae";
+    if (home_slice.len + suffix.len > out_buf.len) return null;
+    @memcpy(out_buf[0..home_slice.len], home_slice);
+    @memcpy(out_buf[home_slice.len .. home_slice.len + suffix.len], suffix);
+    return out_buf[0 .. home_slice.len + suffix.len];
+}
+
+/// Resolved bundle root (directory containing `768.mlmodelc` …), or explicit `.mlmodelc` path.
 pub fn modelPath() ?[]const u8 {
-    return envStr("MINIMAX_H3_TAE_MODEL");
+    if (envStr("MINIMAX_H3_TAE_MODEL")) |m| return m;
+
+    model_path_len = 0;
+
+    if (pack_dir_len > 0) {
+        const n = std.fmt.bufPrint(&model_path_buf, "{s}/minimax_h3_tae", .{pack_dir[0..pack_dir_len]}) catch return null;
+        if (bundleLooksValid(n)) {
+            model_path_len = n.len;
+            return model_path_buf[0..model_path_len];
+        }
+    }
+
+    if (sharedCacheRoot(&model_path_buf)) |shared| {
+        if (bundleLooksValid(shared)) {
+            model_path_len = shared.len;
+            return model_path_buf[0..model_path_len];
+        }
+    }
+
+    return null;
+}
+
+pub fn enabled() bool {
+    if (envStr("MINIMAX_H3_TAE")) |raw| {
+        if (std.mem.eql(u8, raw, "0")) return false;
+    }
+    if (h3_tae_preview_available() == 0) return false;
+    return modelPath() != null;
 }
 
 fn useAne() bool {
@@ -64,19 +120,23 @@ fn useAne() bool {
     return true;
 }
 
-fn resolveModelPath(allocator: std.mem.Allocator, lat_h: u32, lat_w: u32) ![]const u8 {
-    const base = modelPath() orelse return error.NoModel;
-    if (std.mem.endsWith(u8, base, ".mlmodelc")) return try allocator.dupe(u8, base);
+fn variantName(lat_h: u32, lat_w: u32) []const u8 {
     const px = @max(lat_h, lat_w) * 16;
-    const variant: []const u8 = blk: {
-        if (px <= 768) break :blk "768";
-        if (px <= 1024) break :blk "1024";
-        if (px <= 1280) break :blk "1280";
-        if (px <= 1536) break :blk "1536";
-        if (px <= 1792) break :blk "1792";
-        break :blk "2048";
-    };
-    return std.fmt.allocPrint(allocator, "{s}/{s}.mlmodelc", .{ base, variant });
+    if (px <= 768) return "768";
+    if (px <= 1024) return "1024";
+    if (px <= 1280) return "1280";
+    if (px <= 1536) return "1536";
+    if (px <= 1792) return "1792";
+    return "2048";
+}
+
+fn resolveModelPath(allocator: std.mem.Allocator, lat_h: u32, lat_w: u32) ![:0]const u8 {
+    const base = modelPath() orelse return error.NoModel;
+    if (std.mem.endsWith(u8, base, ".mlmodelc")) return try allocator.dupeSentinel(u8, base, 0);
+    const variant = variantName(lat_h, lat_w);
+    const tmp = try std.fmt.allocPrint(allocator, "{s}/{s}.mlmodelc", .{ base, variant });
+    defer allocator.free(tmp);
+    return try allocator.dupeSentinel(u8, tmp, 0);
 }
 
 fn ensureSession(allocator: std.mem.Allocator, lat_h: u32, lat_w: u32) !*h3_tae_ctx {
@@ -92,14 +152,24 @@ fn ensureSession(allocator: std.mem.Allocator, lat_h: u32, lat_w: u32) !*h3_tae_
         session_path_len = 0;
     }
 
+    if (open_failed_path_len > 0 and open_failed_path_len == path.len and
+        std.mem.eql(u8, open_failed_path[0..open_failed_path_len], path))
+    {
+        return error.OpenFailed;
+    }
+
     if (h3_tae_preview_available() == 0) return error.Unavailable;
 
     var errbuf: ErrBuf = undefined;
-    const s = h3_tae_preview_open(path[0..path.len :0].ptr, if (useAne()) 1 else 0, &errbuf, errbuf.len) orelse {
+    const s = h3_tae_preview_open(path.ptr, if (useAne()) 1 else 0, &errbuf, errbuf.len) orelse {
         const msg = std.mem.sliceTo(&errbuf, 0);
-        std.log.warn("[h3-tae] open failed: {s}\n", .{msg});
+        std.log.warn("[h3-tae] open failed path={s}: {s}\n", .{ path, msg });
+        const copy_len = @min(path.len, open_failed_path.len);
+        @memcpy(open_failed_path[0..copy_len], path[0..copy_len]);
+        open_failed_path_len = copy_len;
         return error.OpenFailed;
     };
+    open_failed_path_len = 0;
     const copy_len = @min(path.len, session_path.len);
     @memcpy(session_path[0..copy_len], path[0..copy_len]);
     session_path_len = copy_len;
@@ -261,4 +331,35 @@ fn bilinear(src: []const u8, sw: u32, sh: u32, dst: []u8, dw: u32, dh: u32) void
 
 fn samp(src: []const u8, sw: u32, x: u32, y: u32, ch: u32) f32 {
     return @floatFromInt(src[(@as(usize, y) * @as(usize, sw) + @as(usize, x)) * 3 + ch]);
+}
+
+test "h3 tae variant bucket for 704px canvas latent grid" {
+    const lat_h: u32 = 44;
+    const lat_w: u32 = 44;
+    const px: u32 = @as(u32, @max(lat_h, lat_w)) * 16;
+    try std.testing.expectEqual(@as(u32, 704), px);
+    try std.testing.expect(px <= 768);
+    try std.testing.expectEqualStrings("768", variantName(lat_h, lat_w));
+}
+
+fn bumpStackForTest() void {
+    var x: [8192]u8 = undefined;
+    @memset(&x, 0xA5);
+}
+
+test "h3 tae modelPath uses module buffer not caller stack" {
+    const base = modelPath() orelse return;
+    bumpStackForTest();
+    const again = modelPath() orelse return;
+    try std.testing.expectEqualStrings(base, again);
+    try std.testing.expect(base.ptr == again.ptr);
+}
+
+test "h3 tae resolve path is nul terminated with variant suffix" {
+    const a = std.testing.allocator;
+    _ = modelPath() orelse return;
+    const path = try resolveModelPath(a, 44, 44);
+    defer a.free(path);
+    try std.testing.expect(path[path.len] == 0);
+    try std.testing.expect(std.mem.endsWith(u8, path, "/768.mlmodelc"));
 }

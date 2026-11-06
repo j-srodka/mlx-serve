@@ -3,10 +3,14 @@
 #import <CoreML/CoreML.h>
 #import <Foundation/Foundation.h>
 
+#include <errno.h>
 #include <math.h>
 #include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 typedef __fp16 f16;
 
@@ -38,6 +42,30 @@ static void zero_f16(MLMultiArray *arr) {
     if (arr.dataType != MLMultiArrayDataTypeFloat16) return;
     f16 *p = arr.dataPointer;
     for (NSInteger i = 0; i < arr.count; i++) p[i] = (f16)0;
+}
+
+static f16 f16_at(const MLMultiArray *a, const int idx[5]) {
+    const f16 *base = a.dataPointer;
+    size_t off = 0;
+    for (NSInteger d = 0; d < a.strides.count; d++) {
+        off += (size_t)idx[d] * (size_t)a.strides[d].integerValue;
+    }
+    return base[off];
+}
+
+static void log_array_strides(const MLMultiArray *a, const char *name) {
+    if (!getenv("MINIMAX_H3_TAE_DEBUG")) return;
+    NSMutableString *sh = [NSMutableString stringWithFormat:@"[h3-tae] %s shape=", name];
+    NSMutableString *st = [NSMutableString stringWithString:@" strides="];
+    for (NSInteger i = 0; i < a.shape.count; i++) {
+        [sh appendFormat:@"%ld", (long)a.shape[i].integerValue];
+        [st appendFormat:@"%ld", (long)a.strides[i].integerValue];
+        if (i + 1 < a.shape.count) {
+            [sh appendString:@","];
+            [st appendString:@","];
+        }
+    }
+    fprintf(stderr, "%s%s\n", sh.UTF8String, st.UTF8String);
 }
 
 static MLMultiArray *make_chunk(const float *latent, int T, int H, int W, int C, int chunk_t, int pad_h,
@@ -107,7 +135,68 @@ static MLMultiArray *predict_chunk(MLModel *model, MLMultiArray *chunk, NSMutabl
         }
         states[i] = next;
     }
+    // If preview ever carries act_* across chunks, densify strided `next` before re-feeding.
     return image;
+}
+
+static int is_regular_file(const char *p) {
+    struct stat st;
+    if (stat(p, &st) != 0) return 0;
+    return S_ISREG(st.st_mode);
+}
+
+static int dest_is_shared_file(const char *p) {
+    struct stat st;
+    if (lstat(p, &st) != 0) return 0;
+    if (S_ISLNK(st.st_mode)) return 0;
+    return S_ISREG(st.st_mode);
+}
+
+static int copy_file(const char *src, const char *dst) {
+    FILE *in = fopen(src, "rb");
+    if (!in) return -1;
+    FILE *out = fopen(dst, "wb");
+    if (!out) {
+        fclose(in);
+        return -1;
+    }
+    char buf[1 << 16];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            fclose(in);
+            fclose(out);
+            return -1;
+        }
+    }
+    int bad = ferror(in);
+    fclose(in);
+    if (fclose(out) != 0) return -1;
+    return bad ? -1 : 0;
+}
+
+static int link_weight_bin_if_needed(const char *mlmodelc_path) {
+    char bundle_root[4096];
+    char src[4096];
+    char dst[4096];
+    char weights_dir[4096];
+    strncpy(bundle_root, mlmodelc_path, sizeof(bundle_root) - 1);
+    bundle_root[sizeof(bundle_root) - 1] = 0;
+    char *last = strrchr(bundle_root, '/');
+    if (!last) return -1;
+    *last = 0;
+    snprintf(src, sizeof(src), "%s/weight.bin", bundle_root);
+    snprintf(weights_dir, sizeof(weights_dir), "%s/weights", mlmodelc_path);
+    snprintf(dst, sizeof(dst), "%s/weight.bin", weights_dir);
+    if (!is_regular_file(src)) return -1;
+    if (dest_is_shared_file(dst)) return 0;
+    (void)mkdir(weights_dir, 0755);
+    // Import trees leave a dangling symlink to a temp probe; stat() follows it
+    // so a later link() hits EEXIST. Unlink any non-file dest, then hardlink.
+    (void)unlink(dst);
+    if (link(src, dst) == 0) return 0;
+    if (copy_file(src, dst) == 0) return 0;
+    return -1;
 }
 
 h3_tae_ctx *h3_tae_preview_open(const char *bundle_dir, int use_ane, char *error, size_t error_size) {
@@ -120,6 +209,11 @@ h3_tae_ctx *h3_tae_preview_open(const char *bundle_dir, int use_ane, char *error
         MLModelConfiguration *cfg = [[MLModelConfiguration alloc] init];
         cfg.computeUnits = use_ane ? MLComputeUnitsCPUAndNeuralEngine : MLComputeUnitsAll;
         NSURL *url = [NSURL fileURLWithPath:@(bundle_dir)];
+        if (link_weight_bin_if_needed(bundle_dir) != 0) {
+            fail(error, error_size, "weight.bin missing or unlinkable under %s (errno=%d)", bundle_dir,
+                 errno);
+            return NULL;
+        }
         MLModel *model = [MLModel modelWithContentsOfURL:url configuration:cfg error:&err];
         if (!model) {
             fail(error, error_size, "load model: %s", err.localizedDescription.UTF8String ?: "unknown");
@@ -190,7 +284,7 @@ int h3_tae_preview_decode_frame(h3_tae_ctx *ctx, const float *latent, int t, int
             fail(error, error_size, "image not fp16");
             return -1;
         }
-        const f16 *img = image.dataPointer;
+        log_array_strides(image, "image");
         const int img_t = (int)image.shape[1].intValue;
         const int img_h = (int)image.shape[2].intValue;
         const int img_w = (int)image.shape[3].intValue;
@@ -198,11 +292,12 @@ int h3_tae_preview_decode_frame(h3_tae_ctx *ctx, const float *latent, int t, int
             fail(error, error_size, "frame index oob");
             return -1;
         }
+        // Core ML / ANE outputs may use padded strides; never index dataPointer densely.
         for (int y = 0; y < pixel_h && y < img_h; y++) {
             for (int x = 0; x < pixel_w && x < img_w; x++) {
-                const size_t base = (size_t)(((out_frame_in_chunk * img_h + y) * img_w + x) * 3);
                 for (int k = 0; k < 3; k++) {
-                    float v = (float)img[base + (size_t)k];
+                    const int idx[5] = {0, out_frame_in_chunk, y, x, k};
+                    float v = (float)f16_at(image, idx);
                     v = fminf(fmaxf(v, 0.f), 1.f) * 255.f;
                     out_rgb[(y * pixel_w + x) * 3 + k] = (uint8_t)v;
                 }
