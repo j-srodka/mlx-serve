@@ -172,6 +172,7 @@ class DownloadManager: ObservableObject {
     ///   convention; live: `DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf` in
     ///   antirez/deepseek-v4-gguf). Not loadable as a chat model — it's a
     ///   dependency of the main quant, downloaded alongside it.
+    /// - `*-Vision.gguf` — DeepSeek-V4.1's DS4 vision tower, loaded beside the set.
     ///
     /// This has to be exhaustive because discovery lists EVERY quant in a folder
     /// as a separately selectable model — anything not filtered here becomes a
@@ -187,8 +188,10 @@ class DownloadManager: ObservableObject {
         // server-side, never a servable chat quant.
         return lower.hasPrefix("mmproj") || lower.contains("tokenizer")
             || lower.hasPrefix("mtp-") // llama.cpp's head-only `convert --mtp` export
+            || lower.hasPrefix("dspark-") // Unsloth's DeepSeek-V4.1 stage bundle
             || lower.contains("-mtp-") || lower.contains("-mtp.")
             || lower.contains("-dspark-") || lower.contains("-dspark.")
+            || lower.hasSuffix("-vision.gguf") // DeepSeek-V4.1's DS4 vision tower beside the set
     }
 
     /// Retained for the mmproj-specific call sites (the Swift mirror of the
@@ -286,6 +289,7 @@ class DownloadManager: ObservableObject {
             } else if !selection.recursive {
                 guard !path.contains("/") || path.hasPrefix("mtp/") || path.hasPrefix(DrafterGems.packFolder + "/")
                     || path.hasPrefix("engram/") || path.hasPrefix("tensors/") || path == "optiq/mtp.safetensors"
+                    || path.hasPrefix("audio_tokenizer/")   // a model that speaks: its speech codec (LFM3-Audio, Omni)
                     || indexedShards.contains(path) else { return nil }
             }
             let ext = (path as NSString).pathExtension.lowercased()
@@ -339,7 +343,7 @@ class DownloadManager: ObservableObject {
     /// root markers made its complete 8.9 GB download read as absent forever
     /// (the Kokoro-vs-`tts()` bug: the pane offers Download, the click reverts).
     /// The server has the same problem and solves it the same way — it
-    /// classifies that repo from the DiT's weight NAMES (`peekMfluxFlux2`), not
+    /// classifies that repo from the DiT's weight NAMES (the flux2 plugin's `claims`), not
     /// from a root file.
     nonisolated static func holdsWeightLayout(_ dir: String) -> Bool {
         let fm = FileManager.default
@@ -370,6 +374,7 @@ class DownloadManager: ObservableObject {
         case "moss_image": return "vae/diffusion_pytorch_model.safetensors"
         case "trellis2": return "microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16.safetensors"
         case "pixal3d": return "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors"
+        case "idol": return "vae/model.safetensors"
         default: return nil
         }
     }
@@ -395,12 +400,12 @@ class DownloadManager: ObservableObject {
     }
 
     /// Laya typed-decision checkpoints ship no root config.json; these two
-    /// files identify one. Twin of `model_discovery.peekLayaCheckpoint`.
+    /// files identify one. Twin of the laya plugin's `claims`.
     nonisolated static let layaMarkers = ["rl_agent_config.json", "encoder/config.json"]
 
     /// The model_type a marker file decides, or nil. Laya has no root config.json;
     /// a Kev pack's names its Qwen trunk, so `kev_config.json` wins. Twin of
-    /// `model_discovery.peekKevPack`.
+    /// the kev plugin's `claims`.
     nonisolated static func markerModelType(inDir dir: String) -> String? {
         let fm = FileManager.default
         if fm.fileExists(atPath: (dir as NSString).appendingPathComponent("joint_head_config.json")) { return "clef" }
@@ -410,6 +415,7 @@ class DownloadManager: ObservableObject {
         if fm.fileExists(atPath: (dir as NSString).appendingPathComponent("kev_config.json")) { return "kev" }
         if isD1Config(atPath: (dir as NSString).appendingPathComponent("config.json")) { return "d1" }
         if isStableAudio3Config(atPath: (dir as NSString).appendingPathComponent("model_config.json")) { return "stable_audio3" }
+        if isIdolConfig(atPath: (dir as NSString).appendingPathComponent("config.json")) { return "idol" }
         if isPixal3dPipeline(inDir: dir) { return "pixal3d" }
         if isTrellis2Pipeline(atPath: (dir as NSString).appendingPathComponent("pipeline.json")) { return "trellis2" }
         if qwen3AsrThinker(dir) == "qwen3_forced_aligner" { return "qwen3_forced_aligner" }
@@ -417,12 +423,20 @@ class DownloadManager: ObservableObject {
     }
 
     /// A D1 decision checkpoint (LiquidAI/d1-3B): its LFM2-VL config's `auto_map` names the card's own class,
-    /// which is what tells it from a chat LFM2.5-VL. Twin of `model_discovery.isD1Root`.
+    /// which is what tells it from a chat LFM2.5-VL. Twin of the d1 plugin's `claims`.
     nonisolated static func isD1Config(atPath path: String) -> Bool {
         guard let data = FileManager.default.contents(atPath: path),
               let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let map = cfg["auto_map"] as? [String: Any] else { return false }
         return map["AutoModel"] as? String == "modeling_d1.D1Model"
+    }
+
+    /// speridlabs' Idol release: its config.json has no `model_type`, its denoiser's class name tells it. Twin of the
+    /// idol plugin's `claims`.
+    nonisolated static func isIdolConfig(atPath path: String) -> Bool {
+        guard let data = FileManager.default.contents(atPath: path),
+              let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        return (cfg["denoiser"] as? [String: Any])?["name"] as? String == "LatentSeqMMFlowModel"
     }
 
     /// Microsoft's TRELLIS.2 image-to-3D pack: no root config.json, its `pipeline.json` names the pipeline.
@@ -449,7 +463,7 @@ class DownloadManager: ObservableObject {
 
     /// A stable-audio-tools inpainting model conditioned on T5Gemma: the
     /// Stable Audio 3 family as Stability publishes it. Twin of
-    /// `model_discovery.peekStableAudio3Config`.
+    /// the stable_audio3 plugin's `claims`.
     nonisolated static func isStableAudio3Config(atPath path: String) -> Bool {
         guard let data = FileManager.default.contents(atPath: path),
               let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -2064,7 +2078,7 @@ class DownloadManager: ObservableObject {
         guard let data = fm.contents(atPath: (dir as NSString).appendingPathComponent("model.safetensors.index.json")),
               let text = String(data: data, encoding: .utf8) else { return false }
         return ["\"mtp.fc.weight\"", "\"language_model.mtp.fc.weight\"", "\"mtp.eh_proj.weight\"",
-                "\"language_model.mtp.eh_proj.weight\"", "\"language_model.mtp.fc_hidden.weight\""]
+                "\"language_model.mtp.eh_proj.weight\"", "\"language_model.mtp.fc_hidden.weight\"", "\"mtp.fc_hidden.weight\""]
             .contains { text.contains($0) }
     }
 

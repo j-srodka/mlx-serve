@@ -47,10 +47,25 @@ final class ChatWorkspaceTests: XCTestCase {
             "Cancel still wins — it is the sheet's one door")
     }
 
-    func testEntryLandsOnTheRecommendedSection() {
-        XCTAssertEqual(ChatWorkspace.defaultEntry, .models(.recommended))
-        XCTAssertTrue(ChatWorkspace.defaultEntry.isModels)
+    func testDefaultBrowserEntryDependsOnLocalLibrary() {
+        XCTAssertEqual(ChatWorkspace.modelBrowserEntry(localModels: []), .models(.recommended))
+        let model = LocalModel(id: "local", name: "Qwen", path: "/fixture/Qwen", sizeFormatted: "1 GB",
+                               modelType: "qwen3", source: .mlxServe, kind: .base)
+        XCTAssertEqual(ChatWorkspace.modelBrowserEntry(localModels: [model]), .models(.myModels))
         XCTAssertEqual(ChatWorkspace.conversation.section, nil)
+    }
+
+    func testMediaOnlyLibraryOpensRecommended() {
+        let model = LocalModel(id: "image", name: "FLUX", path: "/fixture/FLUX", sizeFormatted: "1 GB",
+                               modelType: "flux", source: .mlxServe, kind: .base)
+        XCTAssertFalse(model.isChatPickable)
+        XCTAssertEqual(ChatWorkspace.modelBrowserEntry(localModels: [model]), .models(.recommended))
+    }
+
+    func testExplicitBrowserDestinationsArePreserved() {
+        for section in ModelBrowserSection.allCases {
+            XCTAssertEqual(ChatWorkspace.modelBrowserEntry(section: section, localModels: []), .models(section))
+        }
     }
 
     // MARK: - One chokepoint in
@@ -159,6 +174,8 @@ final class ChatWorkspaceTests: XCTestCase {
                       // trap the Tasks columns hit, invisible to this audit for
                       // exactly as long as the file was missing from this list.
                       "Sources/MLXServe/Views/AgentsWindow.swift",
+                      // Models ▸ Plugins reads the download manager for its pack rows.
+                      "Sources/MLXServe/Views/PluginsPane.swift",
                       "Sources/MLXServe/Views/TerminalPane.swift"]
         let pattern = try NSRegularExpression(pattern: #"@EnvironmentObject\s+var\s+\w+\s*:\s*(\w+)"#)
         var types = Set<String>()
@@ -521,12 +538,12 @@ final class ChatWorkspaceTests: XCTestCase {
                        "\"Recent\" was renamed to \"Sessions\"")
         XCTAssertTrue(chat.contains("if !rows.agents.isEmpty"),
                       "the Agents section must be hidden when empty")
-        // Pinned above the list, so no destination scrolls away.
-        guard let inset = chat.range(of: "safeAreaInset(edge: .top)"),
-              let rows = chat.range(of: "destinationRow(", range: inset.upperBound..<chat.endIndex) else {
-            return XCTFail("the destinations must ride the sidebar's top inset")
+        // Outside the scrolling list, so no destination scrolls away.
+        guard let block = chat.range(of: "private var destinations: some View {"),
+              let rows = chat.range(of: "destinationRow(", range: block.upperBound..<chat.endIndex) else {
+            return XCTFail("the destinations must be their own block above the list")
         }
-        XCTAssertLessThan(inset.lowerBound, rows.lowerBound)
+        XCTAssertLessThan(block.lowerBound, rows.lowerBound)
         // The Create section: rows for the generators, from the SAME catalogue
         // the chips and the Tools menu iterate (`sidebarCreateItems`, pinned in
         // ChatEmptyStateTests) — a hand list here is where the three surfaces

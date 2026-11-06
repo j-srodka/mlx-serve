@@ -42,6 +42,8 @@ msv_ane_model *msv_ane_model_create(const char *name, const char *mil,
                                   uint32_t procedure_count, int ane_instance,
                                   char *error, size_t error_size);
 void msv_ane_model_free(msv_ane_model *model);
+/* Models loaded in the process now, every caller's: the runtime refuses loads past about 121. */
+uint32_t msv_ane_resident(void);
 
 int msv_ane_model_eval(msv_ane_model *model, uint32_t procedure, char *error,
                        size_t error_size);
@@ -59,9 +61,7 @@ bool msv_ane_model_cache_hit(const msv_ane_model *model);
  * (the hash covers the MIL text AND the weights, so same-shape
  * different-weight models never collide; MLX_SERVE_ANE_CACHE_DIR overrides
  * the root). Only the compiled artifacts are kept; the `data` file embeds
- * the constants. MLX_SERVE_ANE_CACHE=0 disables reuse, and freeing a model
- * while disabled also evicts its entry. */
-bool msv_ane_cache_enabled(void);
+ * the constants. */
 
 /* Names the (seam + shape, share) the next compiles belong to: entries of
  * the same group at a different variant are pruned on the cold-compile

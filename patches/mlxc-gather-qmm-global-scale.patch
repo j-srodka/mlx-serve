@@ -6,6 +6,10 @@ extended signature this mlx-c revision already matches the fork (quantize,
 dequantize, qqmm all carry global_scale here). Shim: pass no global scale —
 the C ABI has no surface for it yet.
 
+Older MLX/mlx-c pairings also needed an extra SDPA argument in `fast.cpp`; MLX
+≥0.32.5 removed that parameter — do not patch `fast.cpp` here (pair with
+`scaled_dot_product_attention` as published in `mlx/fast.h`).
+
 --- a/mlx/c/ops.cpp
 +++ b/mlx/c/ops.cpp
 @@ -1501,5 +1501,7 @@

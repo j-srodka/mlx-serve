@@ -349,7 +349,7 @@ final class LocalizationTests: XCTestCase {
     /// the same evidence as adding a key: a branch that resolves in the table.
     private static let labelProducers = [
         "actionLabel", "actionTitle", "buttonLabel", "caption",
-        "controller.partialTranscript", "defect?.explanation", "detail", "displayName",
+        "defect?.explanation", "detail", "displayName",
         "engineExplainer", "label", "lead", "modeLabel", "modelPickerLabel", "placeholder", "pretty",
         "run.summary ?? run.status.label", "shortMessage", "startupModelLabel", "statusLine", "title",
     ]
@@ -550,6 +550,19 @@ final class LocalizationTests: XCTestCase {
         }
     }
 
+    /// The marketplace renders an input's `helpText` through `L10n.text`, so a
+    /// wording change must re-key every catalog that translates it.
+    func testMCPInputHelpTextResolvesInEveryCatalog() throws {
+        let ado = try XCTUnwrap(MCPCatalog.entry(for: "azure-devops"))
+        let help = try XCTUnwrap(ado.inputs.first { $0.id == "ado_pat" }?.helpText)
+        let resources = Self.catalogURL.deletingLastPathComponent().deletingLastPathComponent()
+        for lang in ["zh-Hans", "ko"] {
+            let data = try Data(contentsOf: resources.appendingPathComponent("\(lang).lproj/Localizable.strings"))
+            let entries = try XCTUnwrap(PropertyListSerialization.propertyList(from: data, format: nil) as? [String: String])
+            XCTAssertNotNil(entries[help], "\(lang): the Azure DevOps PAT help text has no entry")
+        }
+    }
+
     /// The image pane's resolution menu is a producer table too.
     func testImageResolutionLabelsResolveInTheCatalog() throws {
         let keys = Set(try catalog().map(\.key))
@@ -644,11 +657,9 @@ final class LocalizationTests: XCTestCase {
     func testVoiceAndChatProducerValuesResolveInTheCatalog() throws {
         let keys = Set(try catalog().map(\.key))
 
-        for issue: VoicePreflight.Issue in [.microphoneDenied, .speechDenied,
-                                            .dictationUnavailable(locale: "en-US")] {
+        for issue: VoicePreflight.Issue in [.microphoneDenied, .asrMissing] {
             assertResolves(VoicePreflight.shortMessage(for: issue), "voice short message", keys: keys)
-            assertResolves(VoicePreflight.detail(for: issue), "voice detail",
-                           values: [("en-US", "%@")], keys: keys)
+            assertResolves(VoicePreflight.detail(for: issue), "voice detail", keys: keys)
             assertResolves(VoicePreflight.actionLabel(for: issue), "voice action", keys: keys)
         }
 

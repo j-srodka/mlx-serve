@@ -1,41 +1,17 @@
 #!/bin/bash
-# test_tool_matrix_small.sh — cross-model tool-call matrix for the sub-4B fleet.
+# test_tool_matrix_small.sh — tool calls on the sub-4B fleet, one model at a time, where small models fail: a one-shot
+# file write whose content carries raw newlines and unescaped inner quotes. Per model, stream and non-stream: a trivial
+# bash call fires; the quotes+newlines write FIRES (not dropped), arguments are valid JSON, the path byte-exact,
+# `class="hero"` survives, no tool tag leaks into content; a full HTML page write is not dropped or emptied. Reports per
+# model whether `[tool-parse] loose-repair recovered` engaged (informational). Outcome-based: a model that escapes
+# right or one the server repairs both pass.
 #
-# Companion to test_format_matrix.sh (which keys on format-family reps and only
-# byte-checks a TRIVIAL write). This one boots the SMALL models one at a time and
-# stresses the thing small models actually fail at: writing a file in one shot
-# whose content carries the escaping hazards that strict JSON rejects — raw
-# newlines and unescaped inner quotes. The bug those triggered (pre-fix) was the
-# WHOLE tool call getting dropped and the file leaking into visible content; the
-# server-side looseRepairToolCallJson recovery is what these assertions pin live.
+#   ./tests/test_tool_matrix_small.sh   # TOOL_MODELS=qwen35-2b,gemma4-e4b, PORT (11298); missing models skip
 #
-# Per model, per request the battery asserts:
-#   • bash baseline  — a trivial tool call fires at all (name + valid JSON args)
-#   • quotes+newlines write — call FIRES (not dropped), args valid JSON, path
-#     byte-exact, content carries the attribute-quote token `class="hero"`, and
-#     NO <tool_call>/<|tool_call> tag leaks into visible content
-#   • big-file write — a full HTML page: call fires, valid JSON, content length
-#     over a floor (the call neither dropped nor silently emptied)
-# each in BOTH non-stream and stream mode. It also greps the server log for the
-# `[tool-parse] loose-repair recovered …` line and REPORTS per model whether the
-# recovery actually engaged — i.e. which of these small models mis-escape in the
-# wild (informational, never a failure).
-#
-# Outcome-based on purpose: a model that escapes correctly OR whose mangled
-# output the server recovers both PASS — that is the cross-model "tool calls work"
-# signal. A capability miss (a 0.8B that won't follow "exactly") shows as a FAIL
-# for that one check on that one model, which is itself the signal you want.
-# The deterministic proof of the recovery logic lives in the hermetic corpus
-# test: `zig build test -Dtest-filter="format corpus"`.
-#
-# Usage: ./tests/test_tool_matrix_small.sh
-#   TOOL_MODELS=qwen35-2b,gemma4-e4b   — csv filter of logical names
-#   PORT=11298                          — override port
-#   Missing model paths skip cleanly (exit 0 if nothing ran, nothing failed).
-#
-# Runtime: ~1–2 min/model (these are small), ~5–10 min for all five.
+# The deterministic proof of the repair is the format corpus (`zig build test -Dtest-filter="format corpus"`).
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 cd "$(dirname "$0")/.."
 source tests/_lib_models.sh
 
@@ -78,6 +54,13 @@ big_content_check() { # mode verdict finish_reason
     if [ "$3" = "length" ]; then echo "  skip [$logical] big-file write ($1): content >=400 bytes — the model ran to max_tokens"; return; fi
     check "[$logical] big-file write ($1): content >=400 bytes" "$([ "$(echo "$2"|cut -d'|' -f4)" = 1 ] && echo 1 || echo 0)"
 }
+big_write_checks() { # mode verdict finish_reason finish_details.type
+    # A write the server cut as a repetition loop has no call by design (the loop's markup is never parsed).
+    if [ "$4" = "repetition_loop" ]; then echo "  skip [$logical] big-file write ($1): the model looped and the server cut it"; return; fi
+    check "[$logical] big-file write ($1): call FIRES (not dropped)" "$([ "$(echo "$2"|cut -d'|' -f1)" = 1 ] && echo 1 || echo 0)"
+    check "[$logical] big-file write ($1): args valid JSON"         "$([ "$(echo "$2"|cut -d'|' -f2)" = 1 ] && echo 1 || echo 0)"
+    big_content_check "$1" "$2" "$3"
+}
 check() {
     local desc="$1" ok="$2"
     if [ "$ok" = "1" ]; then PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} $desc"
@@ -116,10 +99,10 @@ print(json.dumps(body))
 PY
 }
 
-# Accumulate an SSE stream into {"finish","content","calls":[{name,args}]}.
+# Accumulate an SSE stream into {"finish","details","content","calls":[{name,args}]} (details = finish_details.type).
 SSE_ACCUM='
 import json,sys
-calls={}; fr=None; c=""
+calls={}; fr=None; fd=None; c=""
 for line in sys.stdin:
     line=line.strip()
     if not line.startswith("data:"): continue
@@ -129,6 +112,7 @@ for line in sys.stdin:
     except: continue
     ch=(o.get("choices") or [{}])[0]
     if ch.get("finish_reason"): fr=ch["finish_reason"]
+    if ch.get("finish_details"): fd=ch["finish_details"].get("type")
     d=ch.get("delta",{})
     c+=d.get("content") or ""
     for tc in d.get("tool_calls") or []:
@@ -136,7 +120,7 @@ for line in sys.stdin:
         f=tc.get("function",{})
         if f.get("name"): e["name"]=f["name"]
         e["args"]+=f.get("arguments") or ""
-print(json.dumps({"finish":fr,"content":c,"calls":[calls[k] for k in sorted(calls)]}))
+print(json.dumps({"finish":fr,"details":fd,"content":c,"calls":[calls[k] for k in sorted(calls)]}))
 '
 
 # Verdict for a write call. argv: expected_path must_contain min_len
@@ -177,11 +161,7 @@ run_model() {
     "$BINARY" --model "$path" --serve --port "$PORT" --ctx-size 8192 --log-level debug > "$log" 2>&1 &
     local sp=$!
     local up=0
-    for _ in $(seq 1 90); do
-        curl -sf "$BASE/health" >/dev/null 2>&1 && { up=1; break; }
-        kill -0 "$sp" 2>/dev/null || break
-        sleep 2
-    done
+    srv_wait_health "$BASE" 90 2 "$sp" && up=1
     if [ "$up" != "1" ]; then
         check "[$logical] server boots" 0
         tail -10 "$log" | sed 's/^/    /'; kill "$sp" 2>/dev/null; return 1
@@ -221,18 +201,14 @@ run_model() {
         -d "$(mkreq "$BIG_MSG" "[$WRITE_TOOL]" 0 3500)")
     V=$(jget "$R" "__import__('json').dumps({'name':(r['choices'][0]['message'].get('tool_calls') or [{}])[0].get('function',{}).get('name',''),'args':(r['choices'][0]['message'].get('tool_calls') or [{}])[0].get('function',{}).get('arguments',''),'content':r['choices'][0]['message'].get('content') or ''})" \
         | python3 -c "$WRITE_VERDICT" mars.html '-' 400)
-    check "[$logical] big-file write (non-stream): call FIRES (not dropped)" "$([ "$(echo "$V"|cut -d'|' -f1)" = 1 ] && echo 1 || echo 0)"
-    check "[$logical] big-file write (non-stream): args valid JSON"         "$([ "$(echo "$V"|cut -d'|' -f2)" = 1 ] && echo 1 || echo 0)"
-    big_content_check "non-stream" "$V" "$(jget "$R" "r['choices'][0]['finish_reason']")"
+    big_write_checks "non-stream" "$V" "$(jget "$R" "r['choices'][0]['finish_reason']")" "$(jget "$R" "(r['choices'][0].get('finish_details') or {}).get('type')")"
 
     # ── big-file write, STREAM ──
     ACC=$(curl -sN "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
         -d "$(mkreq "$BIG_MSG" "[$WRITE_TOOL]" 1 3500)" | python3 -c "$SSE_ACCUM")
     V=$(jget "$ACC" "__import__('json').dumps({**((r['calls'] or [{'name':'','args':''}])[0]),'content':r['content']})" \
         | python3 -c "$WRITE_VERDICT" mars.html '-' 400)
-    check "[$logical] big-file write (stream): call FIRES (not dropped)" "$([ "$(echo "$V"|cut -d'|' -f1)" = 1 ] && echo 1 || echo 0)"
-    check "[$logical] big-file write (stream): args valid JSON"         "$([ "$(echo "$V"|cut -d'|' -f2)" = 1 ] && echo 1 || echo 0)"
-    big_content_check "stream" "$V" "$(jget "$ACC" "r['finish']")"
+    big_write_checks "stream" "$V" "$(jget "$ACC" "r['finish']")" "$(jget "$ACC" "r['details']")"
 
     # Informational: did the server-side recovery actually engage for this model?
     local recov

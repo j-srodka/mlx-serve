@@ -79,11 +79,6 @@ static NSString *bridge_cache_root(void) {
     return root;
 }
 
-bool msv_ane_cache_enabled(void) {
-    const char *env = getenv("MLX_SERVE_ANE_CACHE");
-    return !env || atoi(env) != 0;
-}
-
 static void bridge_write_sources(NSString *directory, NSData *program,
                                  NSData *weights) {
     NSFileManager *files = [NSFileManager defaultManager];
@@ -304,12 +299,6 @@ static void bridge_cache_store(NSString *identifier, NSString *directory) {
         [entry stringByAppendingPathComponent:@"compiled.ok"] atomically:YES];
 }
 
-static void bridge_cache_evict(const char *identifier) {
-    if (!identifier) return;
-    [[NSFileManager defaultManager]
-        removeItemAtPath:bridge_cache_entry(@(identifier)) error:nil];
-}
-
 /* Symbol indices for one procedure: oMLX query the model rather than
  * assuming 0..count-1 (qwen35_ane.mm:724-731), because a bank's procedures
  * do NOT share one symbol numbering — the identity mapping serves procedure
@@ -368,13 +357,44 @@ static bool bridge_retryable(NSError *failure) {
  * builds are in flight. */
 #define BRIDGE_BARE_TRIES 3
 
+/* The models loaded now, every user's: weak, so one freed without an unload drops out too. */
+static NSHashTable *bridge_resident_set(void) {
+    static NSHashTable *set;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ set = [NSHashTable weakObjectsHashTable]; });
+    return set;
+}
+
+static void bridge_mark_resident(id model, bool resident) {
+    NSHashTable *set = bridge_resident_set();
+    @synchronized (set) {
+        if (resident) [set addObject:model];
+        else [set removeObject:model];
+    }
+}
+
+uint32_t msv_ane_resident(void) {
+    NSHashTable *set = bridge_resident_set();
+    @synchronized (set) {
+        return (uint32_t)set.allObjects.count;
+    }
+}
+
+/* Unloads `model`; it no longer counts as resident whatever the runtime answers. */
+static BOOL bridge_unload(id model, NSError **failure) {
+    bridge_mark_resident(model, false);
+    return ((BOOL(*)(id, SEL, unsigned int, NSError **))objc_msgSend)(model, @selector(unloadWithQoS:error:), 21, failure);
+}
+
 /* Load `model`, again after a pause when the runtime refuses. */
 static BOOL bridge_load(id model, NSDictionary *options, NSError **failure) {
     for (int attempt = 0;; attempt++) {
         *failure = nil;
         if (((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-                model, @selector(loadWithQoS:options:error:), 21, options, failure))
+                model, @selector(loadWithQoS:options:error:), 21, options, failure)) {
+            bridge_mark_resident(model, true);
             return YES;
+        }
         if (attempt + 1 >= BRIDGE_BARE_TRIES) return NO;
         usleep(200000);
     }
@@ -430,8 +450,7 @@ static bool bridge_compile_load(const char *name, id model, NSData *program,
     });
     NSString *directory = [NSTemporaryDirectory() stringByAppendingPathComponent:identifier];
     NSFileManager *files = [NSFileManager defaultManager];
-    bool cache = msv_ane_cache_enabled();
-    bool cached = cache && bridge_cache_restore(identifier, directory);
+    bool cached = bridge_cache_restore(identifier, directory);
     if (cached) bridge_cache_tag(bridge_cache_entry(identifier));
     if (!cached) bridge_write_sources(directory, program, weights);
     [[NSString stringWithFormat:@"%d", getpid()]
@@ -467,10 +486,8 @@ static bool bridge_compile_load(const char *name, id model, NSData *program,
             [files removeItemAtPath:directory error:nil];
             return false;
         }
-        if (cache) {
-            bridge_cache_prune();
-            bridge_cache_store(identifier, directory);
-        }
+        bridge_cache_prune();
+        bridge_cache_store(identifier, directory);
     }
     /* The staging weights blob and MIL text are COMPILE inputs only —
      * the warm-restore path loads AND SERVES from a mirror that never
@@ -636,9 +653,7 @@ int msv_ane_model_unload(msv_ane_model *handle, char *error, size_t error_size) 
     }
     @autoreleasepool {
         NSError *failure = nil;
-        if (!((BOOL(*)(id, SEL, unsigned int, NSError **))objc_msgSend)(
-                (__bridge id)handle->model, @selector(unloadWithQoS:error:), 21,
-                &failure)) {
+        if (!bridge_unload((__bridge id)handle->model, &failure)) {
             bridge_fail(error, error_size, "ANE unload failed: %s",
                         failure ?
                         failure.localizedDescription.UTF8String : "?");
@@ -657,11 +672,8 @@ int msv_ane_model_reload(msv_ane_model *handle, char *error, size_t error_size) 
         NSString *directory = @(handle->staging_directory);
         bridge_cache_restore(directory.lastPathComponent, directory);
         NSError *failure = nil;
-        if (!((BOOL(*)(id, SEL, unsigned int, id, NSError **))objc_msgSend)(
-                (__bridge id)handle->model,
-                @selector(loadWithQoS:options:error:), 21,
-                handle->options ? (__bridge id)handle->options : @{},
-                &failure)) {
+        if (!bridge_load((__bridge id)handle->model,
+                         handle->options ? (__bridge id)handle->options : @{}, &failure)) {
             bridge_fail(error, error_size, "ANE reload failed: %s",
                         failure ?
                         failure.localizedDescription.UTF8String : "?");
@@ -677,8 +689,7 @@ void msv_ane_model_free(msv_ane_model *handle) {
         if (handle->model) {
             id model = (__bridge_transfer id)handle->model;
             NSError *failure = nil;
-            ((BOOL(*)(id, SEL, unsigned int, NSError **))objc_msgSend)(
-                model, @selector(unloadWithQoS:error:), 21, &failure);
+            bridge_unload(model, &failure);
         }
         if (handle->requests) {
             id requests = (__bridge_transfer id)handle->requests;
@@ -691,10 +702,6 @@ void msv_ane_model_free(msv_ane_model *handle) {
         if (handle->staging_directory) {
             [[NSFileManager defaultManager]
                 removeItemAtPath:@(handle->staging_directory) error:nil];
-            if (!msv_ane_cache_enabled())
-                bridge_cache_evict(strrchr(handle->staging_directory, '/') ?
-                    strrchr(handle->staging_directory, '/') + 1 :
-                    handle->staging_directory);
             free(handle->staging_directory);
         }
     }
@@ -861,7 +868,7 @@ msv_ane_program *msv_ane_program_create(const char *name, const char *mil,
     fail:
         for (id m in models) {
             NSError *failure = nil;
-            ((BOOL(*)(id, SEL, unsigned int, NSError **))objc_msgSend)(m, @selector(unloadWithQoS:error:), 21, &failure);
+            bridge_unload(m, &failure);
         }
         if (p->staging_directory) {
             if (bridge_staging_release(p->staging_directory))
@@ -880,7 +887,7 @@ void msv_ane_program_free(msv_ane_program *p) {
             NSArray *models = (__bridge_transfer NSArray *)p->models;
             for (id m in models) {
                 NSError *failure = nil;
-                ((BOOL(*)(id, SEL, unsigned int, NSError **))objc_msgSend)(m, @selector(unloadWithQoS:error:), 21, &failure);
+                bridge_unload(m, &failure);
             }
         }
         if (p->attributes) {
@@ -894,8 +901,6 @@ void msv_ane_program_free(msv_ane_program *p) {
         if (p->staging_directory) {
             if (bridge_staging_release(p->staging_directory)) {
                 [[NSFileManager defaultManager] removeItemAtPath:@(p->staging_directory) error:nil];
-                if (!msv_ane_cache_enabled())
-                    bridge_cache_evict(strrchr(p->staging_directory, '/') + 1);
             }
             free(p->staging_directory);
         }

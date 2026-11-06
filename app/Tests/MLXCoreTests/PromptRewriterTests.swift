@@ -22,6 +22,17 @@ final class PromptRewriterTests: XCTestCase {
         XCTAssertFalse(r.system.contains("integrated_multimodal_description:"))
     }
 
+    func testEveryVideoRewriteWritesTheSpokenWordsInItsModelsNotation() {
+        for format in [VideoPromptFormat.ltx, .h3Base, .h3Reference] {
+            for r in [PromptRewriter.video(text: "a man raps to camera", format: format, seconds: 15),
+                      PromptRewriter.storyboard(idea: "a man raps to camera", format: format, totalSeconds: 30, shotSeconds: 5...15)] {
+                XCTAssertTrue(r.system.contains("rapped line word for word"), "\(format)")
+                XCTAssertTrue(r.system.contains("else English"), "\(format)")
+                XCTAssertEqual(r.system.contains("<d>[Language]"), format != .ltx, "\(format)")
+            }
+        }
+    }
+
     func testVideoRewriteCapsTheActionAtTheClipLength() {
         for seconds in [2, 8] {
             let r = PromptRewriter.video(text: "a dog runs", format: .ltx, seconds: seconds)
@@ -120,6 +131,20 @@ final class PromptRewriterTests: XCTestCase {
         XCTAssertEqual(both.images, [png, jpg])
         XCTAssertTrue(both.user(seeingImage: true).contains("attached picture"))
         XCTAssertTrue(both.user(seeingImage: true).contains("<Picture 1>"))
+    }
+
+    func testEveryEnhanceRequestThinksAtMediumWithNoOutputCap() {
+        let requests = [
+            PromptRewriter.image(text: "a fox", editing: false, groups: ImagePromptExamples.textToImage, denseText: false),
+            PromptRewriter.video(text: "they dance", format: .h3Base, seconds: 10),
+            PromptRewriter.storyboard(idea: "they dance", format: .h3Base, totalSeconds: 120, shotSeconds: 5...10),
+            MusicPromptRewriter.request(.lyrics, text: "la la", family: .acestep, other: "", instrumental: false, language: "en"),
+            MusicPromptRewriter.request(.style, text: "jazz", family: .acestep, other: "", instrumental: false, language: "en"),
+        ]
+        for r in requests {
+            XCTAssertEqual(r.maxTokens, 0, "0 = no cap: the server allows the rest of the context")
+            XCTAssertEqual(r.reasoningEffort, "medium")
+        }
     }
 
     func testNoFirstFrameMeansNoPicture() {

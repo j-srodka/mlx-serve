@@ -76,9 +76,13 @@ final class DownloadManagerLayoutTests: XCTestCase {
         // with "deepseek-v4-flash", so unfiltered it classifies as a
         // servable chat quant via ggufModelType.
         XCTAssertTrue(DownloadManager.isGgufSidecar("DeepSeek-V4-Flash-DSpark-support.gguf"))
+        // Unsloth's V4.1 stage bundle carries a `dspark-` prefix.
+        XCTAssertTrue(DownloadManager.isGgufSidecar("dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf"))
         // llama.cpp's head-only MTP export (`convert --mtp`), e.g. unsloth's MTP/ folder.
         XCTAssertTrue(DownloadManager.isGgufSidecar("mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"))
         XCTAssertTrue(DownloadManager.isGgufSidecar("MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf"))
+        XCTAssertTrue(DownloadManager.isGgufSidecar("DeepSeek-V4.1-Flash-1017-Vision.gguf"))
+        XCTAssertFalse(DownloadManager.isGgufSidecar("Llama-3.2-11B-Vision-Instruct-Q4_K_M.gguf"))
         // Real chat quants stay servable — including names that merely
         // contain the letters without the delimited token.
         XCTAssertFalse(DownloadManager.isGgufSidecar("DeepSeek-V4-Flash-IQ2XXS-chat-v2.gguf"))
@@ -92,6 +96,20 @@ final class DownloadManagerLayoutTests: XCTestCase {
     /// the nested `mtp/weights.safetensors` head (else the model loses its
     /// speculative-decoding speedup), while NOT pulling unrelated nested
     /// subdirectories (e.g. `original/` alternate-precision shadow weights).
+    /// A model that speaks (LFM3-Audio, Omni) ships its speech codec in `audio_tokenizer/`: without it the pack
+    /// downloads, loads, and cannot answer in speech.
+    func testSelectNeededFilesKeepsTheSpeechCodec() {
+        let entries: [[String: Any]] = [
+            ["path": "config.json", "type": "file", "size": 100],
+            ["path": "model.safetensors", "type": "file", "size": 2_000_000_000],
+            ["path": "audio_tokenizer/config.json", "type": "file", "size": 1_000],
+            ["path": "audio_tokenizer/model.safetensors", "type": "file", "size": 150_000_000],
+        ]
+        let paths = Set(DownloadManager.selectNeededFiles(from: entries).map { $0.0 })
+        XCTAssertTrue(paths.contains("audio_tokenizer/model.safetensors"))
+        XCTAssertTrue(paths.contains("audio_tokenizer/config.json"))
+    }
+
     func testSelectNeededFilesIncludesMtpSidecarSkipsOtherNestedDirs() {
         let entries: [[String: Any]] = [
             ["path": "config.json", "type": "file", "size": 100],

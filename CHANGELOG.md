@@ -1,5 +1,59 @@
 # Changelog
 
+## v26.11.2 — DeepSeek Across Two Macs, GGUF at MLX Speed
+
+- **DeepSeek-V4.1-Flash across two Macs.** `--dist tensor` splits the model over two Thunderbolt 5 Macs that work on every token together: on two M3 Ultras it writes 57% faster with DSpark (88 tokens a second instead of 56) and 31% faster without. Thanks @ivanfioravanti.
+- **DeepSeek-V4.1 GGUF files at MLX speed.** With `--mlx-gguf`, DeepSeek-V4.1 GGUF sets (ISTA's GSQ-RCO packs, the Coder pack and ivanfioravanti's DS4 packs) run on the MLX engine with DSpark drafting and image input (a llama.cpp image projector beside the files works too): about 3,300 tokens a second reading prompts on an M5 Ultra, 2.5x what it managed before and close to our own MLX pack. More GGUF families take this path too (Qwen3, Flint, Muse Glimmer), with faster IQ kernels, and GGUFs on the built-in DeepSeek engine open at the context they were trained for instead of 32k (thanks @garnetlyx).
+- **Faster and steadier.** DeepSeek-V4.1's Lossless pack writes 7% faster on M3 and older Macs (thanks @ivanfioravanti), its iQ-MLX and expert-pruned packs write 25% to 43% faster on M4 and older Macs, 3-bit mixture-of-experts models such as Qwen3-Coder-30B-A3B write a little faster (thanks @toxeh), and a model stays in memory between requests instead of being squeezed out by macOS, which could freeze a Mac running a model close to its memory size.
+- **Long chats stay cached when you go back.** On models that keep their own state (DeepSeek-V4.1 and others), a conversation keeps a few earlier checkpoints, so editing or forking an older message answers in a fraction of a second instead of re-reading the whole chat (8.7 s to 0.13 s at 60k tokens). Thanks @STRML. Forking a long Qwen3.8-Flash-Next chat that moved to the SSD picks up from a checkpoint too: 5 seconds instead of 46 (thanks @yoyo930021).
+- **Newer MLX.** mlx-serve moves to MLX 0.32.5. Outside plugins built for 26.11.1 now show Needs rebuild in Models ▸ Plugins, and one Rebuild all compiles them again with this release's kit; a model a refused plugin served names it in its load error. Outside plugins can now use the Neural Engine and stream their weights from the SSD with their own memory budget, and a server can steer a model per request by removing a direction from its activations (thanks @STRML, @sjordan0228).
+- **Answers and switches come out right.** Switching away from a DeepSeek-V4.1 Sushi pack unloads it instead of refusing the new model, Qwen3.8-Flash-Next picks up its cached reply on the next agent turn instead of re-reading it, agents talking to DeepSeek's API no longer fail on tool-call history, GLM-5.3-Flash no longer carries one turn's reasoning into the next, a reply that keeps restating one paragraph with a reworded ending is cut short (thanks @lborloz), Qwen3.8-Flash-Next no longer crashes when an image request shares the GPU with other chats (thanks @slava-kudzinau, @yoyo930021), DeepSeek-V4.1 runs on Macs built with the macOS 26.5 tools (thanks @pcoppinger), headless Qwen3 embedding models load (thanks @trigger2k20), and a memory refusal with nothing left to unload says a restart is needed. A `reasoning_effort` word (low, medium) no longer cuts a model's thinking short: it reaches the chat template as in other engines, and only a reasoning budget you set caps it.
+- **App fixes.** The model browser opens on a model you already have (thanks @trigger2k20), a GGUF picked in the app finds its own settings (thanks @elkaix), Models ▸ Plugins downloads the pack you clicked instead of the first one on the list (thanks @hyspace), and turning an MCP server on or off in the marketplace keeps the command, environment and folder you set by hand in `mcp.json` (thanks @jondestoppeleire).
+
+### Thank you
+
+@elkaix, @fedeandri, @garnetlyx, @hyspace, @ivanfioravanti, @jondestoppeleire, @lborloz, @pcoppinger, @sjordan0228, @slava-kudzinau, @STRML, @toxeh, @trigger2k20, @yoyo930021
+
+---
+
+## v26.11.1 — Outside Plugins, Full Rewrite, Faster Deepseek
+
+- **Plugins you can build and install.** `mlx-serve plugin new` starts a plugin for a new model, `plugin check` tests it, and `plugin install` adds it after showing who signed it. Models ▸ Plugins lists every plugin beside a page that shows what it needs, the packs it serves (one click to download) and its on/off switch. Plugins can draft ahead, look at images and reuse the server's own building blocks. Thanks @davidtai and @STRML for helping here. Point your agent here: https://github.com/CommunityServe/plugins 
+- **DeepSeek-V4.1-Flash is faster and remembers more.** It reads long prompts faster (most of all on M5 Macs), writes faster, stays fast when several people use it at once, and keeps your conversation cached even after you stop a reply, so the next message starts right away. Asking a DeepSeek model for embeddings now gives a clear error instead of stopping the server. Thanks @STRML.
+- **Idol: one photo to a 3D model.** Drop a photo into the 3D pane and Idol turns it into a 3D model you can open in Preview or any 3D viewer. It cuts out the background by itself, runs faster than the original, and is now the recommended 3D model.
+- **LFM3 chats, sees, listens and talks.** Liquid's LFM3 models can read pictures, understand speech and answer out loud, and the app can use them for voice input without Apple's dictation.
+- **NVIDIA Nemotron 3.5 Transcribe.** Speech to text in 40 languages, with translation, who said what, word timings and subtitles, and you can ask questions about a recording. Settings ▸ Voice can use it for dictation and meeting notes. Thanks @beamivalice.
+- **A usage dashboard in the chat window.** The corner of the chat sidebar shows how busy your Mac is and how fast the model is going. Click the speeds for daily activity, the last 30 days, average and top speeds, and a breakdown per model. The history survives restarts.
+- **Recommended models.** Liquid LFM3 leads the list, and DeepSeek-V4.1-Flash is there for Macs with 256 GB of memory.
+- **Enhance works with thinking models.** The Enhance buttons on the Image, Video and Music panes and the storyboard planner no longer come back empty when the model thinks first.
+- **Text to speech in the language you pick.** Qwen3-TTS can be told which language to speak. Thanks @lborloz.
+- **Clearer text-to-speech errors.** A reference voice Qwen3-TTS cannot use is refused with a clear message. Thanks @ianalitis.
+- **Faster prompts on M1 and M2.** `MLX_SERVE_F16_PREFILL=1` reads prompts faster for bf16 models on Macs without fast bf16 math. Thanks @hyeoktae.
+- **Other's Flash-Next packs load.** Thanks @jasontitus.
+- **Gemma 4 packs that mix quantization settings load.** Thanks @lborloz.
+- **Draft heads stored one expert at a time load.** Thanks @brandondyal.
+- **Build draft heads for MoE models.** `tests/build_mtp_sidecar.py` now builds them for mixture-of-experts models too. Thanks @Dankpaws.
+- **Codex works better with local models.** `mlx-serve launch codex` and the app's Codex tab give Codex up-to-date instructions for the tools it really has. Thanks @kmahara.
+- **Answers come out right.** A thinking budget no longer switches off speculative decoding for the answer, text that looks like a special token is read as plain text, and stray tool-call markers no longer show up as the answer. Mistral 7B follows a system prompt and calls tools instead of rambling in the wrong format, Gemma 3 prompts start with one start token instead of two, and EmbeddingGemma gives proper vectors when a batch mixes very short and very long texts.
+- **Drafting stays within the rules.** Drafting ahead from your prompt can no longer slip in a word the model must never write. Thanks @dmumber.
+- **The Responses API keeps reasoning.** Replayed replies keep their reasoning text. Thanks @shikyo13.
+- **The Responses API sees tool images.** An image returned by a tool now reaches the model. Thanks @yerbolgmailcom.
+- **A steadier server.** A schema the server cannot enforce is refused up front instead of being ignored, the prompt cache holds up better on long-running servers, and the server shuts down promptly. Ollama clients get non-streamed replies without a wait at the end, `ignore_eos` requests run to their token limit, GLM-5.3-Flash no longer offers video input it cannot read, and a plugin built for an older release is refused with a note to rebuild it. Style LoRAs no longer turn FLUX.2 klein pictures into noise on Macs that run media models in int8.
+- **The SSD cache keeps what it just saved.** Thanks @lborloz.
+- **Models are found where they are.** Models in symlinked folders are found, and Qwen-Image downloads and MTP badges show correctly in the app. Thanks @elkaix.
+- **A finished agent stops using CPU.** Thanks @jondestoppeleire.
+- **No more web console timeouts on long replies.** Thanks @lborloz.
+- **Streams report their speed.** The last chunk of a streamed reply carries its timings, on the OpenAI and Anthropic APIs alike. Thanks @hyeoktae.
+- **Retired settings.** DiffusionGemma is no longer supported, and many old `MLX_SERVE_*` tuning variables are gone: what they switched on is now the default.
+
+### Thank you
+
+Everyone below sent a pull request for this release. Thank you!
+
+@beamivalice, @brandondyal, @Dankpaws, @davidtai, @dmumber, @elkaix, @hyeoktae, @ianalitis, @jasontitus, @jondestoppeleire, @kmahara, @lborloz, @shikyo13, @STRML, @yerbolgmailcom
+
+---
+
 ## v26.10.3 — New Models, Transcripts, RDMA, Faster
 
 ### Highlights

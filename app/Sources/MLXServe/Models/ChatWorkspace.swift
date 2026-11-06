@@ -72,24 +72,23 @@ enum ChatWorkspace: Equatable {
         return nil
     }
 
-    /// Where a "browse models" request lands. One section — the friendly front
-    /// door — because every entry point that used to open the window opened it
-    /// on `.recommended` too, and a request that arrived on a different tab
-    /// each time would read as the app forgetting.
-    static let defaultEntry: ChatWorkspace = .models(.recommended)
+    static func modelBrowserEntry(section: ModelBrowserSection? = nil, localModels: [LocalModel]) -> ChatWorkspace {
+        .models(section ?? .defaultSection(hasChatModels: localModels.contains(where: \.isChatPickable)))
+    }
 
     /// Whether the "you need a model to chat" gate may cover the window.
     ///
     /// - Parameter palettePresented: the ⌘L model switcher. Two sheets on one
     ///   window is one sheet plus a thing nobody can see, so the gate stands
     ///   down for it exactly as it does for the welcome sheet and the models
-    ///   pane — deferred, not dismissed.
+    ///   pane — deferred, not dismissed. The usage dashboard is the same case.
     static func gateShouldPresent(gateIsBlocking: Bool,
                                   cancelled: Bool,
                                   workspace: ChatWorkspace,
                                   welcomePresented: Bool,
-                                  palettePresented: Bool = false) -> Bool {
+                                  palettePresented: Bool = false,
+                                  usagePresented: Bool = false) -> Bool {
         gateIsBlocking && !cancelled && workspace.isConversation
-            && !welcomePresented && !palettePresented
+            && !welcomePresented && !palettePresented && !usagePresented
     }
 }
