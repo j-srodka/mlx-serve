@@ -39,6 +39,10 @@ zig-out/
 # ds4 CUDA library (scripts/build-ds4-linux.sh)
 /lib/ds4-linux/
 
+# Optional sibling checkouts (not submodules in this repo; zig resolves `-Dsushi-dir` / GGUF helper paths)
+/lib/mlx-serve-gguf/
+/lib/sushi/
+
 # Swift / app build. No leading slash, so it also catches the stray root
 # .build/ SwiftPM drops when a swift command is run from the repo root.
 .build/
