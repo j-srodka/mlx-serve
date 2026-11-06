@@ -3,9 +3,9 @@
 //! `__metadata__.refmod_meta` is JSON.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
-const minimax_h3 = @import("minimax_h3.zig");
-const minimax_h3_audio = @import("minimax_h3_audio.zig");
+const mlx = @import("mlx/ffi.zig");
+const minimax_h3 = @import("plugins/minimax_h3/h3.zig");
+const minimax_h3_audio = @import("plugins/minimax_h3/audio.zig");
 const testing = std.testing;
 
 pub const LATENT_C: u32 = 24;

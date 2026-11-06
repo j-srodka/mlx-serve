@@ -17,6 +17,10 @@ const frame_in = @import("../../sdk/media/frame_in.zig");
 const wav = @import("../../sdk/media/wav.zig");
 const h3 = @import("h3.zig");
 const vsa = @import("vsa.zig");
+const h3_refmod = @import("../../h3_refmod.zig");
+const model_mod = @import("../../sdk/weights/load.zig");
+const vae_mod = @import("vae.zig");
+const audio_mod = @import("audio.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;
@@ -40,7 +44,7 @@ const gpa = std.heap.c_allocator;
 const Verdict = abi.Verdict;
 const A = mlx.mlx_array;
 
-const Engine = struct {
+pub const Engine = struct {
     model_dir: []u8,
     stream: mlx.mlx_stream,
     owns_stream: bool,
@@ -59,6 +63,8 @@ const Engine = struct {
     lora_scales: [lora.MAX_LORAS]f32 = undefined,
     lora_n: usize = 0,
     result: []u8 = &.{},
+    /// `POST /v1/video/refmods` response body (taken by the host after `refmodsExtract`).
+    refmods_result: []u8 = &.{},
 
     fn freeLoras(e: *Engine) void {
         for (e.lora_paths[0..e.lora_n]) |p| gpa.free(p);
@@ -111,6 +117,7 @@ fn unload(ep: *anyopaque) callconv(.c) void {
     _ = e.resident.release();
     e.freeLoras();
     gpa.free(e.result);
+    if (e.refmods_result.len != 0) gpa.free(e.refmods_result);
     gpa.free(e.model_dir);
     if (e.owns_stream) _ = mlx.mlx_stream_free(e.stream);
     gpa.destroy(e);
@@ -488,6 +495,240 @@ fn encode(ep: *anyopaque, out: *abi.Str) callconv(.c) Verdict {
     if (e.result.len == 0) return Verdict.refuse(.failed, "minimax_h3: no finished job to encode");
     out.* = .of(e.result);
     return .ok;
+}
+
+fn voiceMaxStereoSamples(seconds: f64) u32 {
+    const s = if (seconds <= 0.0) 0.0 else seconds;
+    const capped = @min(s, 3600.0);
+    return @intFromFloat(@ceil(capped * 32000.0));
+}
+
+fn mlxSliceAudioLatentT(z: mlx.mlx_array, t_keep: u32, s: mlx.mlx_stream) !mlx.mlx_array {
+    var out = mlx.mlx_array_new();
+    const st = [_]c_int{ 0, 0, 0, 0 };
+    const en = [_]c_int{ 1, @intCast(h3_refmod.AUDIO_LATENT_C), @intCast(h3_refmod.AUDIO_STEREO), @intCast(t_keep) };
+    const one = [_]c_int{ 1, 1, 1, 1 };
+    try mlx.check(mlx.mlx_slice(&out, z, &st, 4, &en, 4, &one, 4, s));
+    return out;
+}
+
+fn appendJsonEscaped(allocator: std.mem.Allocator, w: *std.ArrayList(u8), raw: []const u8) !void {
+    for (raw) |c| switch (c) {
+        '\\' => try w.appendSlice(allocator, "\\\\"),
+        '"' => try w.appendSlice(allocator, "\\\""),
+        '\n' => try w.appendSlice(allocator, "\\n"),
+        '\r' => try w.appendSlice(allocator, "\\r"),
+        '\t' => try w.appendSlice(allocator, "\\t"),
+        0...8, 11, 12, 14...31 => {
+            var buf: [6]u8 = undefined;
+            const s = try std.fmt.bufPrint(&buf, "\\u{d:0>4}", .{c});
+            try w.appendSlice(allocator, s);
+        },
+        else => try w.append(allocator, c),
+    };
+}
+
+fn refmodsOkJson(allocator: std.mem.Allocator, path: []const u8, kind: []const u8, latent_t: u32) ![]u8 {
+    var esc: std.ArrayList(u8) = .empty;
+    defer esc.deinit(allocator);
+    try appendJsonEscaped(allocator, &esc, path);
+    return std.fmt.allocPrint(allocator, "{{\"path\":\"{s}\",\"kind\":\"{s}\",\"latent_t\":{d}}}", .{ esc.items, kind, latent_t });
+}
+
+fn runRefmodsExtract(e: *Engine, req: *const abi.Request) Verdict {
+    if (e.refmods_result.len != 0) {
+        gpa.free(e.refmods_result);
+        e.refmods_result = &.{};
+    }
+
+    var b = job.Body.parse(gpa, req.body.slice()) orelse
+        return req.refuseFmt(.unsupported, "invalid JSON body", "invalid JSON body", .{});
+    defer b.deinit();
+
+    const out_path = b.str("out_path") orelse
+        return req.refuseFmt(.unsupported, "missing 'out_path'", "missing 'out_path'", .{});
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    h3_refmod.validateSafetensorsOutPath(io, out_path) catch
+        return req.refuseFmt(.unsupported, "'out_path' must be an absolute path to a new or writable .safetensors file in an existing directory", "'out_path' must be an absolute path to a new or writable .safetensors file in an existing directory", .{});
+
+    const width = u32Field(&b, "width", 0);
+    const height = u32Field(&b, "height", 0);
+    if (width == 0 or height == 0)
+        return req.refuseFmt(.unsupported, "missing 'width' or 'height'", "missing 'width' or 'height'", .{});
+    if (width % 32 != 0 or height % 32 != 0)
+        return req.refuseFmt(.unsupported, "width and height must be multiples of 32", "width and height must be multiples of 32", .{});
+
+    const s = e.stream;
+    const has_voice = fieldSet(&b, "voice_max_seconds");
+    const stills = fieldSet(&b, "ref_images");
+    const one_video = fieldSet(&b, "ref_videos");
+    const audio_list = fieldSet(&b, "ref_audios");
+
+    if (has_voice) {
+        if (stills or one_video) return req.refuseFmt(.unsupported, "'voice_max_seconds' uses standalone voice: send 'ref_audios' only, not stills or video", "'voice_max_seconds' uses standalone voice: send 'ref_audios' only, not stills or video", .{});
+        if (!audio_list) return req.refuseFmt(.unsupported, "missing 'ref_audios' for voice extract", "missing 'ref_audios' for voice extract", .{});
+        const vm = b.float("voice_max_seconds") orelse
+            return req.refuseFmt(.unsupported, "'voice_max_seconds' must be a positive number", "'voice_max_seconds' must be a positive number", .{});
+        if (vm <= 0.0)
+            return req.refuseFmt(.unsupported, "'voice_max_seconds' must be positive", "'voice_max_seconds' must be positive", .{});
+
+        var audios: std.ArrayList([]f32) = .empty;
+        defer {
+            for (audios.items) |x| gpa.free(x);
+            audios.deinit(gpa);
+        }
+        const rau = b.get("ref_audios") orelse return req.refuseFmt(.unsupported, "missing 'ref_audios' for voice extract", "missing 'ref_audios' for voice extract", .{});
+        if (rau != .array) return req.refuseFmt(.unsupported, "'ref_audios' must be an array of base64 WAV strings", "'ref_audios' must be an array of base64 WAV strings", .{});
+        for (rau.array.items, 0..) |item, i| {
+            if (item != .string) return req.refuseFmt(.unsupported, "'ref_audios' must be an array of base64 WAV strings", "'ref_audios'[{d}] must be a base64 WAV string", .{i});
+            const pcm = wav32kStereo(item.string) catch return req.refuseFmt(.unsupported, "a 'ref_audios' entry could not be decoded", "'ref_audios'[{d}] must be a PCM16/PCM24/float32 WAV", .{i});
+            audios.append(gpa, pcm) catch return Verdict.refuse(.busy, "out of memory");
+        }
+        if (audios.items.len != 1)
+            return req.refuseFmt(.unsupported, "voice extract expects exactly one 'ref_audios' entry", "voice extract expects exactly one 'ref_audios' entry", .{});
+
+        const apack = e.path("audio_vae.safetensors") catch return Verdict.refuse(.busy, "out of memory");
+        defer gpa.free(apack);
+        var aw = model_mod.loadWeightsSingleFile(gpa, apack) catch return req.refuseFmt(.unsupported, "this pack has no audio_vae.safetensors", "this pack has no audio_vae.safetensors", .{});
+        defer aw.deinit();
+
+        const wf = planar(audios.items[0]) catch return Verdict.refuse(.busy, "out of memory");
+        defer _ = mlx.mlx_array_free(wf);
+
+        var z = audio_mod.encode(gpa, &aw, wf, s) catch return job.failure(error.OutOfMemory, "MiniMax-H3 refmods: audio encode failed");
+        const max_samples = voiceMaxStereoSamples(vm);
+        const wf_shp = mlx.getShape(wf);
+        const cur_len: u32 = @intCast(wf_shp[1]);
+        const want_frames = audio_mod.latentFrames(@min(max_samples, cur_len));
+        const z_shp = mlx.getShape(z);
+        const cur_t: u32 = @intCast(z_shp[3]);
+        if (want_frames < cur_t) {
+            const z2 = mlxSliceAudioLatentT(z, want_frames, s) catch {
+                _ = mlx.mlx_array_free(z);
+                return job.failure(error.OutOfMemory, "MiniMax-H3 refmods: audio latent trim failed");
+            };
+            _ = mlx.mlx_array_free(z);
+            z = z2;
+        }
+
+        const meta = h3_refmod.metaFromAudioLatent(z) catch {
+            _ = mlx.mlx_array_free(z);
+            return Verdict.refuse(.failed, "bad audio latent shape");
+        };
+        h3_refmod.save(gpa, out_path, meta, z) catch |err| {
+            _ = mlx.mlx_array_free(z);
+            return switch (err) {
+                error.OutOfMemory => Verdict.refuse(.busy, "out of memory"),
+                else => Verdict.named(.failed, @errorName(err)),
+            };
+        };
+        _ = mlx.mlx_array_free(z);
+
+        e.refmods_result = refmodsOkJson(gpa, out_path, "audio", meta.latent_t) catch return Verdict.refuse(.busy, "out of memory");
+        return .ok;
+    }
+
+    if (stills == one_video)
+        return req.refuseFmt(.unsupported, "send either 'ref_images' OR 'ref_videos' (stills XOR one video reference)", "send either 'ref_images' OR 'ref_videos' (stills XOR one video reference), not both nor neither", .{});
+    if (audio_list)
+        return req.refuseFmt(.unsupported, "standalone 'ref_audios' requires 'voice_max_seconds' (voice extract)", "standalone 'ref_audios' requires 'voice_max_seconds' (voice extract)", .{});
+
+    const gen_frames = h3.temporalShape(124).frame_count;
+    var refs: std.ArrayList(h3.RefMedia) = .empty;
+    defer {
+        for (refs.items) |*m| m.deinit();
+        refs.deinit(gpa);
+    }
+    if (references(req, &b, width, height, gen_frames, s, &refs) catch |err| return job.failure(err, "MiniMax-H3 refmods: reference decode failed")) |v| return v;
+    if (refs.items.len == 0)
+        return req.refuseFmt(.unsupported, "attach reference images or one reference video", "attach 'ref_images' or one 'ref_videos' entry", .{});
+
+    const vae_path = e.path("video_vae.safetensors") catch return Verdict.refuse(.busy, "out of memory");
+    defer gpa.free(vae_path);
+    var vw = model_mod.loadWeightsSingleFile(gpa, vae_path) catch return job.failure(error.FileNotFound, "MiniMax-H3 refmods: video VAE missing");
+    defer vw.deinit();
+    var enc = vae_mod.Encoder.load(gpa, &vw, s) catch return job.failure(error.OutOfMemory, "MiniMax-H3 refmods: VAE load failed");
+    defer enc.deinit();
+
+    var lat_parts: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (lat_parts.items) |x| _ = mlx.mlx_array_free(x);
+        lat_parts.deinit(gpa);
+    }
+
+    if (stills) {
+        for (refs.items) |m| {
+            if (m.ref.kind != .image) continue;
+            const px = m.pixels orelse return req.refuseFmt(.unsupported, "internal: missing reference pixels", "internal: missing reference pixels", .{});
+            const z = enc.encodeImage(px, gpa, s) catch {
+                return job.failure(error.OutOfMemory, "MiniMax-H3 refmods: VAE encode failed");
+            };
+            _ = mlx.mlx_array_eval(z);
+            lat_parts.append(gpa, z) catch {
+                _ = mlx.mlx_array_free(z);
+                return Verdict.refuse(.busy, "out of memory");
+            };
+        }
+        if (lat_parts.items.len == 0)
+            return req.refuseFmt(.unsupported, "'ref_images' must contain at least one valid image", "'ref_images' must contain at least one valid image", .{});
+    } else {
+        if (refs.items.len != 1 or refs.items[0].ref.kind != .video)
+            return req.refuseFmt(.unsupported, "'ref_videos' must contain exactly one reference video", "'ref_videos' must contain exactly one reference video", .{});
+        const px = refs.items[0].pixels orelse return req.refuseFmt(.unsupported, "internal: missing reference pixels", "internal: missing reference pixels", .{});
+        const z = enc.encodeVideo(px, gpa, s) catch {
+            return job.failure(error.OutOfMemory, "MiniMax-H3 refmods: VAE encode failed");
+        };
+        _ = mlx.mlx_array_eval(z);
+        lat_parts.append(gpa, z) catch {
+            _ = mlx.mlx_array_free(z);
+            return Verdict.refuse(.busy, "out of memory");
+        };
+    }
+
+    const latent: mlx.mlx_array = if (lat_parts.items.len == 1)
+        lat_parts.pop().?
+    else
+        h3_refmod.stackLatentsAlongT(gpa, lat_parts.items, s) catch {
+            return job.failure(error.OutOfMemory, "MiniMax-H3 refmods: latent stack failed");
+        };
+    errdefer _ = mlx.mlx_array_free(latent);
+    for (lat_parts.items) |x| _ = mlx.mlx_array_free(x);
+    lat_parts.clearRetainingCapacity();
+
+    var meta = h3_refmod.metaFromLatentShape(width, height, latent) catch {
+        _ = mlx.mlx_array_free(latent);
+        return Verdict.refuse(.failed, "bad visual latent shape");
+    };
+    if (stills and refs.items.len > 1) meta.source_frames = @intCast(refs.items.len);
+
+    h3_refmod.save(gpa, out_path, meta, latent) catch |err| {
+        _ = mlx.mlx_array_free(latent);
+        return switch (err) {
+            error.OutOfMemory => Verdict.refuse(.busy, "out of memory"),
+            else => Verdict.named(.failed, @errorName(err)),
+        };
+    };
+    _ = mlx.mlx_array_free(latent);
+
+    const kind_str: []const u8 = if (meta.kind == .video) "video" else "image";
+    e.refmods_result = refmodsOkJson(gpa, out_path, kind_str, meta.latent_t) catch return Verdict.refuse(.busy, "out of memory");
+    return .ok;
+}
+
+/// `POST /v1/video/refmods` — VAE-encode references to a RefMod `.safetensors` (host inference thread). On success,
+/// `refmodsResultTake` returns the JSON body; on refusal, `req.message` may hold the composed text.
+pub fn refmodsExtract(ep: *anyopaque, req: *const abi.Request) abi.Verdict {
+    const e: *Engine = @ptrCast(@alignCast(ep));
+    return runRefmodsExtract(e, req);
+}
+
+/// Moves the last success JSON out of `e` (caller frees with `std.heap.c_allocator`).
+pub fn refmodsResultTake(ep: *anyopaque) []u8 {
+    const e: *Engine = @ptrCast(@alignCast(ep));
+    const r = e.refmods_result;
+    e.refmods_result = &.{};
+    return r;
 }
 
 /// A tiny random H3: a one-layer DiT at 64 (two 32-wide heads, one refiner block), a one-layer text encoder at 64

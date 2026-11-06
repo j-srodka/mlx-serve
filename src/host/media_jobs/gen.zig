@@ -43,6 +43,8 @@ pub const GenRoute = enum {
     music,
     sound,
     video,
+    /// POST /v1/video/refmods — MiniMax-H3 refmod extract; not a generation job.
+    h3_refmods,
     mesh,
     decisions,
 
@@ -51,6 +53,7 @@ pub const GenRoute = enum {
             .image => .image,
             .speech, .music, .sound => .audio,
             .video => .video,
+            .h3_refmods => .video,
             .mesh => .mesh,
             .decisions => .decision,
         };

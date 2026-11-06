@@ -2,12 +2,14 @@
 
 const std = @import("std");
 const log = @import("../../sdk/util/log.zig");
+const abi = @import("../../abi/media.zig");
 const scheduler_mod = @import("../gpu_thread/requests.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const media_mod = @import("gen.zig");
 const plugin_http = @import("plugin/http.zig");
 const PluginEngine = @import("plugin/engine.zig").Engine;
 const http_server = @import("../http/server.zig");
+const minimax_h3_plugin = @import("../../plugins/minimax_h3/plugin.zig");
 
 const Conn = @import("../http/conn.zig").Conn;
 const sendErrorResponse = @import("../http/errors.zig").sendErrorResponse;
@@ -29,9 +31,48 @@ fn genJobRun(ctx: *anyopaque) void {
     const job: *GenJob = @ptrCast(@alignCast(ctx));
     if (job.route == .decisions) return genJobRunMany(&.{ctx});
     const p = job.lm.media_plugin orelse return;
+    if (job.route == .h3_refmods) {
+        refmodsJobRun(job) catch |err| {
+            log.warn("[gen] {s} job failed: {s}\n", .{ @tagName(job.route), @errorName(err) });
+        };
+        return;
+    }
     plugin_http.handle(job.allocator, job.conn, job.body, p, job.route, job.lm.id) catch |err| {
         log.warn("[gen] {s} job failed: {s}\n", .{ @tagName(job.route), @errorName(err) });
     };
+}
+
+fn refmodsJobRun(job: *GenJob) !void {
+    const engine = job.lm.media_plugin orelse return;
+    if (!std.mem.eql(u8, engine.table.name.slice(), "minimax_h3")) {
+        try sendErrorResponse(job.allocator, job.conn, "400 Bad Request", "invalid_request_error", "POST /v1/video/refmods requires a loaded MiniMax-H3 (minimax_h3) model", 400);
+        return;
+    }
+    var msg_buf: [512]u8 = undefined;
+    var msg_len: usize = 0;
+    const req = abi.Request{
+        .body = .of(job.body),
+        .model_id = .of(job.lm.id),
+        .message = .{ .ptr = &msg_buf, .cap = msg_buf.len, .len = &msg_len },
+        .dir = &engine.pack,
+        .machine = &engine.machine,
+    };
+    const v = minimax_h3_plugin.refmodsExtract(engine.handle, &req);
+    if (v.isOk()) {
+        const json = minimax_h3_plugin.refmodsResultTake(engine.handle);
+        defer std.heap.c_allocator.free(json);
+        return media_mod.sendBytesJson(job.conn, job.allocator, json);
+    }
+    const text: []const u8 = if (msg_len > 0) msg_buf[0..msg_len] else v.why.slice();
+    log.warn("[gen] refmods refused: {s}\n", .{text});
+    const status: u16 = switch (v.code) {
+        .unsupported => 400,
+        .too_large => 400,
+        .busy => 503,
+        .failed => media_mod.jobFailureStatus(error.RefmodsFailed),
+        else => 500,
+    };
+    try media_mod.sendError(job.conn, status, text);
 }
 
 /// Inference-thread entry point for decision jobs queued back to back for one
@@ -62,7 +103,7 @@ pub fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, 
     }
     var job = GenJob{ .allocator = allocator, .conn = stream, .body = body, .lm = lm, .route = route };
     var req = scheduler_mod.GenRequest{ .ctx = &job, .run = genJobRun, .model = lm, .decision = route == .decisions };
-    if (lm.media_plugin) |p| req.peak_bytes = p.requestPeak(body);
+    if (lm.media_plugin) |p| req.peak_bytes = if (route == .h3_refmods) 0 else p.requestPeak(body);
     if (route == .decisions) if (lm.media_plugin) |p| {
         req.merge = .{ .run_many = genJobRunMany, .weight = plugin_http.questionCount(body), .window_us = p.batch_window_us };
     };

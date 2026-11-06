@@ -301,7 +301,7 @@ fn generate(
 ) !ltx.VideoFrames {
     switch (pipeline) {
         // The schedule the loaded variant was trained for; the request never forces a swap here.
-        .one_stage => return ltx.generateVideoFrames(io(), gpa, e.ltx_cfg, &e.transformer, &e.connector, vae_choice, enc, first.full, last.full, e.gemma_dir, pos_ids, neg_ids, engine_mod.PAD_ID, num_frames, height, width, FPS, steps, e.transformer_variant == .distilled, seed, guiders.vp, guiders.ap, prog, e.s),
+        .one_stage => return ltx.generateVideoFrames(io(), gpa, e.ltx_cfg, &e.transformer, &e.connector, vae_choice, enc, first.full, last.full, null, e.gemma_dir, pos_ids, neg_ids, engine_mod.PAD_ID, num_frames, height, width, FPS, steps, e.transformer_variant == .distilled, seed, guiders.vp, guiders.ap, prog, e.s),
         .two_stage, .two_stage_hq => {
             try e.ensureTransformer(.dev);
             var swapper = engine_mod.Stage2Swap{ .engine = e };
@@ -313,7 +313,7 @@ fn generate(
                 .swap_ctx = @ptrCast(&swapper),
                 .swap = engine_mod.Stage2Swap.swap,
             };
-            return ltx.generateVideoFramesTwoStage(io(), gpa, e.ltx_cfg, &e.transformer, &e.connector, vae_choice, &e.vae_encoder.?, first.half, first.full, last.half, last.full, track.cond, e.gemma_dir, pos_ids, neg_ids, engine_mod.PAD_ID, num_frames, height, width, FPS, opts, seed, guiders.vp, guiders.ap, prog, e.s);
+            return ltx.generateVideoFramesTwoStage(io(), gpa, e.ltx_cfg, &e.transformer, &e.connector, vae_choice, &e.vae_encoder.?, first.half, first.full, last.half, last.full, null, null, track.cond, e.gemma_dir, pos_ids, neg_ids, engine_mod.PAD_ID, num_frames, height, width, FPS, opts, seed, guiders.vp, guiders.ap, prog, e.s);
         },
     }
 }

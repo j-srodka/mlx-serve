@@ -130,6 +130,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/responses/compact",
     "/v1/unload-model",
     "/v1/video/generations",
+    "/v1/video/refmods",
 };
 
 /// Is `path` an endpoint this server serves at all (any method)?
@@ -677,6 +678,10 @@ pub fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleGen(allocator, stream, body, lm, .sound);
+    } else if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/video/refmods")) {
+        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+        const body = request[header_end + 4 .. total_read];
+        try handleGen(allocator, stream, body, lm, .h3_refmods);
     } else if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/video/generations")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
@@ -881,6 +886,7 @@ test "request body cap is per route: media bodies are base64 frame payloads" {
         "/v1/images/generations",
         "/v1/images/edits",
         "/v1/video/generations",
+        "/v1/video/refmods",
         "/v1/audio/speech",
         "/v1/audio/music-generations",
         "/v1/3d/generations",

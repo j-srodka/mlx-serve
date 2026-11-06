@@ -1,7 +1,7 @@
 //! Optional Core ML tiny decoder (taeh3) for sharp H3 step previews on ANE.
 const std = @import("std");
-const preview = @import("preview.zig");
-const jpeg = @import("jpeg.zig");
+const preview = @import("sdk/media/preview.zig");
+const jpeg = @import("sdk/media/jpeg.zig");
 
 const h3_tae_ctx = opaque {};
 

@@ -141,6 +141,19 @@ pub fn addAneSources(b: *std.Build, module: *std.Build.Module) void {
     module.addIncludePath(b.path("lib/ane"));
 }
 
+/// Optional Core ML taeh3 bridge for sharp H3 step previews (`MINIMAX_H3_TAE`).
+pub fn addH3TaeSources(b: *std.Build, module: *std.Build.Module) void {
+    const objc_flags = &[_][]const u8{
+        "-O3",
+        "-fobjc-arc",
+        "-Wno-deprecated-declarations",
+        "-framework",
+        "CoreML",
+    };
+    module.addCSourceFile(.{ .file = b.path("lib/h3_tae/h3_tae_preview.m"), .flags = objc_flags });
+    module.addIncludePath(b.path("lib/h3_tae"));
+}
+
 pub fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {
     // Link the prebuilt libllama staged by scripts/fetch-llama.sh. The dylib's
     // install-name is @rpath/libllama.dylib; we add an rpath to its build-tree
