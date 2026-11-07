@@ -237,7 +237,76 @@ fn videoFrames(frames: []const []u8, th: u32, tw: u32, stride: u32, cat_axis: c_
 
 /// The REF2VA references decoded into `out` in `resolveRefs` order; a reference the server cannot use is a named
 /// refusal, never dropped (the generation would succeed and ignore what the user asked it to follow).
-fn references(req: *const abi.Request, b: *const job.Body, gen_w: u32, gen_h: u32, gen_frames: u32, s: mlx.mlx_stream, out: *std.ArrayList(h3.RefMedia), limits: h3.RefLimits) !?Verdict {
+fn countRefModAudioPacks(items: []const h3.RefMedia) u32 {
+    var n: u32 = 0;
+    for (items) |m| {
+        if (m.latent != null and m.ref.kind == .audio) n += 1;
+    }
+    return n;
+}
+
+fn refModPaths(req: *const abi.Request, b: *const job.Body, s: mlx.mlx_stream, out: *std.ArrayList(h3.RefMedia)) !?Verdict {
+    const v = b.get("ref_mod_paths") orelse return null;
+    if (v == .null) return null;
+    if (v != .array) return bad("'ref_mod_paths' must be a JSON array of absolute .safetensors paths");
+    if (v.array.items.len == 0) return null;
+    if (v.array.items.len > h3.MAX_REF_TOTAL)
+        return req.refuseFmt(.unsupported, "too many 'ref_mod_paths'", "too many 'ref_mod_paths' (max {d})", .{h3.MAX_REF_TOTAL});
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var n_img: u32 = 0;
+    var n_vid: u32 = 0;
+    var n_aud: u32 = 0;
+    for (v.array.items, 0..) |item, i| {
+        if (item != .string) return req.refuseFmt(.unsupported, "a 'ref_mod_paths' entry is not a string", "'ref_mod_paths'[{d}] must be a JSON string", .{i});
+        const path = item.string;
+        if (!std.mem.endsWith(u8, path, ".safetensors"))
+            return req.refuseFmt(.unsupported, "each 'ref_mod_paths' entry must be a .safetensors file", "'ref_mod_paths'[{d}] must end with .safetensors", .{i});
+        h3_refmod.validateAbsoluteSafetensorsPath(io, path) catch
+            return req.refuseFmt(.unsupported, "'ref_mod_paths' entries must be absolute .safetensors paths", "'ref_mod_paths'[{d}] must be an absolute path to a .safetensors file", .{i});
+        var loaded = h3_refmod.load(gpa, io, path, s) catch
+            return req.refuseFmt(.unsupported, "could not load a ref mod file", "could not load 'ref_mod_paths'[{d}] (missing latent tensor or refmod_meta)", .{i});
+        const ordinal: u32 = switch (loaded.meta.kind) {
+            .image => blk: {
+                n_img += 1;
+                break :blk n_img;
+            },
+            .video => blk: {
+                n_vid += 1;
+                break :blk n_vid;
+            },
+            .audio => blk: {
+                n_aud += 1;
+                if (n_aud > h3.MAX_REF_AUDIOS)
+                    return req.refuseFmt(.unsupported, "too many audio ref mods", "too many audio ref mods (max {d})", .{h3.MAX_REF_AUDIOS});
+                break :blk n_aud;
+            },
+        };
+        const r = loaded.meta.toResolvedRef(ordinal, i);
+        try out.append(gpa, .{ .ref = r, .latent = loaded.takeLatent() });
+        log.info("[minimax-h3] ref mod #{d}: {s} {d}x{d} latent_t={d} path={s}\n", .{
+            i + 1,
+            @tagName(loaded.meta.kind),
+            loaded.meta.canvas_w,
+            loaded.meta.canvas_h,
+            loaded.meta.latent_t,
+            path,
+        });
+    }
+    return null;
+}
+
+fn references(
+    req: *const abi.Request,
+    b: *const job.Body,
+    gen_w: u32,
+    gen_h: u32,
+    gen_frames: u32,
+    s: mlx.mlx_stream,
+    out: *std.ArrayList(h3.RefMedia),
+    limits: h3.RefLimits,
+    audio_ordinal_base: u32,
+) !?Verdict {
     const mode: h3.RefImageSizing = blk: {
         const raw = b.str("ref_image_size") orelse break :blk .match;
         if (std.mem.eql(u8, raw, "match")) break :blk .match;
@@ -298,7 +367,7 @@ fn references(req: *const abi.Request, b: *const job.Body, gen_w: u32, gen_h: u3
     const in_a = try a.alloc(h3.RefInput, audios.items.len);
     for (audios.items, in_a) |pcm, *r| r.* = .{ .kind = .audio, .audio_samples = @intCast(pcm.len / 2) };
 
-    var res = switch (try h3.resolveRefs(gpa, in_i, in_v, in_a, gen_w, gen_h, mode, limits)) {
+    var res = switch (try h3.resolveRefs(gpa, in_i, in_v, in_a, gen_w, gen_h, mode, limits, audio_ordinal_base)) {
         .ok => |r| r,
         .reject => |why| {
             return switch (why) {
@@ -429,9 +498,18 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         for (refs.items) |*m| m.deinit();
         refs.deinit(gpa);
     }
-    const has_refs = fieldSet(&b, "ref_images") or fieldSet(&b, "ref_videos") or fieldSet(&b, "ref_audios");
-    if (has_refs and !e.supports_refs) return bad("this MiniMax-H3 pack does not support references (it declares no 'ref2va' task) — load a REF2VA checkpoint");
-    if (has_refs) if (references(req, &b, width, height, shape.frame_count, s, &refs, h3.RefLimits.generation) catch |err| return job.failure(err, "MiniMax-H3 generation failed")) |v| return v;
+    const has_live_refs = fieldSet(&b, "ref_images") or fieldSet(&b, "ref_videos") or fieldSet(&b, "ref_audios");
+    const has_ref_mod_paths = fieldSet(&b, "ref_mod_paths");
+    if (has_ref_mod_paths and fieldSet(&b, "ref_images"))
+        return Verdict.named(.unsupported, "do not mix 'ref_mod_paths' with ref_images");
+    if ((has_live_refs or has_ref_mod_paths) and !e.supports_refs)
+        return bad("this MiniMax-H3 pack does not support references (it declares no 'ref2va' task) — load a REF2VA checkpoint");
+    if (has_ref_mod_paths) if (refModPaths(req, &b, s, &refs) catch |err| return job.failure(err, "MiniMax-H3 generation failed")) |v| return v;
+    const audio_ref_mods = countRefModAudioPacks(refs.items);
+    if (has_live_refs) if (references(req, &b, width, height, shape.frame_count, s, &refs, h3.RefLimits.generation, audio_ref_mods) catch |err| return job.failure(err, "MiniMax-H3 generation failed")) |v| return v;
+    if (refs.items.len > h3.MAX_REF_TOTAL)
+        return req.refuseFmt(.unsupported, "too many references", "too many references: at most {d} files across live refs and ref_mod_paths combined", .{h3.MAX_REF_TOTAL});
+    const has_refs = has_live_refs or has_ref_mod_paths or refs.items.len > 0;
     if (h3.refCompatError(has_refs, chain_windows, latent_prefix_frames, latent_suffix_frames)) |msg| return Verdict.named(.unsupported, msg);
     var kf_has_first = false;
     var kf_has_last = false;
@@ -759,7 +837,7 @@ fn runRefmodsExtract(e: *Engine, req: *const abi.Request) Verdict {
         for (refs.items) |*m| m.deinit();
         refs.deinit(gpa);
     }
-    if (references(req, &b, width, height, gen_frames, s, &refs, h3.RefLimits.refmods_visual) catch |err| return job.failure(err, "MiniMax-H3 refmods: reference decode failed")) |v| return v;
+    if (references(req, &b, width, height, gen_frames, s, &refs, h3.RefLimits.refmods_visual, 0) catch |err| return job.failure(err, "MiniMax-H3 refmods: reference decode failed")) |v| return v;
     if (refs.items.len == 0)
         return req.refuseFmt(.unsupported, "attach reference images or one reference video", "attach 'ref_images' or one 'ref_videos' entry", .{});
 
@@ -1015,7 +1093,7 @@ test "minimax_h3 plugin: a reference the server cannot use is refused by name, n
             out.deinit(gpa);
         }
         len = 0;
-        const v = (try references(&req, &b, 864, 480, 124, s, &out, h3.RefLimits.generation)) orelse return error.ExpectedRejection;
+        const v = (try references(&req, &b, 864, 480, 124, s, &out, h3.RefLimits.generation, 0)) orelse return error.ExpectedRejection;
         const msg = if (len > 0) buf[0..len] else v.why.slice();
         testing.expect(std.mem.indexOf(u8, msg, c.needle) != null) catch |e| {
             std.debug.print("{s}: {s}\n", .{ c.body, msg });
@@ -1027,7 +1105,7 @@ test "minimax_h3 plugin: a reference the server cannot use is refused by name, n
     defer none_b.deinit();
     var none: std.ArrayList(h3.RefMedia) = .empty;
     defer none.deinit(gpa);
-    try testing.expect((try references(&req, &none_b, 864, 480, 124, s, &none, h3.RefLimits.generation)) == null);
+    try testing.expect((try references(&req, &none_b, 864, 480, 124, s, &none, h3.RefLimits.generation, 0)) == null);
     try testing.expectEqual(@as(usize, 0), none.items.len);
 }
 

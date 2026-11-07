@@ -332,6 +332,7 @@ pub fn resolveRefs(
     gen_h: u32,
     mode: RefImageSizing,
     limits: RefLimits,
+    audio_ordinal_base: u32,
 ) !union(enum) { ok: RefResolution, reject: RefReject } {
     // Per-type first: "too many images" is more actionable than "too many
     // files" when it is one list that is over.
@@ -339,6 +340,12 @@ pub fn resolveRefs(
     if (videos.len > limits.max_videos) return .{ .reject = .too_many_videos };
     if (audios.len > limits.max_audios) return .{ .reject = .too_many_audios };
     if (images.len + videos.len + audios.len > limits.max_total) return .{ .reject = .too_many_refs };
+    var soundtrack_count: u32 = 0;
+    for (videos) |v| {
+        if (v.soundtrack_samples != null) soundtrack_count += 1;
+    }
+    if (audio_ordinal_base + soundtrack_count + audios.len > limits.max_audios)
+        return .{ .reject = .too_many_audios };
     for (videos) |v| {
         if (v.frames == 0) return .{ .reject = .empty_video };
         if (v.frames < MIN_REF_VIDEO_FRAMES) return .{ .reject = .video_too_short };
@@ -351,7 +358,7 @@ pub fn resolveRefs(
 
     var n_img: u32 = 0;
     var n_vid: u32 = 0;
-    var n_aud: u32 = 0;
+    var n_aud: u32 = audio_ordinal_base;
 
     for (images, 0..) |img, i| {
         n_img += 1;
@@ -3720,11 +3727,14 @@ pub const RefMedia = struct {
     vision: ?mlx.mlx_array = null,
     /// 32 kHz stereo `[2, L]`: a standalone audio, or a video's soundtrack.
     waveform: ?mlx.mlx_array = null,
+    /// RefMod visual `[1, 24, T, H, W]` or audio `[1, 32, 2, T]`; skips live encode.
+    latent: ?mlx.mlx_array = null,
 
     pub fn deinit(self: *RefMedia) void {
         if (self.pixels) |x| _ = mlx.mlx_array_free(x);
         if (self.vision) |x| _ = mlx.mlx_array_free(x);
         if (self.waveform) |x| _ = mlx.mlx_array_free(x);
+        if (self.latent) |x| _ = mlx.mlx_array_free(x);
         self.* = undefined;
     }
 };
@@ -4229,6 +4239,21 @@ pub fn keyframeSidecarBindingError(
     return null;
 }
 
+/// Named refusal when identity stills and on-disk RefMods are mixed (`null` = ok).
+pub fn refModMixError(has_ref_mod_paths: bool, has_ref_images: bool) ?[]const u8 {
+    if (has_ref_mod_paths and has_ref_images) return "do not mix 'ref_mod_paths' with ref_images";
+    return null;
+}
+
+/// Latent RefMods skip Qwen vision blocks; only audio packs still get `<Audio j>`.
+pub fn refModLatentPresentationNeedsAudioLabel(has_latent: bool, kind: enum { image, video, audio }) bool {
+    return has_latent and kind == .audio;
+}
+
+pub fn refModLatentPresentationSkipsQwenVision(has_latent: bool, kind: enum { image, video, audio }) bool {
+    return has_latent and kind != .audio;
+}
+
 /// Named refusal when references share a request with latent pins or chained
 /// windows (`null` = ok). `latent_out` with refs is intentionally allowed.
 pub fn refCompatError(
@@ -4522,43 +4547,79 @@ fn generateOne(
         }
 
         if (needs_visual) {
-            var vw0 = try model_mod.loadWeightsSingleFile(allocator, paths.vae);
-            defer vw0.deinit();
-            var enc = try vae_mod.Encoder.load(allocator, &vw0, s);
-            defer enc.deinit();
-            for (req.keyframes, 0..) |kf, ki| {
-                anchors_buf[ki] = kf.anchor;
-                const lat = try enc.encodeImage(kf.pixels, allocator, s);
-                defer _ = mlx.mlx_array_free(lat);
-                try rows_list.append(allocator, try patchifyVideo(lat, s));
-            }
-            anchors = anchors_buf[0..req.keyframes.len];
+            var need_video_vae = req.keyframes.len > 0;
             for (req.refs) |m| {
                 if (m.ref.kind == .audio) continue;
-                const px = m.pixels orelse return error.RefMissingPixels;
-                // encodeImage IS encodeVideo at T == 1; naming the two apart
-                // keeps the call site readable, not the behaviour different.
-                const lat = try enc.encodeVideo(px, allocator, s);
-                defer _ = mlx.mlx_array_free(lat);
-                const got_t: u32 = @intCast(mlx.getShape(lat)[2]);
-                const want_t: u32 = if (m.ref.kind == .image) 1 else m.ref.latent_t;
-                // The layout budgeted rows from `latent_t`; a VAE that returned
-                // a different depth would silently shift every later segment.
-                if (got_t != want_t) return error.RefLatentDepthMismatch;
+                if (m.latent == null) need_video_vae = true;
+            }
+            var enc: ?vae_mod.Encoder = null;
+            defer if (enc) |*e| e.deinit();
+            if (need_video_vae) {
+                var vw0 = try model_mod.loadWeightsSingleFile(allocator, paths.vae);
+                defer vw0.deinit();
+                enc = try vae_mod.Encoder.load(allocator, &vw0, s);
+            }
+            if (req.keyframes.len > 0) {
+                for (req.keyframes, 0..) |kf, ki| {
+                    anchors_buf[ki] = kf.anchor;
+                    const lat = try enc.?.encodeImage(kf.pixels, allocator, s);
+                    defer _ = mlx.mlx_array_free(lat);
+                    try rows_list.append(allocator, try patchifyVideo(lat, s));
+                }
+                anchors = anchors_buf[0..req.keyframes.len];
+            }
+            for (req.refs) |m| {
+                if (m.ref.kind == .audio) continue;
+                const lat_owned = m.latent == null;
+                const lat = if (m.latent) |stored| blk: {
+                    const got_t: u32 = @intCast(mlx.getShape(stored)[2]);
+                    const want_t: u32 = if (m.ref.kind == .image) 1 else m.ref.latent_t;
+                    if (got_t != want_t) return error.RefLatentDepthMismatch;
+                    break :blk stored;
+                } else blk: {
+                    const px = m.pixels orelse return error.RefMissingPixels;
+                    const encoded = try enc.?.encodeVideo(px, allocator, s);
+                    const got_t: u32 = @intCast(mlx.getShape(encoded)[2]);
+                    const want_t: u32 = if (m.ref.kind == .image) 1 else m.ref.latent_t;
+                    if (got_t != want_t) return error.RefLatentDepthMismatch;
+                    break :blk encoded;
+                };
+                defer {
+                    if (lat_owned) _ = mlx.mlx_array_free(lat);
+                }
                 try rows_list.append(allocator, try patchifyVideo(lat, s));
             }
         }
         if (needs_audio) {
-            const apath = paths.audio_vae orelse return error.RefAudioNeedsAudioVae;
-            var aw = try model_mod.loadWeightsSingleFile(allocator, apath);
-            defer aw.deinit();
+            var need_audio_vae = false;
             for (req.refs) |m| {
                 if (m.ref.audio_t == 0) continue;
-                const wav = m.waveform orelse return error.RefMissingAudio;
-                const z = try audio_mod.encode(allocator, &aw, wav, s);
-                defer _ = mlx.mlx_array_free(z);
-                if (@as(u32, @intCast(mlx.getShape(z)[3])) != m.ref.audio_t)
-                    return error.RefAudioLengthMismatch;
+                if (m.latent == null) need_audio_vae = true;
+            }
+            var aw: ?model_mod.Weights = null;
+            defer if (aw) |*w| w.deinit();
+            if (need_audio_vae) {
+                const apath = paths.audio_vae orelse return error.RefAudioNeedsAudioVae;
+                aw = try model_mod.loadWeightsSingleFile(allocator, apath);
+            }
+            for (req.refs) |m| {
+                if (m.ref.audio_t == 0) continue;
+                const z_owned = m.latent == null;
+                const z = if (m.latent) |stored| blk: {
+                    if (m.ref.kind != .audio) return error.RefMissingAudio;
+                    if (@as(u32, @intCast(mlx.getShape(stored)[3])) != m.ref.audio_t)
+                        return error.RefAudioLengthMismatch;
+                    break :blk stored;
+                } else blk: {
+                    const wav = m.waveform orelse return error.RefMissingAudio;
+                    const encoded = try audio_mod.encode(allocator, &aw.?, wav, s);
+                    if (@as(u32, @intCast(mlx.getShape(encoded)[3])) != m.ref.audio_t)
+                        return error.RefAudioLengthMismatch;
+                    break :blk encoded;
+                };
+                defer {
+                    if (z_owned) _ = mlx.mlx_array_free(z);
+                }
                 try arows_list.append(allocator, try audioLatentToRows(z, s));
             }
             // AUDIO_COND_TIMESTEP is 1.0 and the reference only augments below
@@ -4643,6 +4704,11 @@ fn generateOne(
 
     // ref2va references, in `resolveRefs` order.
     for (req.refs) |m| {
+        if (m.latent != null) {
+            if (m.ref.kind == .audio)
+                try addLabel(allocator, &tok, &present, &label_ids, try h3v.labelFor(&label_buf, .audio, m.ref.ordinal));
+            continue;
+        }
         switch (m.ref.kind) {
             .audio => try addLabel(allocator, &tok, &present, &label_ids, try h3v.labelFor(&label_buf, .audio, m.ref.ordinal)),
             .image => {
@@ -6015,7 +6081,7 @@ test "minimax h3: a ref block is DERIVED from its resolved reference" {
         .{ .kind = .video, .w = 1920, .h = 1080, .frames = 56, .soundtrack_samples = 48000 },
     };
     const audios = [_]RefInput{.{ .kind = .audio, .audio_samples = 32000 }};
-    var res = switch (try resolveRefs(a, &images, &videos, &audios, 864, 480, .match, RefLimits.generation)) {
+    var res = switch (try resolveRefs(a, &images, &videos, &audios, 864, 480, .match, RefLimits.generation, 0)) {
         .ok => |r| r,
         .reject => return error.UnexpectedReject,
     };
@@ -6650,7 +6716,7 @@ test "minimax h3: ref2va request resolution orders and numbers references" {
     };
     const audios = [_]RefInput{.{ .kind = .audio, .audio_samples = 16000 }};
 
-    var res = switch (try resolveRefs(a, &images, &videos, &audios, 864, 480, .match, RefLimits.generation)) {
+    var res = switch (try resolveRefs(a, &images, &videos, &audios, 864, 480, .match, RefLimits.generation, 0)) {
         .ok => |r| r,
         .reject => |why| {
             std.debug.print("unexpected reject: {s}\n", .{why.message()});
@@ -6739,7 +6805,7 @@ test "minimax h3: ref2va rejects what it cannot honor, by name" {
         .{ .i = &.{}, .v = &empty, .au = &.{}, .want = .empty_video },
     };
     for (cases) |c| {
-        switch (try resolveRefs(a, c.i, c.v, c.au, 864, 480, .match, RefLimits.generation)) {
+        switch (try resolveRefs(a, c.i, c.v, c.au, 864, 480, .match, RefLimits.generation, 0)) {
             .ok => |r| {
                 var rr = r;
                 rr.deinit();
@@ -6756,7 +6822,7 @@ test "minimax h3: ref2va rejects what it cannot honor, by name" {
     // The caps are INCLUSIVE — exactly at the limit must be served.
     const at_cap_i = rep(MAX_REF_IMAGES, img);
     const at_cap_v = rep(MAX_REF_VIDEOS, vid);
-    var ok = switch (try resolveRefs(a, &at_cap_i, &at_cap_v, &.{}, 864, 480, .max, RefLimits.generation)) {
+    var ok = switch (try resolveRefs(a, &at_cap_i, &at_cap_v, &.{}, 864, 480, .max, RefLimits.generation, 0)) {
         .ok => |r| r,
         .reject => return error.TestUnexpectedResult,
     };
@@ -6788,7 +6854,7 @@ test "minimax h3: the reference set has a TOTAL cap, not just per-type ones" {
     const over_i = rep(9, img);
     const over_v = rep(3, vid);
     const over_a = rep(3, aud);
-    switch (try resolveRefs(a, &over_i, &over_v, &over_a, 864, 480, .max, RefLimits.generation)) {
+    switch (try resolveRefs(a, &over_i, &over_v, &over_a, 864, 480, .max, RefLimits.generation, 0)) {
         .ok => return error.TestUnexpectedResult,
         .reject => |r| {
             try testing.expectEqual(RefReject.too_many_refs, r);
@@ -6802,13 +6868,13 @@ test "minimax h3: the reference set has a TOTAL cap, not just per-type ones" {
     const twelve_i = rep(6, img);
     const three_v = rep(3, vid);
     const four_a = rep(4, aud); // over the per-type cap too — that wins, it is more specific
-    switch (try resolveRefs(a, &twelve_i, &three_v, &four_a, 864, 480, .max, RefLimits.generation)) {
+    switch (try resolveRefs(a, &twelve_i, &three_v, &four_a, 864, 480, .max, RefLimits.generation, 0)) {
         .ok => return error.TestUnexpectedResult,
         .reject => |r| try testing.expectEqual(RefReject.too_many_audios, r),
     }
     const six_i = rep(6, img);
     const three_a = rep(3, aud);
-    var ok = switch (try resolveRefs(a, &six_i, &three_v, &three_a, 864, 480, .max, RefLimits.generation)) {
+    var ok = switch (try resolveRefs(a, &six_i, &three_v, &three_a, 864, 480, .max, RefLimits.generation, 0)) {
         .ok => |r| r,
         .reject => return error.TestUnexpectedResult,
     };
@@ -6827,11 +6893,11 @@ test "minimax h3: refmods visual profile allows 16 images; generation profile do
         }
     }.f;
     const sixteen = rep(16, img);
-    switch (try resolveRefs(a, &sixteen, &.{}, &.{}, 864, 480, .match, RefLimits.generation)) {
+    switch (try resolveRefs(a, &sixteen, &.{}, &.{}, 864, 480, .match, RefLimits.generation, 0)) {
         .ok => return error.TestUnexpectedResult,
         .reject => |r| try testing.expectEqual(RefReject.too_many_images, r),
     }
-    var ok16 = switch (try resolveRefs(a, &sixteen, &.{}, &.{}, 864, 480, .match, RefLimits.refmods_visual)) {
+    var ok16 = switch (try resolveRefs(a, &sixteen, &.{}, &.{}, 864, 480, .match, RefLimits.refmods_visual, 0)) {
         .ok => |r| r,
         .reject => return error.TestUnexpectedResult,
     };
@@ -6839,7 +6905,7 @@ test "minimax h3: refmods visual profile allows 16 images; generation profile do
     try testing.expectEqual(@as(usize, 16), ok16.refs.len);
 
     const seventeen = rep(17, img);
-    switch (try resolveRefs(a, &seventeen, &.{}, &.{}, 864, 480, .match, RefLimits.refmods_visual)) {
+    switch (try resolveRefs(a, &seventeen, &.{}, &.{}, 864, 480, .match, RefLimits.refmods_visual, 0)) {
         .ok => return error.TestUnexpectedResult,
         .reject => |r| try testing.expectEqual(RefReject.too_many_images, r),
     }
@@ -7982,6 +8048,38 @@ test "minimax h3: pin request validators name the refusal" {
     try testing.expectEqualStrings("latent_prefix_frames requires chain_windows > 1", latentPrefixRequestError(22, 1, 56, true, false).?);
     try testing.expectEqualStrings("latent_suffix_frames requires latent_suffix_path", latentSuffixRequestError(22, 1, 56, true, false).?);
     try testing.expectEqualStrings("latent_prefix_frames cannot be used with references or ref_mod_paths", refCompatError(true, 1, 22, 0).?);
+}
+
+test "minimax h3: ref_mod_paths mix and presentation gates" {
+    try testing.expectEqualStrings("do not mix 'ref_mod_paths' with ref_images", refModMixError(true, true).?);
+    try testing.expect(refModMixError(true, false) == null);
+    try testing.expect(refModLatentPresentationNeedsAudioLabel(true, .audio));
+    try testing.expect(!refModLatentPresentationNeedsAudioLabel(true, .video));
+    try testing.expect(refModLatentPresentationSkipsQwenVision(true, .image));
+    try testing.expect(!refModLatentPresentationSkipsQwenVision(false, .image));
+}
+
+test "minimax h3: audio RefMods seed live ref_audios ordinals" {
+    const a = testing.allocator;
+    const audios = [_]RefInput{.{ .kind = .audio, .audio_samples = 16000 }};
+    var res = switch (try resolveRefs(a, &.{}, &.{}, &audios, 864, 480, .match, RefLimits.generation, 1)) {
+        .ok => |r| r,
+        .reject => return error.TestUnexpectedResult,
+    };
+    defer res.deinit();
+    try testing.expectEqual(@as(u32, 2), res.refs[0].ordinal);
+    var label_buf: [32]u8 = undefined;
+    try testing.expectEqualStrings("<Audio 1>: ", try h3v.labelFor(&label_buf, .audio, 1));
+    try testing.expectEqualStrings("<Audio 2>: ", try h3v.labelFor(&label_buf, .audio, 2));
+}
+
+test "minimax h3: audio ordinal base respects MAX_REF_AUDIOS cap" {
+    const a = testing.allocator;
+    const audios = [_]RefInput{.{ .kind = .audio, .audio_samples = 8000 }};
+    switch (try resolveRefs(a, &.{}, &.{}, &audios, 864, 480, .match, RefLimits.generation, 3)) {
+        .ok => return error.TestUnexpectedResult,
+        .reject => |why| try testing.expectEqual(RefReject.too_many_audios, why),
+    }
     try testing.expect(refCompatError(true, 1, 0, 0) == null);
     try testing.expectEqualStrings("a first-frame anchor cannot combine with a prefix pin — the pin owns the window's opening", keyframeSidecarBindingError(true, false, true, false).?);
     try testing.expect(latentPinWindowError(22, 0, 56) == null);
