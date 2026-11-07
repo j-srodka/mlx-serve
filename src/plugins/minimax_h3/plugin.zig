@@ -52,6 +52,8 @@ pub const Engine = struct {
     geometry: h3.Geometry,
     /// The REF2VA partition (the pack's declared tasks; its files are the FL2VA ones).
     supports_refs: bool,
+    /// A pack declaring the `fl2va` task (keyframes, pins, `latent_out`). A hybrid pack sets this AND `supports_refs`.
+    supports_fl2va: bool,
     /// A pack declaring ref2va without t2va (FastH3 Omni) needs an image or video reference on every request.
     supports_t2va: bool,
     pdd: ?h3.Pdd,
@@ -102,6 +104,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .machine = if (ctx.machine) |m| m.* else .{},
         .geometry = geometry,
         .supports_refs = config.declaresTask(gpa, cfg, "ref2va"),
+        .supports_fl2va = config.declaresTask(gpa, cfg, "fl2va"),
         .supports_t2va = config.declaresTask(gpa, cfg, "t2va"),
         .pdd = pdd,
         .vsa = contract,
@@ -386,11 +389,33 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     // Chained windows ride FL2VA keyframe conditioning: `num_frames` is per window.
     const chain_windows = u32Field(&b, "chain_windows", 1);
     if (chain_windows < 1 or chain_windows > 6) return bad("chain_windows must be 1-6");
-    if (chain_windows > 1 and e.supports_refs) return bad("chained windows ride FL2VA keyframe conditioning — the REF2VA pack cannot serve them; load an FL2VA checkpoint");
+    if (chain_windows > 1 and e.supports_refs and !e.supports_fl2va) return bad("chained windows ride FL2VA keyframe conditioning — the REF2VA pack cannot serve them; load an FL2VA checkpoint");
+
+    const latent_prefix_frames = u32Field(&b, "latent_prefix_frames", 0);
+    const latent_suffix_frames = u32Field(&b, "latent_suffix_frames", 0);
+    const latent_out_raw = b.str("latent_out");
+    const latent_prefix_path_raw = b.str("latent_prefix_path");
+    const latent_suffix_path_raw = b.str("latent_suffix_path");
+    const has_latent_out = latent_out_raw != null and latent_out_raw.?.len > 0;
+    const has_latent_prefix_path = latent_prefix_path_raw != null and latent_prefix_path_raw.?.len > 0;
+    const has_latent_suffix_path = latent_suffix_path_raw != null and latent_suffix_path_raw.?.len > 0;
 
     // Snapped to the model's own ladder, and said so: a silently different length drifts the client's audio mux.
     const shape = h3.temporalShape(requested_frames);
-    const delivered = h3.chainDeliveredFrames(chain_windows, shape.frame_count);
+    if (h3.latentPrefixRequestError(latent_prefix_frames, chain_windows, shape.frame_count, e.supports_fl2va, has_latent_prefix_path)) |msg| return Verdict.named(.unsupported, msg);
+    if (h3.latentSuffixRequestError(latent_suffix_frames, chain_windows, shape.frame_count, e.supports_fl2va, has_latent_suffix_path)) |msg| return Verdict.named(.unsupported, msg);
+    if (h3.latentPinWindowError(latent_prefix_frames, latent_suffix_frames, shape.frame_count)) |msg| return Verdict.named(.unsupported, msg);
+    if (has_latent_prefix_path and latent_prefix_frames == 0) return bad("latent_prefix_path requires latent_prefix_frames");
+    if (has_latent_suffix_path and latent_suffix_frames == 0) return bad("latent_suffix_path requires latent_suffix_frames");
+    if (has_latent_out and !e.supports_fl2va) return bad("latent_out is FL2VA only — load an FL2VA checkpoint");
+    if (has_latent_out and shape.frame_count == 1) return bad("num_frames 1 is a still and cannot use latent_out");
+    if (has_latent_prefix_path and !e.supports_fl2va) return bad("latent_prefix_path is FL2VA only — load an FL2VA checkpoint");
+    if (has_latent_prefix_path and shape.frame_count == 1) return bad("num_frames 1 is a still and cannot use latent_prefix_path");
+    if (has_latent_suffix_path and !e.supports_fl2va) return bad("latent_suffix_path is FL2VA only — load an FL2VA checkpoint");
+    if (has_latent_suffix_path and shape.frame_count == 1) return bad("num_frames 1 is a still and cannot use latent_suffix_path");
+
+    const overlap: u32 = if (latent_prefix_frames > 0) latent_prefix_frames else 0;
+    const delivered = h3.chainDeliveredFrames(chain_windows, shape.frame_count, overlap);
     const rgb = video_out.rgbBytes(delivered, width, height);
     if (rgb > video_out.MAX_RGB_BYTES) return req.refuseFmt(.unsupported, video_out.TOO_LARGE, video_out.TOO_LARGE_FMT, .{ delivered, width, height, rgb / (1024 * 1024), video_out.MAX_RGB_BYTES / (1024 * 1024) });
 
@@ -407,6 +432,14 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     const has_refs = fieldSet(&b, "ref_images") or fieldSet(&b, "ref_videos") or fieldSet(&b, "ref_audios");
     if (has_refs and !e.supports_refs) return bad("this MiniMax-H3 pack does not support references (it declares no 'ref2va' task) — load a REF2VA checkpoint");
     if (has_refs) if (references(req, &b, width, height, shape.frame_count, s, &refs, h3.RefLimits.generation) catch |err| return job.failure(err, "MiniMax-H3 generation failed")) |v| return v;
+    if (h3.refCompatError(has_refs, chain_windows, latent_prefix_frames, latent_suffix_frames)) |msg| return Verdict.named(.unsupported, msg);
+    var kf_has_first = false;
+    var kf_has_last = false;
+    for (kfs.buf[0..kfs.n]) |kf| switch (kf.anchor) {
+        .first => kf_has_first = true,
+        .last => kf_has_last = true,
+    };
+    if (h3.keyframeSidecarBindingError(kf_has_first, kf_has_last, has_latent_prefix_path, has_latent_suffix_path)) |msg| return Verdict.named(.unsupported, msg);
     if (e.supports_refs and !e.supports_t2va) {
         const visual = for (refs.items) |m| {
             if (m.ref.kind != .audio) break true;
@@ -452,6 +485,67 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     var paths_c: [lora.MAX_LORAS][]const u8 = undefined;
     for (e.lora_paths[0..e.lora_n], 0..) |p, i| paths_c[i] = p;
     const io = std.Io.Threaded.global_single_threaded.io();
+    if (has_latent_out) {
+        const raw = latent_out_raw.?;
+        if (!std.fs.path.isAbsolute(raw)) return bad("'latent_out' must be an absolute path");
+        const parent = std.fs.path.dirname(raw) orelse return bad("'latent_out' must be an absolute path");
+        const d = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch return bad("'latent_out' parent directory does not exist");
+        d.close(io);
+    }
+    if (has_latent_prefix_path) {
+        const raw = latent_prefix_path_raw.?;
+        if (!std.fs.path.isAbsolute(raw)) return bad("'latent_prefix_path' must be an absolute path");
+        const f = std.Io.Dir.openFileAbsolute(io, raw, .{}) catch return bad("'latent_prefix_path' file not found or not readable");
+        f.close(io);
+    }
+    if (has_latent_suffix_path) {
+        const raw = latent_suffix_path_raw.?;
+        if (!std.fs.path.isAbsolute(raw)) return bad("'latent_suffix_path' must be an absolute path");
+        const f = std.Io.Dir.openFileAbsolute(io, raw, .{}) catch return bad("'latent_suffix_path' file not found or not readable");
+        f.close(io);
+    }
+
+    var prefix_v: ?mlx.mlx_array = null;
+    defer if (prefix_v) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    var prefix_a: ?mlx.mlx_array = null;
+    defer if (prefix_a) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    var suffix_v: ?mlx.mlx_array = null;
+    defer if (suffix_v) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    var suffix_a: ?mlx.mlx_array = null;
+    defer if (suffix_a) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    if (has_latent_prefix_path) {
+        const pathz = gpa.dupeSentinel(u8, latent_prefix_path_raw.?, 0) catch return job.failure(error.OutOfMemory, "out of memory");
+        defer gpa.free(pathz);
+        const loaded = h3.loadLatentSidecar(gpa, pathz, s) catch |err| return switch (err) {
+            error.BadLatentSidecarPack => bad("'latent_prefix_path' sidecar must declare pack fl2va"),
+            error.MissingVideoLatent => bad("'latent_prefix_path' sidecar missing video_latent"),
+            error.MissingAudioLatent => bad("'latent_prefix_path' sidecar missing audio_latent"),
+            else => bad("'latent_prefix_path' could not be loaded"),
+        };
+        prefix_v = loaded.video;
+        prefix_a = loaded.audio;
+    }
+    if (has_latent_suffix_path) {
+        const pathz = gpa.dupeSentinel(u8, latent_suffix_path_raw.?, 0) catch return job.failure(error.OutOfMemory, "out of memory");
+        defer gpa.free(pathz);
+        const loaded = h3.loadLatentSidecar(gpa, pathz, s) catch |err| return switch (err) {
+            error.BadLatentSidecarPack => bad("'latent_suffix_path' sidecar must declare pack fl2va"),
+            error.MissingVideoLatent => bad("'latent_suffix_path' sidecar missing video_latent"),
+            error.MissingAudioLatent => bad("'latent_suffix_path' sidecar missing audio_latent"),
+            else => bad("'latent_suffix_path' could not be loaded"),
+        };
+        suffix_v = loaded.video;
+        suffix_a = loaded.audio;
+    }
+
     var res = h3.generate(gpa, io, paths, .{
         .geometry = e.geometry,
         .resident = if (plan) |p| p.r else null,
@@ -469,6 +563,12 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         .lora_paths = paths_c[0..e.lora_n],
         .lora_scales = e.lora_scales[0..e.lora_n],
         .chain_windows = chain_windows,
+        .latent_prefix_frames = latent_prefix_frames,
+        .chain_prefix_video_latent = prefix_v,
+        .chain_prefix_audio_latent = prefix_a,
+        .latent_suffix_frames = latent_suffix_frames,
+        .chain_suffix_video_latent = suffix_v,
+        .chain_suffix_audio_latent = suffix_a,
         .keyframes = kfs.buf[0..kfs.n],
         .refs = refs.items,
     }, job.progressOf(progress), s) catch |err| return switch (err) {
@@ -481,6 +581,12 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         else => job.failure(err, "MiniMax-H3 generation failed"),
     };
     defer res.deinit();
+    if (has_latent_out) {
+        const vl = res.video_latent orelse return job.failure(error.MissingVideoLatent, "MiniMax-H3 failed to write latent_out");
+        const pathz = gpa.dupeSentinel(u8, latent_out_raw.?, 0) catch return job.failure(error.OutOfMemory, "out of memory");
+        defer gpa.free(pathz);
+        h3.saveLatentSidecar(pathz, vl, res.audio_latent, s) catch return Verdict.refuse(.failed, "MiniMax-H3 failed to write latent_out");
+    }
     const members = encodeResult(&res, s) catch |err| return job.failure(err, "MiniMax-H3 generation failed");
     gpa.free(e.result);
     e.result = members;
@@ -848,6 +954,9 @@ test "minimax_h3 plugin: a seeded clip on the tiny pack is deterministic JSON me
         .{ "{\"prompt\":\"x\",\"width\":70}", "width and height must be multiples of 32" },
         .{ "{\"prompt\":\"x\",\"steps\":0}", "'steps' must be in [1,100]" },
         .{ "{\"prompt\":\"x\",\"chain_windows\":7}", "chain_windows must be 1-6" },
+        .{ "{\"prompt\":\"x\",\"latent_prefix_frames\":22,\"chain_windows\":1}", "latent_prefix_frames requires chain_windows > 1" },
+        .{ "{\"prompt\":\"x\",\"latent_prefix_path\":\"/tmp/no_h3_sidecar.safetensors\"}", "latent_prefix_path requires latent_prefix_frames" },
+        .{ "{\"prompt\":\"x\",\"latent_out\":\"latents.safetensors\"}", "'latent_out' must be an absolute path" },
         .{ "{\"prompt\":\"x\",\"ref_images\":[\"AAAA\"]}", "this MiniMax-H3 pack does not support references (it declares no 'ref2va' task) — load a REF2VA checkpoint" },
         .{ "{\"prompt\":\"x\",\"turbo\":true}", "this pack has no turbo_lora.safetensors — download minimax_h3_turbo_4step_ema_ckpt850.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora (Apache-2.0) into the model folder as turbo_lora.safetensors" },
         .{ "{\"prompt\":\"x\",\"first_frame_image\":\"!!\"}", "keyframe image is not valid base64" },

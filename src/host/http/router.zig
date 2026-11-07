@@ -281,7 +281,9 @@ pub fn handleConnection(
     if (std.mem.eql(u8, method, "GET") and isRoute(path, "/health")) {
         if (mlx.gpuContextLost()) return sendResponse(stream, "503 Service Unavailable", "application/json", "{\"status\":\"cuda context lost\"}");
         log.debug("GET  /health -> 200\n", .{});
-        try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
+        // Pin/sidecar capability flags (binary, not pack): h3cli refuses a
+        // server whose /health omits `latent_suffix`.
+        try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\",\"latent_suffix\":true,\"ref_latent_out\":true}");
         return;
     }
     // The console. It belongs here, above resolution, for the same reason

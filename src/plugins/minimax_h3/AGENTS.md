@@ -18,7 +18,7 @@ REF2VA (references), FastH3 Omni (REF2VA's 8-step PDD student with trained VSA s
 ## Request contract
 `prompt`, `width`/`height` (multiples of 32), `num_frames` (snapped UP to 17k+5, said so in the log), `steps` ([1,100];
 a student runs exactly its own), `seed`, `turbo` (needs `turbo_lora.safetensors`, >= 4 steps), `fast` (default on),
-`chain_windows` 1-6 (FL2VA only; `num_frames` per window), `first_frame_image` / `last_frame_image`, `ref_images` /
+`chain_windows` 1-6 (FL2VA only; `num_frames` per window), FL2VA pins (`latent_prefix_frames`/`latent_suffix_frames` 5/22/39/56 + sidecar paths, `latent_out`), `first_frame_image` / `last_frame_image`, `ref_images` /
 `ref_videos` (`{frames, audio}`) / `ref_audios` + `ref_image_size` (REF2VA only), `lora_paths`/`lora_scales`.
 `cfg_scale`/`stg_scale`/`pipeline` are ignored, not refused (the app sends them for every video backend).
 

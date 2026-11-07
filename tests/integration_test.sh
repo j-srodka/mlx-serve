@@ -126,7 +126,9 @@ echo ""
 # ── Test: Health ──
 echo -e "${YELLOW}Test: Health endpoint${NC}"
 RESP=$(curl -s "$BASE/health")
-assert_eq "GET /health returns ok" '{"status":"ok"}' "$RESP"
+assert_contains "GET /health returns ok" '"status":"ok"' "$RESP"
+assert_contains "GET /health advertises latent_suffix" '"latent_suffix":true' "$RESP"
+assert_contains "GET /health advertises ref_latent_out" '"ref_latent_out":true' "$RESP"
 echo ""
 
 # ── Test: Models ──
