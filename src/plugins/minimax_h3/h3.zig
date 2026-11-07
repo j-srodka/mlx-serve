@@ -1881,8 +1881,8 @@ pub fn buildTimestepPlan(
     var has_vis_cond = false;
     var has_aud_cond = false;
     for (layout.segments) |seg| switch (seg.kind) {
-        .cond, .ref_img => has_vis_cond = true,
-        .ref_audio => has_aud_cond = true,
+        .cond, .ref_img, .video_pin => has_vis_cond = true,
+        .ref_audio, .audio_pin => has_aud_cond = true,
         else => {},
     };
     add(&uniq, &n, t_v);
@@ -1907,10 +1907,10 @@ pub fn buildTimestepPlan(
     var nr: usize = 0;
     for (layout.segments) |seg| {
         const t = switch (seg.kind) {
-            .text, .video, .video_pin => t_v,
-            .audio, .audio_pin => t_a,
-            .cond, .ref_img => @max(t_v, aug.visual),
-            .ref_audio => @max(t_a, aug.audio),
+            .text, .video => t_v,
+            .audio => t_a,
+            .cond, .ref_img, .video_pin => @max(t_v, aug.visual),
+            .ref_audio, .audio_pin => @max(t_a, aug.audio),
         };
         // Row = t_row * modalities + tag. The `* 3` is the AdaLN reshape's
         // modality stride, not an arbitrary constant.
@@ -7062,6 +7062,45 @@ test "minimax h3: timestep plan assigns modulation rows" {
         cursor = r.end;
     }
     try testing.expectEqual(l2.seq_len, cursor);
+}
+
+test "minimax h3: latent pin rows use conditioning timesteps, not generation noise" {
+    const a = testing.allocator;
+    const shape = temporalShape(56);
+    const k = overlapVideoLatentT(22);
+    const pin_a = overlapAudioLatentT(22);
+    var layout = try PackedLayout.initFull(a, 8, shape.latent_t, 4, 4, shape.audio_t, &.{}, 56, &.{}, k, 0, pin_a, 0);
+    defer layout.deinit();
+    var plan = try buildTimestepPlan(a, &layout, 0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{});
+    defer plan.deinit();
+    try testing.expect(plan.n_unique >= 3);
+    var vis_cond_i: ?usize = null;
+    var aud_cond_i: ?usize = null;
+    for (plan.unique_t, 0..) |t, i| {
+        if (t == VISUAL_COND_TIMESTEP) vis_cond_i = i;
+        if (t == AUDIO_COND_TIMESTEP) aud_cond_i = i;
+    }
+    try testing.expect(vis_cond_i != null);
+    try testing.expect(aud_cond_i != null);
+    for (layout.segments) |seg| {
+        switch (seg.kind) {
+            .video_pin, .audio_pin => {},
+            else => continue,
+        }
+        var found: ?ModRun = null;
+        for (plan.runs) |run| {
+            if (run.start == seg.start and run.end == seg.end) {
+                found = run;
+                break;
+            }
+        }
+        const run = found orelse return error.TestExpectedValue;
+        switch (seg.kind) {
+            .video_pin => try testing.expectEqual(@as(u32, @intCast(vis_cond_i.?)) * 3 + 0, run.mod_row),
+            .audio_pin => try testing.expectEqual(@as(u32, @intCast(aud_cond_i.?)) * 3 + 2, run.mod_row),
+            else => {},
+        }
+    }
 }
 
 test "minimax h3: a vision-carrying text span splits into tag runs" {
