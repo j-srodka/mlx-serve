@@ -649,6 +649,14 @@ fn refmodsOkJson(allocator: std.mem.Allocator, path: []const u8, kind: []const u
     return std.fmt.allocPrint(allocator, "{{\"path\":\"{s}\",\"kind\":\"{s}\",\"latent_t\":{d}}}", .{ esc.items, kind, latent_t });
 }
 
+/// Named refusal for visual refmod extract canvas (`null` = ok). Voice extract ignores width/height.
+fn refmodsCanvasError(has_voice: bool, width: u32, height: u32) ?[]const u8 {
+    if (has_voice) return null;
+    if (width == 0 or height == 0) return "missing 'width' or 'height'";
+    if (width % 32 != 0 or height % 32 != 0) return "width and height must be multiples of 32";
+    return null;
+}
+
 fn runRefmodsExtract(e: *Engine, req: *const abi.Request) Verdict {
     if (e.refmods_result.len != 0) {
         gpa.free(e.refmods_result);
@@ -668,13 +676,10 @@ fn runRefmodsExtract(e: *Engine, req: *const abi.Request) Verdict {
 
     const width = u32Field(&b, "width", 0);
     const height = u32Field(&b, "height", 0);
-    if (width == 0 or height == 0)
-        return req.refuseFmt(.unsupported, "missing 'width' or 'height'", "missing 'width' or 'height'", .{});
-    if (width % 32 != 0 or height % 32 != 0)
-        return req.refuseFmt(.unsupported, "width and height must be multiples of 32", "width and height must be multiples of 32", .{});
+    const has_voice = fieldSet(&b, "voice_max_seconds");
+    if (refmodsCanvasError(has_voice, width, height)) |msg| return Verdict.named(.unsupported, msg);
 
     const s = e.stream;
-    const has_voice = fieldSet(&b, "voice_max_seconds");
     const stills = fieldSet(&b, "ref_images");
     const one_video = fieldSet(&b, "ref_videos");
     const audio_list = fieldSet(&b, "ref_audios");
@@ -1051,6 +1056,13 @@ test "minimax_h3 plugin: reference audio arrives as 32 kHz stereo in the encoder
     // Duplicated, not summed: both channels carry the mono signal.
     try testing.expectApproxEqAbs(pcm[0], pcm[1], 1e-6);
     try testing.expectApproxEqAbs(pcm[200], pcm[201], 1e-6);
+}
+
+test "minimax_h3 plugin: refmods canvas gate skips width/height on voice extract" {
+    try testing.expect(refmodsCanvasError(true, 0, 0) == null);
+    try testing.expectEqualStrings("missing 'width' or 'height'", refmodsCanvasError(false, 0, 0).?);
+    try testing.expectEqualStrings("width and height must be multiples of 32", refmodsCanvasError(false, 70, 64).?);
+    try testing.expect(refmodsCanvasError(false, 256, 256) == null);
 }
 
 const MediaPack = @import("../../sdk/testing/media_pack.zig").MediaPack(@This());
