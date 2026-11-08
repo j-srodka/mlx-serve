@@ -7151,6 +7151,73 @@ test "minimax h3: timestep plan assigns modulation rows" {
     try testing.expectEqual(l2.seq_len, cursor);
 }
 
+test "minimax h3: refs with prefix and suffix pins — layout, overlap, cond timesteps" {
+    const a = testing.allocator;
+    const shape = temporalShape(56);
+    const refs = [_]RefBlock{
+        .{ .kind = .image, .latent_h = 4, .latent_w = 4 },
+        .{ .kind = .audio, .audio_t = 5 },
+    };
+    const pin_v = overlapVideoLatentT(22);
+    const pin_a = overlapAudioLatentT(22);
+    var layout = try PackedLayout.initFull(a, 8, shape.latent_t, 4, 4, shape.audio_t, &.{}, 56, &refs, pin_v, pin_v, pin_a, pin_a);
+    defer layout.deinit();
+
+    try testing.expect(@as(u64, layout.seq_len) > 8 + refCondRows(&refs));
+
+    var saw_ref_img = false;
+    var saw_ref_audio = false;
+    var vpin_count: u32 = 0;
+    var apin_count: u32 = 0;
+    for (layout.segments) |seg| {
+        switch (seg.kind) {
+            .ref_img => saw_ref_img = true,
+            .ref_audio => saw_ref_audio = true,
+            .video_pin => vpin_count += 1,
+            .audio_pin => apin_count += 1,
+            else => {},
+        }
+    }
+    try testing.expect(saw_ref_img and saw_ref_audio);
+    try testing.expectEqual(@as(u32, 2), vpin_count);
+    try testing.expectEqual(@as(u32, 2), apin_count);
+
+    for (layout.segments, 0..) |seg, i| {
+        if (i > 0) try testing.expectEqual(layout.segments[i - 1].end, seg.start);
+    }
+    try testing.expectEqual(layout.seq_len, layout.segments[layout.segments.len - 1].end);
+
+    var plan = try buildTimestepPlan(a, &layout, 0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{});
+    defer plan.deinit();
+    var vis_cond_i: ?usize = null;
+    var aud_cond_i: ?usize = null;
+    for (plan.unique_t, 0..) |t, i| {
+        if (t == VISUAL_COND_TIMESTEP) vis_cond_i = i;
+        if (t == AUDIO_COND_TIMESTEP) aud_cond_i = i;
+    }
+    try testing.expect(vis_cond_i != null);
+    try testing.expect(aud_cond_i != null);
+    for (layout.segments) |seg| {
+        switch (seg.kind) {
+            .ref_img, .video_pin, .ref_audio, .audio_pin => {},
+            else => continue,
+        }
+        var found: ?ModRun = null;
+        for (plan.runs) |run| {
+            if (run.start == seg.start and run.end == seg.end) {
+                found = run;
+                break;
+            }
+        }
+        const run = found orelse return error.TestExpectedValue;
+        switch (seg.kind) {
+            .ref_img, .video_pin => try testing.expectEqual(@as(u32, @intCast(vis_cond_i.?)) * 3 + 0, run.mod_row),
+            .ref_audio, .audio_pin => try testing.expectEqual(@as(u32, @intCast(aud_cond_i.?)) * 3 + 2, run.mod_row),
+            else => {},
+        }
+    }
+}
+
 test "minimax h3: latent pin rows use conditioning timesteps, not generation noise" {
     const a = testing.allocator;
     const shape = temporalShape(56);

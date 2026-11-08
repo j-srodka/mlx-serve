@@ -1,7 +1,7 @@
 # Handoff: mlx-serve, let H3 references ride pinned windows (Phase B)
 
-**Status:** Phase B steps 1–4 landed 2026-11-08 (mlx-serve `local/ornith-h3`).
-Steps 5–6 (extra layout probe test, docs sweep) still open.
+**Status:** Phase B steps 1–6 landed 2026-11-08 (`local/ornith-h3`). GPU probe
+remains h3-timeline; downstream D-80/D-82 still open.
 **Predecessor:** `docs/archive/handoff-ref2va-latent-out.md`. Its Phase A
 (`latent_out` with refs) shipped; **Phase B (pins with refs) was left open.**
 This is Phase B.

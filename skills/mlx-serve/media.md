@@ -206,16 +206,17 @@ minutes and hold a lot of memory: one at a time, unload the model after.
 
 ### MiniMax H3 FL2VA: chained windows
 
-Only the **FL2VA** pack (not REF2VA, not hybrid with refs). `ref_images`,
-ref video, ref audio, and RefMod cannot be combined with chaining — the server
-returns a named 400. `first_frame_image` and `last_frame_image` can: the first
+Only the **FL2VA** pack (not REF2VA). Live refs, `ref_mod_paths`, and
+`chain_windows`>1 cannot be mixed — named 400. On a **hybrid**
+FL2VA+REF2VA pack, refs may combine with per-window prefix/suffix pins (not
+with multi-window chaining); `GET /health` `"ref_pins":true`. `first_frame_image` and `last_frame_image` can: the first
 image anchors window 0, the last image anchors the final window, including
 when `latent_prefix_frames` is set.
 
 | field | notes |
 |---|---|
 | `chain_windows` | Integer ≥ 2. Run `num_frames` per window in one request; windows are joined server-side. Default (omit or 1) is a single window. |
-| `latent_prefix_frames` | Optional. Requires `chain_windows` > 1 and FL2VA. `0` or omit = **pixel chain**: last decoded frame is re-encoded as a one-frame condition; delivered length is `N·num_frames − (N−1)` (one frame dropped per seam). Non-zero (app sends **22**) = **latent pin**: the previous window's video/audio latent tail is held in the next sample; delivered length is `N·num_frames − (N−1)·overlap`. Legal overlaps are 5, 22, 39, 56 source frames. **22 is the proven overlap** — cleaner seam than the pixel chain on the same prompt. REF2VA and any request with references rejects this field. |
+| `latent_prefix_frames` | Optional. Requires `chain_windows` > 1 and FL2VA for **chained** runs (`0` or omit = pixel chain). On a single window, set with `latent_prefix_path` (hybrid FL2VA+REF2VA). Non-zero overlap = **latent pin** (legal 5, 22, 39, 56 source frames; **22** is the usual). Hybrid may send refs / `ref_mod_paths` with prefix/suffix pins; `chain_windows`>1 with refs is still refused. |
 
 Same prompt, seed, width, height, `num_frames`, and `steps` across windows.
 `"fast": false` and no turbo when comparing pixel chain vs latent pin.
@@ -225,9 +226,10 @@ Same prompt, seed, width, height, `num_frames`, and `steps` across windows.
 `latent_out` (absolute path to a `.safetensors` to receive the finished run's
 video/audio latents) combines freely with keyframe anchors and with refs /
 `ref_mod_paths` on a **hybrid** pack — it is written after generation returns
-(target latents only). Pin frame counts and `chain_windows`>1 with refs stay
-named 400s. `GET /health` `"ref_latent_out":true` is binary capability, not the
-loaded pack (pure REF2VA still refuses `latent_out`). A keyframe anchor can also
+(target latents only). Prefix/suffix pins with refs need hybrid + `"ref_pins":true`
+on `/health`; `chain_windows`>1 with refs stays a named 400. `GET /health`
+`"ref_latent_out":true` is binary capability, not the loaded pack (pure REF2VA
+still refuses `latent_out`). A keyframe anchor can also
 ride a chain with `latent_prefix_frames` set. Two per-side refusals:
 `first_frame_image` + `latent_prefix_path` (the pin owns the window's opening),
 `last_frame_image` + `latent_suffix_path` (mirrored). The mirror combos are
