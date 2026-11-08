@@ -510,7 +510,8 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     if (refs.items.len > h3.MAX_REF_TOTAL)
         return req.refuseFmt(.unsupported, "too many references", "too many references: at most {d} files across live refs and ref_mod_paths combined", .{h3.MAX_REF_TOTAL});
     const has_refs = has_live_refs or has_ref_mod_paths or refs.items.len > 0;
-    if (h3.refCompatError(has_refs, chain_windows, latent_prefix_frames, latent_suffix_frames)) |msg| return Verdict.named(.unsupported, msg);
+    const ref_pins_ok = e.supports_fl2va and e.supports_refs;
+    if (h3.refCompatError(has_refs, chain_windows, latent_prefix_frames, latent_suffix_frames, ref_pins_ok)) |msg| return Verdict.named(.unsupported, msg);
     var kf_has_first = false;
     var kf_has_last = false;
     for (kfs.buf[0..kfs.n]) |kf| switch (kf.anchor) {
@@ -531,7 +532,13 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     const fast: ?bool = if (b.get("fast")) |v| (if (v == .bool) v.bool else null) else null;
     const speed = h3.resolveSpeed(fast, distilled);
     const bcast_row: u64 = if (speed.bcast_k > 0) @as(u64, e.geometry.dit.num_layers) * e.geometry.dit.hidden_size * 2 else 0;
-    const rows = config.requestRows(width, height, shape.frame_count, @intCast(kfs.n));
+    var ref_blocks_buf: [h3.MAX_REF_TOTAL]h3.RefBlock = undefined;
+    const ref_blocks = blk: {
+        if (refs.items.len == 0) break :blk @as([]const h3.RefBlock, &.{});
+        for (refs.items, 0..) |m, i| ref_blocks_buf[i] = h3.refBlockFor(m.ref);
+        break :blk ref_blocks_buf[0..refs.items.len];
+    };
+    const rows = config.requestRows(width, height, shape.frame_count, @intCast(kfs.n)) + h3.refCondRows(ref_blocks);
     const activations = config.activationBytes(rows, bcast_row);
     const mem = memNow(req);
     const plan = residentFor(e, dir, activations, mem);

@@ -129,6 +129,7 @@ RESP=$(curl -s "$BASE/health")
 assert_contains "GET /health returns ok" '"status":"ok"' "$RESP"
 assert_contains "GET /health advertises latent_suffix" '"latent_suffix":true' "$RESP"
 assert_contains "GET /health advertises ref_latent_out" '"ref_latent_out":true' "$RESP"
+assert_contains "GET /health advertises ref_pins" '"ref_pins":true' "$RESP"
 echo ""
 
 # ── Test: Models ──

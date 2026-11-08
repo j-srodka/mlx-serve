@@ -4134,6 +4134,8 @@ pub const isLegalLatentSuffixFrames = isLegalLatentPrefixFrames;
 pub const latent_suffix_supported = true;
 /// This binary accepts `latent_out` together with refs on a hybrid pack (`/health`, pre-load).
 pub const ref_latent_out_supported = true;
+/// Refs may ride `latent_prefix_frames` / `latent_suffix_frames` on hybrid FL2VA+REF2VA packs.
+pub const ref_pins_supported = true;
 
 /// Video-latent tail length for a source-frame overlap.
 pub fn overlapVideoLatentT(overlap_src_frames: u32) u32 {
@@ -4256,20 +4258,39 @@ pub fn refModLatentPresentationSkipsQwenVision(has_latent: bool, kind: enum { im
 
 /// Named refusal when references share a request with latent pins or chained
 /// windows (`null` = ok). `latent_out` with refs is intentionally allowed.
+/// `ref_pins_ok` = hybrid FL2VA+REF2VA (`supports_fl2va` and refs on the pack).
 pub fn refCompatError(
     has_refs: bool,
     chain_windows: u32,
     latent_prefix_frames: u32,
     latent_suffix_frames: u32,
+    ref_pins_ok: bool,
 ) ?[]const u8 {
     if (!has_refs) return null;
     if (chain_windows > 1)
         return "chained windows cannot be used with references or ref_mod_paths";
-    if (latent_prefix_frames > 0)
-        return "latent_prefix_frames cannot be used with references or ref_mod_paths";
-    if (latent_suffix_frames > 0)
-        return "latent_suffix_frames cannot be used with references or ref_mod_paths";
+    const pins = latent_prefix_frames > 0 or latent_suffix_frames > 0;
+    if (pins and !ref_pins_ok)
+        return "latent prefix/suffix pins with references require an FL2VA+REF2VA hybrid pack";
     return null;
+}
+
+/// DiT rows ref2va blocks add beyond the target-only `config.requestRows` estimate.
+pub fn refCondRows(refs: []const RefBlock) u64 {
+    var n: u64 = 0;
+    for (refs) |b| {
+        switch (b.kind) {
+            .image => n += refFrameRows(b),
+            .audio => {
+                if (b.audio_t > 0) n += b.audio_t * 2;
+            },
+            .video => {
+                if (b.audio_t > 0) n += b.audio_t * 2;
+                n += b.latent_t * refFrameRows(b);
+            },
+        }
+    }
+    return n;
 }
 
 pub fn latentPinWindowError(
@@ -8047,7 +8068,9 @@ test "minimax h3: latent prefix — pin is the time-grid head, denoise continues
 test "minimax h3: pin request validators name the refusal" {
     try testing.expectEqualStrings("latent_prefix_frames requires chain_windows > 1", latentPrefixRequestError(22, 1, 56, true, false).?);
     try testing.expectEqualStrings("latent_suffix_frames requires latent_suffix_path", latentSuffixRequestError(22, 1, 56, true, false).?);
-    try testing.expectEqualStrings("latent_prefix_frames cannot be used with references or ref_mod_paths", refCompatError(true, 1, 22, 0).?);
+    try testing.expectEqualStrings("latent prefix/suffix pins with references require an FL2VA+REF2VA hybrid pack", refCompatError(true, 1, 22, 0, false).?);
+    try testing.expect(refCompatError(true, 1, 22, 0, true) == null);
+    try testing.expectEqualStrings("chained windows cannot be used with references or ref_mod_paths", refCompatError(true, 2, 22, 0, true).?);
 }
 
 test "minimax h3: ref_mod_paths mix and presentation gates" {
@@ -8080,7 +8103,7 @@ test "minimax h3: audio ordinal base respects MAX_REF_AUDIOS cap" {
         .ok => return error.TestUnexpectedResult,
         .reject => |why| try testing.expectEqual(RefReject.too_many_audios, why),
     }
-    try testing.expect(refCompatError(true, 1, 0, 0) == null);
+    try testing.expect(refCompatError(true, 1, 0, 0, true) == null);
     try testing.expectEqualStrings("a first-frame anchor cannot combine with a prefix pin — the pin owns the window's opening", keyframeSidecarBindingError(true, false, true, false).?);
     try testing.expect(latentPinWindowError(22, 0, 56) == null);
     try testing.expect(isLegalLatentPrefixFrames(22));
