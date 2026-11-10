@@ -49,10 +49,10 @@ case ",$TASKS," in (*,ref2va,*) HAS_REF2VA=yes;; (*) HAS_REF2VA=no;; esac
 echo "pack tasks: [$TASKS]"
 
 HEALTH=$(curl -sf "http://127.0.0.1:$PORT/health" || true)
-if echo "$HEALTH" | grep -q '"ref_latent_out":true' && echo "$HEALTH" | grep -q '"latent_suffix":true' && echo "$HEALTH" | grep -q '"ref_pins":true'; then
-  echo "PASS: /health advertises latent_suffix, ref_latent_out, and ref_pins"
+if echo "$HEALTH" | grep -q '"ref_latent_out":true' && echo "$HEALTH" | grep -q '"latent_suffix":true' && echo "$HEALTH" | grep -q '"ref_pins":true' && echo "$HEALTH" | grep -q '"latent_refine":true' && echo "$HEALTH" | grep -q '"latent_upscale":'; then
+  echo "PASS: /health advertises latent_suffix, ref_latent_out, ref_pins, latent_refine, and latent_upscale"
 else
-  echo "FAIL: /health missing latent_suffix, ref_latent_out, or ref_pins ($HEALTH)"; rc=1
+  echo "FAIL: /health missing pin/refine flags ($HEALTH)"; rc=1
 fi
 
 # [1] capability + staged preflight engagement

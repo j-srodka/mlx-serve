@@ -3581,6 +3581,67 @@ pub fn sigmaSchedule(allocator: std.mem.Allocator, steps: u32, shift: f64) ![]f6
     return out;
 }
 
+/// `(1-σ)·z + σ·noise` on the video clock (Comfy SamplerCustomAdvanced start).
+pub fn mixInit(z: mlx.mlx_array, noise: mlx.mlx_array, sigma: f64, s: S) !mlx.mlx_array {
+    const keep = try scalarLike(@floatCast(1.0 - sigma), z, s);
+    defer _ = mlx.mlx_array_free(keep);
+    const mix = try scalarLike(@floatCast(sigma), z, s);
+    defer _ = mlx.mlx_array_free(mix);
+    const a = try mulA(z, keep, s);
+    defer _ = mlx.mlx_array_free(a);
+    const b = try mulA(noise, mix, s);
+    defer _ = mlx.mlx_array_free(b);
+    return addA(a, b, s);
+}
+
+/// Named refusal for an explicit refine sigma list (`null` = ok). Values are
+/// already on the VIDEO shifted clock (Comfy ManualSigmas + MiniMaxH3SigmaShift).
+pub fn refineSigmasError(sigmas: []const f64) ?[]const u8 {
+    if (sigmas.len < 2) return "refine_sigmas needs at least two values ending at 0";
+    if (@abs(sigmas[sigmas.len - 1]) > 1e-6) return "refine_sigmas must end at 0";
+    for (sigmas, 0..) |v, i| {
+        if (!std.math.isFinite(v) or v < 0 or v > 1.0 + 1e-6) return "refine_sigmas values must be in [0, 1]";
+        if (i + 1 < sigmas.len and v <= sigmas[i + 1]) return "refine_sigmas must be strictly descending";
+    }
+    return null;
+}
+
+/// Map `refine_start_sigma` onto `sigmaSchedule(steps, shift)`: rescale so σ₀ is the start.
+pub fn refineScheduleFromStart(allocator: std.mem.Allocator, start: f64, steps: u32, shift: f64) ![]f64 {
+    const sched = try sigmaSchedule(allocator, steps, shift);
+    errdefer allocator.free(sched);
+    if (start <= 0 or start > 1.0) return error.BadRefineStart;
+    const s0 = sched[0];
+    if (s0 == 0) return error.BadRefineStart;
+    for (sched) |*v| v.* = v.* * (start / s0);
+    sched[sched.len - 1] = 0;
+    return sched;
+}
+
+/// Video `[1,24,T,H,W]` / audio `[1,32,2,Ta]` vs the request canvas (`null` = ok).
+pub fn refineInitGeometryError(v_n: usize, v_c: u32, v_t: u32, v_h: u32, v_w: u32, a_t: u32, width: u32, height: u32, frames: u32) ?[]const u8 {
+    if (v_n != 5 or v_c != 24) return "'latent_init_path' video_latent must be [1, 24, T, H, W]";
+    const want_h = height / VAE_SPATIAL;
+    const want_w = width / VAE_SPATIAL;
+    if (v_h != want_h or v_w != want_w)
+        return "'latent_init_path' canvas must match the sidecar (latent H×W × 16 = width×height)";
+    const shape = temporalShape(frames);
+    if (v_t != shape.latent_t) return "'latent_init_path' frame count must match num_frames";
+    if (a_t != shape.audio_t) return "'latent_init_path' audio latent length must match num_frames";
+    return null;
+}
+
+pub fn refineRequestError(has_init: bool, has_upscale: bool, supports_fl2va: bool, chain_windows: u32, has_refs: bool, has_pins: bool, pdd: bool) ?[]const u8 {
+    if (!has_init and !has_upscale) return null;
+    if (!has_init) return "latent_upscale requires latent_init_path";
+    if (!supports_fl2va) return "latent refine is FL2VA only — load an FL2VA checkpoint";
+    if (chain_windows > 1) return "latent refine does not support chain_windows > 1";
+    if (has_refs) return "latent refine does not support references yet";
+    if (has_pins) return "latent refine does not support prefix/suffix pins yet";
+    if (pdd) return "latent refine is not a PDD student schedule — omit refine on this pack";
+    return null;
+}
+
 /// A FastH3 PDD student (FastVideo `fastvideo/layers/pdd.py`): its output heads
 /// are `grid` stacked heads, one per interval of a fine grid on the base clock
 /// [0, max_t], and a step between two trained nodes runs their
@@ -3798,6 +3859,14 @@ pub const GenRequest = struct {
     /// Arrival clip's video/audio latent head (HTTP `latent_suffix_path`).
     chain_suffix_video_latent: ?mlx.mlx_array = null,
     chain_suffix_audio_latent: ?mlx.mlx_array = null,
+    /// `latent_out` sidecar to start from. Video is mixed with noise at σ₀;
+    /// audio is carried (conditioning timestep) unless `refine_audio`.
+    init_video_latent: ?mlx.mlx_array = null,
+    init_audio_latent: ?mlx.mlx_array = null,
+    /// Explicit descending video-clock sigmas ending at 0 (already shifted).
+    refine_sigmas: ?[]const f64 = null,
+    /// Re-noise the init audio latent too (default: carry it clean).
+    refine_audio: bool = false,
     /// fl2va keyframes (0-2: first and/or last), conditioned through their VAE
     /// latents as cond rows.
     ///
@@ -4136,6 +4205,8 @@ pub const latent_suffix_supported = true;
 pub const ref_latent_out_supported = true;
 /// Refs may ride `latent_prefix_frames` / `latent_suffix_frames` on hybrid FL2VA+REF2VA packs.
 pub const ref_pins_supported = true;
+/// This binary accepts `latent_init_path` + `refine_sigmas` on FL2VA (`/health`).
+pub const latent_refine_supported = true;
 
 /// Video-latent tail length for a source-frame overlap.
 pub fn overlapVideoLatentT(overlap_src_frames: u32) u32 {
@@ -4855,6 +4926,35 @@ fn generateOne(
     defer _ = mlx.mlx_array_free(video_x);
     var audio_x = try randomNormal(&[_]c_int{ n_audio_rows, @intCast(req.geometry.dit.audio_latents_dim) }, req.seed +% 1, mlx.mlx_dtype.float32, s);
     defer _ = mlx.mlx_array_free(audio_x);
+    var carry_audio: ?mlx.mlx_array = null;
+    defer if (carry_audio) |c| {
+        _ = mlx.mlx_array_free(c);
+    };
+    if (req.init_video_latent) |iv| {
+        const sigma0 = if (req.refine_sigmas) |rs| rs[0] else 1.0;
+        const z = try patchifyVideo(iv, s);
+        defer _ = mlx.mlx_array_free(z);
+        const mixed = try mixInit(z, video_x, sigma0, s);
+        _ = mlx.mlx_array_free(video_x);
+        video_x = mixed;
+        if (req.init_audio_latent) |ia| {
+            const arows = try audioLatentToRows(ia, s);
+            if (req.refine_audio) {
+                defer _ = mlx.mlx_array_free(arows);
+                const sa0 = timeShiftSigma(sigma0, req.shift_video, req.shift_audio);
+                const am = try mixInit(arows, audio_x, sa0, s);
+                _ = mlx.mlx_array_free(audio_x);
+                audio_x = am;
+            } else {
+                _ = mlx.mlx_array_free(audio_x);
+                audio_x = arows;
+                carry_audio = try contig(arows, s);
+            }
+        }
+        log.info("[minimax-h3] refine from latent_init sigma0 {d:.4} (audio {s})\n", .{
+            sigma0, if (req.refine_audio) "re-noised" else "carried",
+        });
+    }
 
     var pin_video_prefix_rows: ?mlx.mlx_array = null;
     defer if (pin_video_prefix_rows) |p| {
@@ -4926,8 +5026,14 @@ fn generateOne(
     }
 
     const max_t: f64 = if (req.pdd) |p| p.max_t else 1.0;
-    const sigmas = if (req.pdd) |*p| try p.sigmas(allocator, req.shift_video) else try sigmaSchedule(allocator, req.steps, req.shift_video);
+    const sigmas = if (req.refine_sigmas) |rs|
+        try allocator.dupe(f64, rs)
+    else if (req.pdd) |*p|
+        try p.sigmas(allocator, req.shift_video)
+    else
+        try sigmaSchedule(allocator, req.steps, req.shift_video);
     defer allocator.free(sigmas);
+    const n_steps: u32 = @intCast(sigmas.len - 1);
     if (req.pdd) |p| log.info("[minimax-h3] PDD student: {d} fused blocks over {d} heads, max_t {d}\n", .{ p.steps(), p.grid, p.max_t });
     // A PDD student starts at its first node's noise level, max_t on both clocks.
     if (req.pdd != null) {
@@ -4987,7 +5093,7 @@ fn generateOne(
         // precomputeAdaln. Default ON: it is what keeps the DiT residency at
         // ~22 GB instead of ~35 on the 8-bit pack.
         if (req.resident == null) {
-            const ts = try collectScheduleTs(allocator, &layout, sigmas[0..req.steps], req.shift_video, req.shift_audio, .{ .max_t = max_t });
+            const ts = try collectScheduleTs(allocator, &layout, sigmas[0..n_steps], req.shift_video, req.shift_audio, .{ .max_t = max_t });
             defer allocator.free(ts);
             try model.precomputeAdaln(ts, s);
             log.info("[minimax-h3] adaln precomputed for {d} timesteps; 13B modulation weights released\n", .{ts.len});
@@ -5103,7 +5209,7 @@ fn generateOne(
             }
         }
 
-        for (0..req.steps) |i| {
+        for (0..n_steps) |i| {
             model.ablate = switch (abl_mode) {
                 .off => .none,
                 .ladder => ladderArmForStep(i),
@@ -5116,7 +5222,7 @@ fn generateOne(
             // Step-cache gate: the relative input move this step would make
             // with the CACHED velocity is known without any forward.
             var sc_skip = false;
-            if (sc_thresh > 0 and sc_v_video != null and i >= stepCacheWarmup(req.steps) and i + 1 < req.steps and sc_consec < 2) {
+            if (sc_thresh > 0 and sc_v_video != null and i >= stepCacheWarmup(n_steps) and i + 1 < n_steps and sc_consec < 2) {
                 const vmag = try meanAbs(sc_v_video.?, s);
                 const xmag = try meanAbs(video_x, s);
                 const rel = @abs(dsigma) * @as(f64, vmag) / @max(@as(f64, xmag), 1e-8);
@@ -5133,14 +5239,19 @@ fn generateOne(
                 const nv = try addA(video_x, stepv, s);
                 _ = mlx.mlx_array_free(video_x);
                 video_x = nv;
-                const askip = cachedAudioAdvance(req.turbo or req.pdd != null, sc_a_slope, sigma, sigmas[i + 1], max_t, req.shift_video, req.shift_audio);
-                const da = try scalarLike(@floatCast(askip), sc_a.?, s);
-                defer _ = mlx.mlx_array_free(da);
-                const stepa = try mulA(sc_a.?, da, s);
-                defer _ = mlx.mlx_array_free(stepa);
-                const na = try addA(audio_x, stepa, s);
-                _ = mlx.mlx_array_free(audio_x);
-                audio_x = na;
+                if (carry_audio) |ca| {
+                    _ = mlx.mlx_array_free(audio_x);
+                    audio_x = try contig(ca, s);
+                } else {
+                    const askip = cachedAudioAdvance(req.turbo or req.pdd != null, sc_a_slope, sigma, sigmas[i + 1], max_t, req.shift_video, req.shift_audio);
+                    const da = try scalarLike(@floatCast(askip), sc_a.?, s);
+                    defer _ = mlx.mlx_array_free(da);
+                    const stepa = try mulA(sc_a.?, da, s);
+                    defer _ = mlx.mlx_array_free(stepa);
+                    const na = try addA(audio_x, stepa, s);
+                    _ = mlx.mlx_array_free(audio_x);
+                    audio_x = na;
+                }
                 const pinned = try restorePinnedLatent(
                     video_x,
                     audio_x,
@@ -5157,15 +5268,19 @@ fn generateOne(
                 );
                 video_x = pinned[0];
                 audio_x = pinned[1];
+                if (carry_audio) |ca| {
+                    _ = mlx.mlx_array_free(audio_x);
+                    audio_x = try contig(ca, s);
+                }
                 try mlx.check(mlx.mlx_array_eval(video_x));
                 try mlx.check(mlx.mlx_array_eval(audio_x));
                 sc_consec += 1;
                 sc_skipped += 1;
                 if (progress) |p| {
                     if (p.boundary()) return error.Cancelled;
-                    p.emit("Generating", @intCast(i + 1), req.steps);
+                    p.emit("Generating", @intCast(i + 1), n_steps);
                 }
-                log.info("[minimax-h3] step {d}/{d} sigma {d:.4} (cached velocity, {d} ms)\n", .{ i + 1, req.steps, sigma, step_timer.lapMs() });
+                log.info("[minimax-h3] step {d}/{d} sigma {d:.4} (cached velocity, {d} ms)\n", .{ i + 1, n_steps, sigma, step_timer.lapMs() });
                 continue;
             }
             var plan = if (model.adaln_tables) |tt|
@@ -5195,7 +5310,7 @@ fn generateOne(
                 _ = mlx.mlx_array_free(audio_in);
             };
 
-            const refresh = attnBroadcastRefresh(i, req.steps, bcast_k, sc_consec > 0);
+            const refresh = attnBroadcastRefresh(i, n_steps, bcast_k, sc_consec > 0);
             if (attn_bcast != null and !refresh) bcast_reused += 1;
             var fused: ?Model.Heads = if (req.pdd) |*p| try model.pddHeads(p, @intCast(i), req.shift_video, req.shift_audio, s) else null;
             defer if (fused) |*f| f.deinit();
@@ -5209,7 +5324,7 @@ fn generateOne(
             // above without a preview. A failed JPEG never fails the job.
             if (progress) |p| {
                 if (p.boundary()) return error.Cancelled;
-                tryEmitH3Preview(p, allocator, "Generating", @intCast(i + 1), req.steps, video_x, out.video, sigma, shape.latent_t, lat_h, lat_w, preview_first_frame, s);
+                tryEmitH3Preview(p, allocator, "Generating", @intCast(i + 1), n_steps, video_x, out.video, sigma, shape.latent_t, lat_h, lat_w, preview_first_frame, s);
             }
 
             // Euler on the flat ODE: x += model_output * dsigma. The audio
@@ -5226,13 +5341,18 @@ fn generateOne(
             _ = mlx.mlx_array_free(video_x);
             video_x = nv;
 
-            const da = try scalarLike(@floatCast(max_t * audioStepFactor(req.turbo or req.pdd != null, unit, sigmas[i + 1] / max_t, req.shift_video, req.shift_audio)), out.audio, s);
-            defer _ = mlx.mlx_array_free(da);
-            const stepa = try mulA(out.audio, da, s);
-            defer _ = mlx.mlx_array_free(stepa);
-            const na = try addA(audio_x, stepa, s);
-            _ = mlx.mlx_array_free(audio_x);
-            audio_x = na;
+            if (carry_audio) |ca| {
+                _ = mlx.mlx_array_free(audio_x);
+                audio_x = try contig(ca, s);
+            } else {
+                const da = try scalarLike(@floatCast(max_t * audioStepFactor(req.turbo or req.pdd != null, unit, sigmas[i + 1] / max_t, req.shift_video, req.shift_audio)), out.audio, s);
+                defer _ = mlx.mlx_array_free(da);
+                const stepa = try mulA(out.audio, da, s);
+                defer _ = mlx.mlx_array_free(stepa);
+                const na = try addA(audio_x, stepa, s);
+                _ = mlx.mlx_array_free(audio_x);
+                audio_x = na;
+            }
             const pinned = try restorePinnedLatent(
                 video_x,
                 audio_x,
@@ -5249,6 +5369,10 @@ fn generateOne(
             );
             video_x = pinned[0];
             audio_x = pinned[1];
+            if (carry_audio) |ca| {
+                _ = mlx.mlx_array_free(audio_x);
+                audio_x = try contig(ca, s);
+            }
 
             if (sc_thresh > 0) {
                 const slope_f = cachedAudioSlope(sigma, max_t, req.shift_video, req.shift_audio);
@@ -5276,13 +5400,13 @@ fn generateOne(
             if (std.meta.activeTag(abl_mode) != .off) {
                 log.info("[h3-prof] arm={s} step={d} ms={d}\n", .{ @tagName(model.ablate), i, step_ms });
             } else {
-                log.info("[minimax-h3] step {d}/{d} sigma {d:.4} ({d} ms)\n", .{ i + 1, req.steps, sigma, step_ms });
+                log.info("[minimax-h3] step {d}/{d} sigma {d:.4} ({d} ms)\n", .{ i + 1, n_steps, sigma, step_ms });
             }
         }
         if (sc_skipped > 0)
-            log.info("[minimax-h3] step-cache reused velocity on {d}/{d} steps (thresh {d:.3})\n", .{ sc_skipped, req.steps, sc_thresh });
+            log.info("[minimax-h3] step-cache reused velocity on {d}/{d} steps (thresh {d:.3})\n", .{ sc_skipped, n_steps, sc_thresh });
         if (bcast_reused > 0)
-            log.info("[minimax-h3] attn-broadcast reused attention on {d}/{d} steps (k={d})\n", .{ bcast_reused, req.steps, bcast_k });
+            log.info("[minimax-h3] attn-broadcast reused attention on {d}/{d} steps (k={d})\n", .{ bcast_reused, n_steps, bcast_k });
     }
     _ = mlx.mlx_clear_cache();
     log.info("[minimax-h3] sampling done in {d} ms, DiT released\n", .{phase_timer.lapMs()});
@@ -8459,6 +8583,42 @@ test "minimax h3: wantedLoras names what is missing or too many" {
     many_req.lora_paths = &many;
     try std.testing.expectError(error.TooManyLoras, wantedLoras(testPaths(null), many_req, &ps, &sc));
     try std.testing.expectEqual(@as(usize, 0), try wantedLoras(testPaths(null), base, &ps, &sc));
+}
+
+test "minimax h3: refine sigma list and start-sigma map" {
+    try testing.expectEqualStrings("refine_sigmas needs at least two values ending at 0", refineSigmasError(&.{0.9}).?);
+    try testing.expectEqualStrings("refine_sigmas must end at 0", refineSigmasError(&.{ 0.9, 0.5 }).?);
+    try testing.expectEqualStrings("refine_sigmas must be strictly descending", refineSigmasError(&.{ 0.5, 0.9, 0 }).?);
+    try testing.expect(refineSigmasError(&.{ 0.9035, 0.6316, 0.3158, 0 }) == null);
+    const a = testing.allocator;
+    const sched = try refineScheduleFromStart(a, 0.9035, 3, SIGMA_SHIFT_VIDEO);
+    defer a.free(sched);
+    try testing.expectEqual(@as(usize, 4), sched.len);
+    try testing.expectApproxEqAbs(@as(f64, 0.9035), sched[0], 1e-12);
+    try testing.expectEqual(@as(f64, 0), sched[sched.len - 1]);
+    try testing.expect(refineRequestError(true, false, true, 1, false, false, false) == null);
+    try testing.expectEqualStrings("latent_upscale requires latent_init_path", refineRequestError(false, true, true, 1, false, false, false).?);
+    try testing.expectEqualStrings("latent refine does not support chain_windows > 1", refineRequestError(true, false, true, 2, false, false, false).?);
+    try testing.expectEqualStrings("latent refine does not support references yet", refineRequestError(true, false, true, 1, true, false, false).?);
+    try testing.expectEqualStrings("latent refine does not support prefix/suffix pins yet", refineRequestError(true, false, true, 1, false, true, false).?);
+    try testing.expect(refineInitGeometryError(5, 24, temporalShape(5).latent_t, 4, 4, temporalShape(5).audio_t, 64, 64, 5) == null);
+    try testing.expect(refineInitGeometryError(5, 24, 1, 8, 4, 1, 64, 64, 5) != null);
+}
+
+test "minimax h3: start-sigma noise mix is (1-σ)·z + σ·noise" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const z = mlx.mlx_array_new_float(2);
+    defer _ = mlx.mlx_array_free(z);
+    const n = mlx.mlx_array_new_float(8);
+    defer _ = mlx.mlx_array_free(n);
+    const y = try mixInit(z, n, 0.25, s);
+    defer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_array_eval(y));
+    var v: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&v, y));
+    try testing.expectApproxEqAbs(@as(f32, 0.75 * 2 + 0.25 * 8), v, 1e-5);
 }
 
 /// Random bf16 normal of `shape`.

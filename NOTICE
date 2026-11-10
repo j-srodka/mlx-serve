@@ -286,6 +286,18 @@ MIT License
 ================================================================================
 
 --------------------------------------------------------------------------------
+ComfyUI MiniMax H3 Latent Upscaler
+https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler
+Copyright (c) 2026 LBH-123-AI
+Licensed under the MIT License (the permission and warranty terms in LICENSE).
+
+The 2D LatentResizer2D forward in src/plugins/minimax_h3/upscaler.zig (Fourier
+scale/tier embedding without π, ResBlockEmb, TemporalConv, bilinear mid
+upsample, per-channel latent mean/std) is a port of
+nodes/minimax_h3_latent_upscaler_2d.py. Weights remain Apache-2.0 at
+https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler.
+
+--------------------------------------------------------------------------------
 Svelte 5.57.2
 https://github.com/sveltejs/svelte/tree/svelte@5.57.2
 Copyright (c) 2016-2025 Svelte Contributors

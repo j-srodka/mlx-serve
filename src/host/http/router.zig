@@ -283,7 +283,12 @@ pub fn handleConnection(
         log.debug("GET  /health -> 200\n", .{});
         // Pin/sidecar capability flags (binary, not pack): h3cli refuses a
         // server whose /health omits `latent_suffix`.
-        try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\",\"latent_suffix\":true,\"ref_latent_out\":true,\"ref_pins\":true}");
+        const up = @import("../../plugins/minimax_h3/upscaler.zig");
+        const health = if (up.weightsPresent(null))
+            "{\"status\":\"ok\",\"latent_suffix\":true,\"ref_latent_out\":true,\"ref_pins\":true,\"latent_refine\":true,\"latent_upscale\":true}"
+        else
+            "{\"status\":\"ok\",\"latent_suffix\":true,\"ref_latent_out\":true,\"ref_pins\":true,\"latent_refine\":true,\"latent_upscale\":false}";
+        try sendResponse(stream, "200 OK", "application/json", health);
         return;
     }
     // The console. It belongs here, above resolution, for the same reason

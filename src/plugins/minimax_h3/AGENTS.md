@@ -11,8 +11,9 @@ REF2VA (references), FastH3 Omni (REF2VA's 8-step PDD student with trained VSA s
   tiny conformance pack.
 - `config.zig`: claims, `geometry()` from config.json, the bills (staged peak, per-request activations, residency).
 - `geometry.zig`: MLX-free geometry and arithmetic shared by the bills and the forward (frame ladder, configs, speed).
-- `h3.zig`: encoders, DiT, sampler, PDD, residency, `generate`. `vae.zig` / `audio.zig` / `vision.zig`: the VAEs and
-  the vision presentation. `vsa.zig`: VSA. `glue.zig`: fused glue kernels. `cluster.zig`: the Thunderbolt step split.
+- `h3.zig`: encoders, DiT, sampler, PDD, residency, `generate`. `upscaler.zig`: 2D LatentResizer2D (MIT port).
+  `vae.zig` / `audio.zig` / `vision.zig`: the VAEs and the vision presentation. `vsa.zig`: VSA. `glue.zig`: fused glue
+  kernels. `cluster.zig`: the Thunderbolt step split.
 - `contract.zig`: kernel contract registrations (qkv_prep, swiglu, VSA pool/assemble/simdgroup/NAX).
 
 ## Request contract
@@ -20,7 +21,9 @@ REF2VA (references), FastH3 Omni (REF2VA's 8-step PDD student with trained VSA s
 a student runs exactly its own), `seed`, `turbo` (needs `turbo_lora.safetensors`, >= 4 steps), `fast` (default on),
 `chain_windows` 1-6 (FL2VA only; `num_frames` per window), FL2VA pins (`latent_prefix_frames`/`latent_suffix_frames` 5/22/39/56 + sidecar paths, `latent_out`), `first_frame_image` / `last_frame_image`, `ref_images` /
 `ref_videos` (`{frames, audio}`) / `ref_audios` + `ref_image_size` (REF2VA only), `ref_mod_paths` (absolute
-`.safetensors` packs; XOR with `ref_images`), `lora_paths`/`lora_scales`.
+`.safetensors` packs; XOR with `ref_images`), `lora_paths`/`lora_scales`,
+`latent_init_path` + `refine_sigmas` / `refine_start_sigma` (FL2VA, one window, no refs/pins),
+`latent_upscale` `{factor|width+height, tier}` (`--h3-upscaler` or pack `latent_upscaler/`).
 `cfg_scale`/`stg_scale`/`pipeline` are ignored, not refused (the app sends them for every video backend).
 
 ## Rules

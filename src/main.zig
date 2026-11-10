@@ -286,6 +286,10 @@ fn printUsage(io: std.Io) void {
         \\                        GPU with 64 GiB of RAM; --w8a8 opts in below that.
         \\  --ane-split <f>     Force the media offload's ANE share (0..1) instead
         \\                        of calibrating it per model.
+        \\  --h3-upscaler <p>   MiniMax-H3 2D latent upscaler weights (.safetensors).
+        \\                        Also accepted as MLX_SERVE_H3_UPSCALER, or the pack
+        \\                        folder latent_upscaler/. Missing weights 400 a
+        \\                        latent_upscale request — never a silent interpolate.
         \\  --mtp               Draft with a loaded MTP head, dense or MoE. The default
         \\                        on Metal and CUDA; Vulkan needs it (--no-mtp turns it off).
         \\  --mtp-head-kv-quant Quantize the qwen4 MTP head's own KV with
@@ -951,6 +955,17 @@ pub fn main(init: std.process.Init) !void {
             ane_media.video = true;
         } else if (std.mem.eql(u8, args[i], "--ane-audio")) {
             ane_media.audio = true;
+        } else if (std.mem.eql(u8, args[i], "--h3-upscaler") and i + 1 < args.len) {
+            i += 1;
+            if (args[i].len == 0) {
+                log.err("--h3-upscaler needs a path to a .safetensors file\n", .{});
+                std.process.exit(1);
+            }
+            const z = allocator.dupeSentinel(u8, args[i], 0) catch {
+                log.err("--h3-upscaler: out of memory\n", .{});
+                std.process.exit(1);
+            };
+            env.set(.MLX_SERVE_H3_UPSCALER, z);
         } else if (std.mem.eql(u8, args[i], "--ane-split") and i + 1 < args.len) {
             i += 1;
             const v = std.fmt.parseFloat(f32, args[i]) catch 0;

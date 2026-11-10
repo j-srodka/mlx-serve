@@ -240,6 +240,23 @@ legal: `last_frame_image` + prefix pin (the proven engine combo),
 a chain: prefix file → window 0 opens on its tail; suffix file → the final
 window finishes at its head.
 
+### MiniMax H3: latent refine and upscale
+
+Low-res render → `latent_out` sidecar → optional 2D latent upscale → few-step
+refine at full size. `GET /health` `"latent_refine":true`; `"latent_upscale":true`
+when `--h3-upscaler` points at the 2D v1 weights (or set `MLX_SERVE_H3_UPSCALER`).
+Pack folder `{model}/latent_upscaler/*.safetensors` also works on the request.
+
+| field | notes |
+|---|---|
+| `latent_init_path` | Absolute `.safetensors` written by `latent_out`. Required. Canvas = sidecar latent × 16; frame count must match. |
+| `refine_sigmas` | Descending video-clock list ending at 0, e.g. `[0.9035, 0.6316, 0.3158, 0]`. Already shifted (do not pass unit-clock values). Alt: `refine_start_sigma` + `steps`. |
+| `refine_audio` | Default false: keep the init soundtrack. true re-noises audio too. |
+| `latent_upscale` | `{ "factor": 2.0, "tier": 1 }` or `{ "width", "height", "tier" }`. Video latent only. Missing weights → named 400, never interpolate. |
+
+FL2VA, `chain_windows` 1, no refs or prefix/suffix pins yet. `latent_out` still
+writes the refined window.
+
 ## 3D: `POST /v1/3d/generations`
 
 The default model is Idol (the `3d` row whose id contains `Idol`, `ddalcu/Idol-MLX-Serve-8bit`: about 3 GB on disk,

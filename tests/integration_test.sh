@@ -130,6 +130,8 @@ assert_contains "GET /health returns ok" '"status":"ok"' "$RESP"
 assert_contains "GET /health advertises latent_suffix" '"latent_suffix":true' "$RESP"
 assert_contains "GET /health advertises ref_latent_out" '"ref_latent_out":true' "$RESP"
 assert_contains "GET /health advertises ref_pins" '"ref_pins":true' "$RESP"
+assert_contains "GET /health advertises latent_refine" '"latent_refine":true' "$RESP"
+assert_contains "GET /health advertises latent_upscale" '"latent_upscale":' "$RESP"
 echo ""
 
 # ── Test: Models ──

@@ -16,6 +16,7 @@ const video_out = @import("../../sdk/media/video_out.zig");
 const frame_in = @import("../../sdk/media/frame_in.zig");
 const wav = @import("../../sdk/media/wav.zig");
 const h3 = @import("h3.zig");
+const upscaler = @import("upscaler.zig");
 const vsa = @import("vsa.zig");
 const h3_refmod = @import("../../h3_refmod.zig");
 const model_mod = @import("../../sdk/weights/load.zig");
@@ -465,6 +466,59 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     const latent_out_raw = b.str("latent_out");
     const latent_prefix_path_raw = b.str("latent_prefix_path");
     const latent_suffix_path_raw = b.str("latent_suffix_path");
+    const latent_init_raw = b.str("latent_init_path");
+    const has_latent_init = latent_init_raw != null and latent_init_raw.?.len > 0;
+    const has_latent_upscale = fieldSet(&b, "latent_upscale");
+    const refine_audio = b.flag("refine_audio");
+    var refine_sigmas_buf: [16]f64 = undefined;
+    var refine_sigmas: ?[]const f64 = null;
+    if (b.get("refine_sigmas")) |v| {
+        if (v != .array) return bad("'refine_sigmas' must be an array of descending sigmas ending at 0");
+        if (v.array.items.len < 2 or v.array.items.len > refine_sigmas_buf.len)
+            return bad("'refine_sigmas' must have 2–16 values ending at 0");
+        for (v.array.items, 0..) |item, i| {
+            refine_sigmas_buf[i] = switch (item) {
+                .float => |f| f,
+                .integer => |n| @floatFromInt(n),
+                else => return bad("'refine_sigmas' must be an array of descending sigmas ending at 0"),
+            };
+        }
+        refine_sigmas = refine_sigmas_buf[0..v.array.items.len];
+        if (h3.refineSigmasError(refine_sigmas.?)) |msg| return Verdict.named(.unsupported, msg);
+    } else if (b.float("refine_start_sigma")) |start| {
+        const mapped = h3.refineScheduleFromStart(gpa, start, steps, h3.SIGMA_SHIFT_VIDEO) catch return bad("'refine_start_sigma' must be in (0, 1]");
+        defer gpa.free(mapped);
+        if (mapped.len > refine_sigmas_buf.len) return bad("'refine_sigmas' must have 2–16 values ending at 0");
+        @memcpy(refine_sigmas_buf[0..mapped.len], mapped);
+        refine_sigmas = refine_sigmas_buf[0..mapped.len];
+        if (h3.refineSigmasError(refine_sigmas.?)) |msg| return Verdict.named(.unsupported, msg);
+    }
+    if ((refine_sigmas != null or refine_audio or has_latent_upscale) and !has_latent_init)
+        return bad("latent_init_path is required for refine / latent_upscale");
+    var up_tier: u32 = 1;
+    var up_factor: ?f64 = null;
+    if (has_latent_upscale) {
+        const uv = b.get("latent_upscale").?;
+        if (uv != .object) return bad("'latent_upscale' must be an object with factor or width+height");
+        const o = uv.object;
+        if (o.get("tier")) |t| {
+            const n: i64 = switch (t) {
+                .integer => |i| i,
+                else => return bad("'latent_upscale.tier' must be an integer 1–6"),
+            };
+            if (n < 1 or n > 6) return bad("'latent_upscale.tier' must be an integer 1–6");
+            up_tier = @intCast(n);
+        }
+        if (o.get("factor")) |f| {
+            up_factor = switch (f) {
+                .float => |x| x,
+                .integer => |n| @floatFromInt(n),
+                else => return bad("'latent_upscale.factor' must be a number in [1, 4]"),
+            };
+            if (up_factor.? < upscaler.SCALE_MIN or up_factor.? > upscaler.SCALE_MAX)
+                return bad("'latent_upscale.factor' must be a number in [1, 4]");
+        }
+    }
     const has_latent_out = latent_out_raw != null and latent_out_raw.?.len > 0;
     const has_latent_prefix_path = latent_prefix_path_raw != null and latent_prefix_path_raw.?.len > 0;
     const has_latent_suffix_path = latent_suffix_path_raw != null and latent_suffix_path_raw.?.len > 0;
@@ -512,6 +566,9 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     const has_refs = has_live_refs or has_ref_mod_paths or refs.items.len > 0;
     const ref_pins_ok = e.supports_fl2va and e.supports_refs;
     if (h3.refCompatError(has_refs, chain_windows, latent_prefix_frames, latent_suffix_frames, ref_pins_ok)) |msg| return Verdict.named(.unsupported, msg);
+    const has_pins = latent_prefix_frames > 0 or latent_suffix_frames > 0;
+    if (h3.refineRequestError(has_latent_init, has_latent_upscale, e.supports_fl2va, chain_windows, has_refs, has_pins, e.pdd != null)) |msg|
+        return Verdict.named(.unsupported, msg);
     var kf_has_first = false;
     var kf_has_last = false;
     for (kfs.buf[0..kfs.n]) |kf| switch (kf.anchor) {
@@ -545,12 +602,14 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     if (plan == null) {
         const dit = config.ditResidentBytes(config.ditFileBytes(dir, &e.machine), true) + (if (turbo) dir.fileBytes("turbo_lora.safetensors") else 0);
         const bill = config.canvasBill(dit, activations, mem.host_avail, mem.gpu_limit, mem.gpu_active, mlx.cudaAvailable());
-        if (dit > 0 and bill.avail > 0 and bill.need > bill.avail) {
+        const up_ws = if (has_latent_upscale) upscaler.workingSetBytes(0, height / h3.VAE_SPATIAL, width / h3.VAE_SPATIAL, shape.latent_t) else 0;
+        const need = bill.need + up_ws;
+        if (dit > 0 and bill.avail > 0 and need > bill.avail) {
             const gb = 1024.0 * 1024.0 * 1024.0;
             const cache = bcast_row > 0;
             return req.refuseFmt(.unsupported, "the canvas does not fit in memory: use a smaller canvas or fewer frames", "{d}x{d} x {d} frames needs ~{d:.1} GB ({d:.1} GB DiT{s} + {d:.1} GB for {d} sequence rows{s}) but {d:.1} GB is available: use a smaller canvas or fewer frames{s}", .{
                 width,                                              height,                                    shape.frame_count,
-                @as(f64, @floatFromInt(bill.need)) / gb,            @as(f64, @floatFromInt(dit)) / gb,         if (mlx.cudaAvailable()) " paged to RAM" else "",
+                @as(f64, @floatFromInt(need)) / gb,                 @as(f64, @floatFromInt(dit)) / gb,         if (mlx.cudaAvailable()) " paged to RAM" else "",
                 @as(f64, @floatFromInt(activations)) / gb,          rows,                                      if (cache) " with the fast recipe's attention cache" else "",
                 @as(f64, @floatFromInt(bill.avail)) / gb,           if (cache) ", or \"turbo\", which keeps no attention cache" else "",
             });
@@ -587,6 +646,12 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         const raw = latent_suffix_path_raw.?;
         if (!std.fs.path.isAbsolute(raw)) return bad("'latent_suffix_path' must be an absolute path");
         const f = std.Io.Dir.openFileAbsolute(io, raw, .{}) catch return bad("'latent_suffix_path' file not found or not readable");
+        f.close(io);
+    }
+    if (has_latent_init) {
+        const raw = latent_init_raw.?;
+        if (!std.fs.path.isAbsolute(raw)) return bad("'latent_init_path' must be an absolute path");
+        const f = std.Io.Dir.openFileAbsolute(io, raw, .{}) catch return bad("'latent_init_path' file not found or not readable");
         f.close(io);
     }
 
@@ -631,6 +696,53 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         suffix_a = loaded.audio;
     }
 
+    var init_v: ?mlx.mlx_array = null;
+    defer if (init_v) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    var init_a: ?mlx.mlx_array = null;
+    defer if (init_a) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    if (has_latent_init) {
+        const pathz = gpa.dupeSentinel(u8, latent_init_raw.?, 0) catch return job.failure(error.OutOfMemory, "out of memory");
+        defer gpa.free(pathz);
+        const loaded = h3.loadLatentSidecar(gpa, pathz, s) catch |err| return switch (err) {
+            error.BadLatentSidecarPack => bad("'latent_init_path' sidecar must declare pack fl2va"),
+            error.MissingVideoLatent => bad("'latent_init_path' sidecar missing video_latent"),
+            error.MissingAudioLatent => bad("'latent_init_path' sidecar missing audio_latent"),
+            else => bad("'latent_init_path' could not be loaded"),
+        };
+        init_v = loaded.video;
+        init_a = loaded.audio;
+        if (has_latent_upscale) {
+            const wpath = (upscaler.resolvePath(gpa, e.model_dir) catch return bad("latent_upscale weights not found — pass --h3-upscaler or put a 2D v1 safetensors in the pack's latent_upscaler/")) orelse
+                return bad("latent_upscale weights not found — pass --h3-upscaler or put a 2D v1 safetensors in the pack's latent_upscaler/");
+            defer gpa.free(wpath);
+            var um = upscaler.Model.load(gpa, wpath) catch return bad("latent_upscale weights could not be loaded");
+            defer um.deinit();
+            const iv = init_v.?;
+            const vsh = mlx.getShape(iv);
+            const src_h: u32 = @intCast(vsh[3]);
+            const src_w: u32 = @intCast(vsh[4]);
+            const dst_h = height / h3.VAE_SPATIAL;
+            const dst_w = width / h3.VAE_SPATIAL;
+            if (up_factor) |f| {
+                const want_h = @as(u32, @intFromFloat(@round(@as(f64, @floatFromInt(src_h)) * f)));
+                const want_w = @as(u32, @intFromFloat(@round(@as(f64, @floatFromInt(src_w)) * f)));
+                if (want_h != dst_h or want_w != dst_w)
+                    return bad("'latent_upscale.factor' does not match request width/height");
+            }
+            const scaled = um.forward(gpa, iv, dst_h, dst_w, up_tier, s) catch |err| return job.failure(err, "MiniMax-H3 latent upscale failed");
+            _ = mlx.mlx_array_free(iv);
+            init_v = scaled;
+        }
+        const vs = mlx.getShape(init_v.?);
+        const as = mlx.getShape(init_a.?);
+        if (h3.refineInitGeometryError(vs.len, @intCast(vs[1]), @intCast(vs[2]), @intCast(vs[3]), @intCast(vs[4]), @intCast(as[3]), width, height, shape.frame_count)) |msg|
+            return Verdict.named(.unsupported, msg);
+    }
+
     var res = h3.generate(gpa, io, paths, .{
         .geometry = e.geometry,
         .resident = if (plan) |p| p.r else null,
@@ -654,6 +766,10 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         .latent_suffix_frames = latent_suffix_frames,
         .chain_suffix_video_latent = suffix_v,
         .chain_suffix_audio_latent = suffix_a,
+        .init_video_latent = init_v,
+        .init_audio_latent = init_a,
+        .refine_sigmas = refine_sigmas,
+        .refine_audio = refine_audio,
         .keyframes = kfs.buf[0..kfs.n],
         .refs = refs.items,
     }, job.progressOf(progress), s) catch |err| return switch (err) {
@@ -1047,6 +1163,11 @@ test "minimax_h3 plugin: a seeded clip on the tiny pack is deterministic JSON me
         .{ "{\"prompt\":\"x\",\"latent_prefix_frames\":22,\"chain_windows\":1}", "latent_prefix_frames requires chain_windows > 1" },
         .{ "{\"prompt\":\"x\",\"latent_prefix_path\":\"/tmp/no_h3_sidecar.safetensors\"}", "latent_prefix_path requires latent_prefix_frames" },
         .{ "{\"prompt\":\"x\",\"latent_out\":\"latents.safetensors\"}", "'latent_out' must be an absolute path" },
+        .{ "{\"prompt\":\"x\",\"refine_sigmas\":[0.9,0]}", "latent_init_path is required for refine / latent_upscale" },
+        .{ "{\"prompt\":\"x\",\"latent_upscale\":{\"factor\":2}}", "latent_init_path is required for refine / latent_upscale" },
+        .{ "{\"prompt\":\"x\",\"latent_init_path\":\"latents.safetensors\"}", "'latent_init_path' must be an absolute path" },
+        .{ "{\"prompt\":\"x\",\"latent_init_path\":\"/tmp/no_h3_init.safetensors\",\"chain_windows\":2}", "latent refine does not support chain_windows > 1" },
+        .{ "{\"prompt\":\"x\",\"latent_init_path\":\"/tmp/no_h3_init.safetensors\",\"refine_sigmas\":[0.5,0.9,0]}", "refine_sigmas must be strictly descending" },
         .{ "{\"prompt\":\"x\",\"ref_images\":[\"AAAA\"]}", "this MiniMax-H3 pack does not support references (it declares no 'ref2va' task) — load a REF2VA checkpoint" },
         .{ "{\"prompt\":\"x\",\"turbo\":true}", "this pack has no turbo_lora.safetensors — download minimax_h3_turbo_4step_ema_ckpt850.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora (Apache-2.0) into the model folder as turbo_lora.safetensors" },
         .{ "{\"prompt\":\"x\",\"first_frame_image\":\"!!\"}", "keyframe image is not valid base64" },
