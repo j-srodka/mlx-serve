@@ -6,10 +6,6 @@ extended signature this mlx-c revision already matches the fork (quantize,
 dequantize, qqmm all carry global_scale here). Shim: pass no global scale —
 the C ABI has no surface for it yet.
 
-Older MLX/mlx-c pairings also needed an extra SDPA argument in `fast.cpp`; MLX
-≥0.32.5 removed that parameter — do not patch `fast.cpp` here (pair with
-`scaled_dot_product_attention` as published in `mlx/fast.h`).
-
 --- a/mlx/c/ops.cpp
 +++ b/mlx/c/ops.cpp
 @@ -1501,5 +1501,7 @@
@@ -21,3 +17,15 @@ Older MLX/mlx-c pairings also needed an extra SDPA argument in `fast.cpp`; MLX
 +            std::nullopt,
 +            sorted_indices,
              mlx_stream_get_(s)));
+diff --git a/mlx/c/fast.cpp b/mlx/c/fast.cpp
+index eb35d16..8d54803 100644
+--- a/mlx/c/fast.cpp
++++ b/mlx/c/fast.cpp
+@@ -620,6 +620,7 @@ extern "C" int mlx_fast_scaled_dot_product_attention(
+             mlx_array_get_(keys),
+             mlx_array_get_(values),
+             scale,
++            -1,
+             std::string(mask_mode),
+             (mask_arr.ctx ? std::make_optional(mlx_array_get_(mask_arr))
+                           : std::nullopt),

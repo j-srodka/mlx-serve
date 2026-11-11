@@ -6,7 +6,6 @@
 #include <mach/vm_page_size.h>
 
 #include <cstdint>
-#include <cstdlib>
 #include <exception>
 #include <string>
 
@@ -15,6 +14,7 @@
 #include "mlx/backend/metal/device.h"
 #include "mlx/c/private/array.h"
 #include "mlx/c/private/enums.h"
+#include "mlx/config.h"
 #include "mlx/utils.h"
 #include "mlx_alloc_shim.h"
 
@@ -22,15 +22,6 @@ namespace mx = mlx::core;
 
 namespace {
 thread_local std::string g_error;
-}  // namespace
-
-namespace {
-int getenv_int(const char* name, int default_value) {
-  if (const char* s = std::getenv(name)) {
-    return std::atoi(s);
-  }
-  return default_value;
-}
 }  // namespace
 
 extern "C" {
@@ -51,12 +42,12 @@ int dsv41_alloc_uninit(mlx_array* out, const int* shape, size_t ndim, mlx_dtype 
       }
       n *= static_cast<size_t>(d);
     }
-    mx::allocator::Buffer buf = mx::allocator::malloc(n);
-    if (buf.ptr() == nullptr) {
+    mx::allocator::Data data = mx::allocator::malloc(n);
+    if (data.buffer().ptr() == nullptr) {
       g_error = "allocator returned no buffer";
       return -1;
     }
-    mlx_array_set_(*out, mx::array(std::move(buf), std::move(s), dt));
+    mlx_array_set_(*out, mx::array(std::move(data), std::move(s), dt));
     return 0;
   } catch (const std::exception& e) {
     g_error = e.what();
@@ -136,7 +127,8 @@ int dsv41_alloc_alias(mlx_array* out, mlx_array base, uint64_t offset, const int
       dsv41_alias::Pool p;
       static_cast<MTL::Buffer*>(x.ptr())->release();
     };
-    mlx_array_set_(*out, mx::array(mx::allocator::Buffer(static_cast<void*>(a)), std::move(s), dt, deleter));
+    mx::allocator::Data data(mx::allocator::Buffer(static_cast<void*>(a)), deleter);
+    mlx_array_set_(*out, mx::array(std::move(data), std::move(s), dt));
     return 0;
   } catch (const std::exception& e) {
     g_error = e.what();
@@ -147,27 +139,15 @@ int dsv41_alloc_alias(mlx_array* out, mlx_array base, uint64_t offset, const int
   }
 }
 
-// MLX's command-buffer split: MetalDevice reads limits from getenv("MLX_MAX_*"), seeded at first use (static cache in
-// mlx::core::env::*). Overwrite the process env before the next stream/device read; same levers as upstream.
+// MLX's command-buffer split: every commit check (CommandEncoder::needs_commit) reads it through mlx::core::config,
+// over the device's default for its architecture.
 int dsv41_command_buffer_limits(int ops, int mb, int* prev_ops, int* prev_mb) {
   try {
-    auto [default_ops, default_mb] = mx::metal::device(mx::Device::gpu).get_max_ops_mb_per_buffer();
-    *prev_ops = getenv_int("MLX_MAX_OPS_PER_BUFFER", default_ops);
-    *prev_mb = getenv_int("MLX_MAX_MB_PER_BUFFER", default_mb);
-    if (ops > 0) {
-      const std::string s = std::to_string(ops);
-      if (setenv("MLX_MAX_OPS_PER_BUFFER", s.c_str(), 1) != 0) {
-        g_error = "setenv MLX_MAX_OPS_PER_BUFFER failed";
-        return -1;
-      }
-    }
-    if (mb > 0) {
-      const std::string s = std::to_string(mb);
-      if (setenv("MLX_MAX_MB_PER_BUFFER", s.c_str(), 1) != 0) {
-        g_error = "setenv MLX_MAX_MB_PER_BUFFER failed";
-        return -1;
-      }
-    }
+    auto [default_ops, default_mb] = mx::metal::device(mx::Device::gpu).get_default_max_ops_mb_per_buffer();
+    *prev_ops = mx::env::max_ops_per_buffer(default_ops);
+    *prev_mb = mx::env::max_mb_per_buffer(default_mb);
+    if (ops > 0) mx::config::update("MLX_MAX_OPS_PER_BUFFER", ops);
+    if (mb > 0) mx::config::update("MLX_MAX_MB_PER_BUFFER", mb);
     return 0;
   } catch (const std::exception& e) {
     g_error = e.what();
