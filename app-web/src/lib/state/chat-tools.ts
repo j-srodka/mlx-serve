@@ -373,7 +373,7 @@ POST /v1/images/edits — multipart/form-data, NOT JSON: model, prompt, image[] 
 POST /v1/audio/speech — model, input, optional ref_audio (base64 WAV), stream; returns audio/wav.
 POST /v1/audio/music-generations — model, prompt (style/genre/mood, required), lyrics, instrumental, duration_seconds (10–600; MiniMax maximum 360), vocal_language, bpm, seed, stream; returns audio/wav.
 POST /v1/audio/sound-generations — model, prompt (required), duration_seconds (up to 120), steps (default 8), seed, stream; returns audio/wav.
-POST /v1/video/generations — model, prompt, width, height, num_frames, steps, seed, stream; optional preview, preview_frames, preview_max_side. LTX: pipeline, first_frame_image, last_frame_image, ref_video_frames, audio, cfg_scale, stg_scale. H3: turbo, fast, chain_windows, first_frame_image / last_frame_image or ref_images / ref_videos / ref_audios.
+POST /v1/video/generations — model, prompt, width, height, num_frames, steps, seed, stream; optional preview, preview_frames, preview_max_side. LTX: pipeline, first_frame_image, last_frame_image, audio, cfg_scale, stg_scale. H3: turbo, fast, chain_windows, first_frame_image / last_frame_image or ref_images / ref_videos / ref_audios.
 POST /v1/embeddings — model, input (string or array), optional dimensions.
 POST /v1/load-model and /v1/unload-model — model (discovered ID or absolute path); these are API reference only, never browser tools.
 Media endpoints with stream:true emit SSE progress/complete/error events. Video progress can include JPEG base64 previews with preview:true.`;

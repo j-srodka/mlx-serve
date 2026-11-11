@@ -20,7 +20,6 @@ final class VideoSettingsSidecarTests: XCTestCase {
         req.firstFrameImagePath = "/private/reference/start.png"
         req.lastFrameImagePath = "/private/reference/end.png"
         req.audioPath = "/private/reference/dialogue.m4a"
-        req.guideVideoPath = "/private/reference/take.mp4"
         req.loras = [LoraAdapter(path: "/private/loras/cinematic.safetensors", scale: 0.75)]
 
         let text = VideoGenService.settingsText(
@@ -47,7 +46,6 @@ final class VideoSettingsSidecarTests: XCTestCase {
         XCTAssertTrue(text.contains("first_frame: start.png"))
         XCTAssertTrue(text.contains("last_frame: end.png"))
         XCTAssertTrue(text.contains("input_audio: dialogue.m4a"))
-        XCTAssertTrue(text.contains("reference_video: take.mp4"))
         XCTAssertTrue(text.contains("lora_1_file: cinematic.safetensors"))
         XCTAssertTrue(text.contains("lora_1_scale: 0.75"))
         XCTAssertTrue(text.contains("# Prompt\nA lighthouse in a winter storm.\n"))
