@@ -39,10 +39,6 @@ zig-out/
 # ds4 CUDA library (scripts/build-ds4-linux.sh)
 /lib/ds4-linux/
 
-# Optional sibling checkouts (not submodules in this repo; zig resolves `-Dsushi-dir` / GGUF helper paths)
-/lib/mlx-serve-gguf/
-/lib/sushi/
-
 # Swift / app build. No leading slash, so it also catches the stray root
 # .build/ SwiftPM drops when a swift command is run from the repo root.
 .build/
@@ -69,10 +65,7 @@ server_err.log
 .vscode
 
 # Cursor IDE / Cloud Agents. Local tooling only; not for upstream PRs.
-# Exception: committed project RULES (enforcement for Cursor agents) — .cursor/rules/*.mdc
-.cursor/*
-!.cursor/rules/
-!.cursor/rules/**
+.cursor/
 agent-tools/
 
 # Speculative-decoding working notes (MTP + PLD planning/scratchpad)
@@ -110,14 +103,6 @@ tests/soak_log.csv
 
 # Agent eval runs (tests/agent_eval): projects, sessions, frames, verdicts
 /tests/agent_eval/out/
-
-# Agent scratch (server logs live in ~/.mlx-serve) + local review bundles
-/logs/
-/nohup.out
-/:memory:.ses
-/.h3-review/
-1necho
-
 runs/*
 data
 

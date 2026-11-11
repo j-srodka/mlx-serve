@@ -4,14 +4,27 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+TOOLS="${H3_TOOLS_ROOT:-$(cd "$ROOT/.." && pwd)/h3-tools}"
 
 missing=0
 need() {
   local p="$1"
-  if [[ ! -e "$ROOT/$p" ]]; then
+  if [[ ! -e "$p" ]]; then
     echo "h3-closure-check: missing: $p" >&2
     missing=1
   fi
+}
+
+need_tool() {
+  local rel="$1"
+  if [[ -e "$ROOT/$rel" ]]; then
+    return 0
+  fi
+  if [[ -e "$TOOLS/$rel" ]]; then
+    return 0
+  fi
+  echo "h3-closure-check: missing: $rel (mlx-serve or $TOOLS)" >&2
+  missing=1
 }
 
 # src: h3 entrypoints
@@ -34,13 +47,13 @@ if ! grep -q addH3TaeSources "$ROOT/build/libs.zig" "$ROOT/build/macos.zig" 2>/d
   missing=1
 fi
 
-# Launchers and timeline tooling
-need start-minimax-h3.sh
+# Launchers and timeline tooling (live in ../h3-tools after hygiene split)
+need_tool start-minimax-h3.sh
 need start-minimax-h3-hybrid.sh
-need start-minimax-h3-ref2va.sh
-need h3_timeline.py
-need generate_h3.py
-need generate_h3_multi.py
+need_tool start-minimax-h3-ref2va.sh
+need_tool h3_timeline.py
+need_tool generate_h3.py
+need_tool generate_h3_multi.py
 
 # Tests
 while IFS= read -r -d '' f; do
@@ -48,13 +61,13 @@ while IFS= read -r -d '' f; do
 done < <(find "$ROOT/tests" -maxdepth 1 -name 'test_h3_*' -print0 2>/dev/null || true)
 
 while IFS= read -r -d '' f; do
-  need "${f#"$ROOT"/}"
+  need_tool "${f#"$ROOT"/}"
 done < <(find "$ROOT/tests" -maxdepth 1 -name 'test_generate_h3*.py' -print0 2>/dev/null || true)
 
-# Topology docs and push guard
-need .cursor/rules/00-repo-topology.mdc
-need docs/gotchas/repo-topology.md
-need .githooks/pre-push
+# Topology docs and push guard (untracked locally; copied to h3-tools/hygiene/)
+for p in .cursor/rules/00-repo-topology.mdc docs/gotchas/repo-topology.md .githooks/pre-push; do
+  need "$p"
+done
 
 if [[ "$missing" -ne 0 ]]; then
   echo "h3-closure-check: failed (${missing} problem(s))" >&2
