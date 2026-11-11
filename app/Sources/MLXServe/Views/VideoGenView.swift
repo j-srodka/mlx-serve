@@ -74,10 +74,6 @@ struct VideoGenView: View {
     // frame; the SERVICE gates the field on `supportsLastFrame`, so a leftover
     // pick can never reach a backend without the anchor.
     @State private var lastFrameImageURL: URL? = nil
-    /// LTX source clip. Kept across preset switches; the request gates it.
-    @State private var guideVideoURL: URL? = nil
-    @State private var guideVideoSummary: String? = nil
-    @State private var isGuideDropTargeted = false
     @State private var isLastFrameDropTargeted = false
     // ref2va references, kept across preset changes like firstFrameImageURL —
     // `requestBody` gates the fields on the pack's own capability, so state
@@ -1386,7 +1382,6 @@ struct VideoGenView: View {
             FoldingSectionHeader(title: "Media inputs for generation", isExpanded: $showMediaInputs)
             if showMediaInputs {
                 keyframeRow
-                referenceVideoSection
                 referencesSection
                 // One clip cannot condition every shot of a storyboard.
                 if !storyboardOn { speechSection }
@@ -1507,95 +1502,6 @@ struct VideoGenView: View {
         // window; see `MediaDropTarget`.
         .mediaDrop(.image, isTargeted: isTargeted) { urls in
             if let dropped = urls.first { url.wrappedValue = dropped }
-        }
-    }
-
-    /// Source clip for an LTX in-context guide (Ripple). Hidden on backends
-    /// that do not declare it. Attaching a clip does not change the pipeline.
-    @ViewBuilder
-    private var referenceVideoSection: some View {
-        if model.supportsVideoInput {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 6) {
-                    Text("Reference video").font(.app(.subheadline).weight(.semibold))
-                    Text("optional, motion to follow")
-                        .font(.app(.caption))
-                        .foregroundStyle(.secondary)
-                    Spacer(minLength: 0)
-                }
-                if let picked = guideVideoURL {
-                    MediaDropWellFilled(isTargeted: isGuideDropTargeted) {
-                        HStack(spacing: 8) {
-                            Image(systemName: "film")
-                                .frame(width: 64, height: 48)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(picked.lastPathComponent)
-                                    .font(.app(.caption))
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                                if let guideVideoSummary {
-                                    Text(guideVideoSummary)
-                                        .font(.app(.caption2))
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                            Spacer()
-                            Button {
-                                guideVideoURL = nil
-                                guideVideoSummary = nil
-                            } label: {
-                                Image(systemName: "xmark.circle.fill")
-                            }
-                            .buttonStyle(.borderless)
-                            .foregroundStyle(.secondary)
-                            .help("Clear reference video")
-                        }
-                    }
-                } else {
-                    MediaDropWell(title: "Choose video...",
-                                  systemImage: "film",
-                                  isTargeted: isGuideDropTargeted) { chooseGuideVideo() }
-                        .help("A clip whose motion, timing and camera the edit should follow.")
-                }
-                Text("Ripple recipe: one-stage, guidance 1, LoRA strength 1.35. Choosing a clip does not change the pipeline or guidance you already picked. The first frame, if set, replaces frame 0 of this clip.")
-                    .font(.app(.caption2))
-                    .foregroundStyle(.secondary)
-            }
-            .mediaDrop(.video, isTargeted: $isGuideDropTargeted) { urls in
-                if let dropped = urls.first {
-                    guideVideoURL = dropped
-                    refreshGuideSummary()
-                }
-            }
-            .onChange(of: guideVideoURL) { _, _ in refreshGuideSummary() }
-        }
-    }
-
-    private func chooseGuideVideo() {
-        let panel = OpenPanel.make()
-        panel.allowedContentTypes = [.movie, .mpeg4Movie, .quickTimeMovie]
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        if AppActivation.runModal(panel) == .OK, let url = panel.url {
-            guideVideoURL = url
-            refreshGuideSummary()
-        }
-    }
-
-    private func refreshGuideSummary() {
-        guard let url = guideVideoURL else {
-            guideVideoSummary = nil
-            return
-        }
-        Task {
-            let asset = AVURLAsset(url: url)
-            guard let duration = try? await asset.load(.duration) else { return }
-            let seconds = CMTimeGetSeconds(duration)
-            guard seconds.isFinite, seconds > 0 else { return }
-            let n = VideoGenService.guideFrameCount(available: Int(seconds * 24))
-            let text = String(format: "%.1f s · %d frames at 24 fps", seconds, n)
-            if guideVideoURL == url { guideVideoSummary = text }
         }
     }
 
@@ -2680,8 +2586,6 @@ struct VideoGenView: View {
         showAdvanced = s.showAdvanced
         firstFrameImageURL = Self.existingFile(s.firstFramePath)
         lastFrameImageURL = Self.existingFile(s.lastFramePath)
-        guideVideoURL = Self.existingFile(s.guideVideoPath)
-        refreshGuideSummary()
         speechText = s.speechText
         audioSource = model.supportsAudioInput ? s.audioSource : .none
         if let clip = Self.existingFile(s.audioPath), audioSource != .none {
@@ -2750,7 +2654,6 @@ struct VideoGenView: View {
         s.prompt = prompt
         s.firstFramePath = firstFrameImageURL?.path
         s.lastFramePath = lastFrameImageURL?.path
-        s.guideVideoPath = guideVideoURL?.path
         s.audioSource = audioSource
         s.audioPath = audioURL?.path
         s.speechText = speechText
@@ -2855,7 +2758,6 @@ struct VideoGenView: View {
             stgScale: stgScale,
             firstFrameImagePath: firstFrameImageURL?.path,
             lastFrameImagePath: lastFrameImageURL?.path,
-            guideVideoPath: model.supportsVideoInput ? guideVideoURL?.path : nil,
             // Belt-and-braces with the requestBody gate: a clip must never
             // reach the transcode (whose failure is a hard error) on a
             // backend that generates its own soundtrack.

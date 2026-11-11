@@ -1768,42 +1768,4 @@ extension MediaGenServiceTests {
         XCTAssertEqual(lbody["lora_scales"] as? [Double], [1.0])
     }
 
-    func testRefVideoFramesFollowTheCapabilityAndTheEditOrder() {
-        XCTAssertTrue(VideoModelPreset.ltx23Q4.supportsVideoInput)
-        XCTAssertTrue(VideoModelPreset.ltx25Q4.supportsVideoInput)
-        XCTAssertTrue(VideoModelPreset.ltx25Q8.supportsVideoInput)
-        XCTAssertFalse(VideoModelPreset.minimaxH3.supportsVideoInput)
-
-        XCTAssertEqual(VideoGenService.guideFrameCount(available: 0), 0)
-        XCTAssertEqual(VideoGenService.guideFrameCount(available: 1), 1)
-        XCTAssertEqual(VideoGenService.guideFrameCount(available: 8), 1)
-        XCTAssertEqual(VideoGenService.guideFrameCount(available: 9), 9)
-        XCTAssertEqual(VideoGenService.guideFrameCount(available: 120), 113)
-        XCTAssertEqual(VideoGenService.guideFrameCount(available: 121), 121)
-        XCTAssertEqual(VideoGenService.guideFrameCount(available: 400), 121)
-
-        let wide = VideoGenService.coverDrawRect(srcW: 200, srcH: 100, dstW: 50, dstH: 50)
-        XCTAssertEqual(wide.width, 100, accuracy: 0.01)
-        XCTAssertEqual(wide.origin.x, -25, accuracy: 0.01)
-
-        var ltx = VideoGenRequest(model: .ltx25Q8, prompt: "p", width: 384, height: 256,
-                                  numFrames: 97, fps: 24, mode: .oneStage, steps: 8, cfgScale: 1.0)
-        let absent = VideoGenService.requestBody(model: "m", prompt: "p", request: ltx, firstFrameB64: "QQ==")
-        XCTAssertNil(absent["ref_video_frames"])
-        XCTAssertEqual(absent["first_frame_image"] as? String, "QQ==")
-
-        ltx.guideVideoPath = "/clips/take.mp4"
-        let frames = ["edited", "src1", "src2"]
-        let present = VideoGenService.requestBody(
-            model: "m", prompt: "p", request: ltx, firstFrameB64: "QQ==", guideFrames: frames)
-        XCTAssertEqual(present["ref_video_frames"] as? [String], frames)
-        XCTAssertNil(present["first_frame_image"], "the edited frame is ref_video_frames[0], not a canvas pin")
-
-        var h3 = VideoGenRequest(model: .minimaxH3, prompt: "p", width: 384, height: 256,
-                                 numFrames: 124, fps: 24, mode: .oneStage, steps: 8, cfgScale: 1.0)
-        h3.guideVideoPath = "/clips/take.mp4"
-        let gated = VideoGenService.requestBody(
-            model: "m", prompt: "p", request: h3, firstFrameB64: nil, guideFrames: frames)
-        XCTAssertNil(gated["ref_video_frames"])
-    }
 }

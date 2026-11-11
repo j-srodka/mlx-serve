@@ -737,10 +737,6 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// reference has no keyframe row to anchor, so on H3 this rides the same
     /// partition complement as Turbo and chaining.
     var supportsLastFrame: Bool = false
-    /// Source-video guide (`ref_video_frames`): an edited first frame plus the
-    /// clip, VAE-encoded as one in-context sequence. LTX only. H3's reference
-    /// clips are `ref_videos`, a different contract.
-    var supportsVideoInput: Bool = false
     /// A distilled student's trained step count, the only one the server accepts: the pane shows
     /// it as a fact instead of a slider. nil = a range to choose from.
     var fixedSteps: Int? { stepsRange.count == 1 ? stepsRange.lowerBound : nil }
@@ -1057,8 +1053,7 @@ struct VideoModelPreset: Identifiable, Hashable {
             maxFrames: cap,
             frameOptions: frameLadder(maxFrames: cap),
             description: "Generates short video clips from a text prompt (and optionally a starting image or audio track), with sound built in. The heaviest model here — it also pulls a Gemma text encoder on first use.",
-            supportsLastFrame: true,
-            supportsVideoInput: true
+            supportsLastFrame: true
         )
     }()
 
@@ -1097,7 +1092,6 @@ struct VideoModelPreset: Identifiable, Hashable {
             frameOptions: frameLadder(maxFrames: cap),
             description: "The newest LTX. Generates short video clips with sound from a text prompt, and optionally a starting image or audio track. Ships its own text encoder, so nothing extra downloads on first use.",
             supportsLastFrame: true,
-            supportsVideoInput: true,
             shipsOwnTextEncoder: true
         )
     }()
@@ -1136,7 +1130,6 @@ struct VideoModelPreset: Identifiable, Hashable {
             frameOptions: frameLadder(maxFrames: cap),
             description: "The sharpest LTX we ship. Same model as the 4-bit pack at twice the weight precision — noticeably more detail in faces, fur and fine texture, for about the same generation time. Needs a Mac with plenty of memory.",
             supportsLastFrame: true,
-            supportsVideoInput: true,
             shipsOwnTextEncoder: true,
             supportsDiffusionDecoder: true
         )
@@ -2610,9 +2603,6 @@ struct VideoGenRequest {
     /// first frame sets the geometry and this one follows it, so a pair with
     /// mismatched aspects still produces a clean landing.
     var lastFrameImagePath: String? = nil
-    /// LTX source clip for the in-context guide. Frames are extracted at 24 fps.
-    /// A first-frame image, when set, replaces frame 0 of that clip.
-    var guideVideoPath: String? = nil
     /// Optional speech/audio clip for audio-to-video: the soundtrack is frozen
     /// as conditioning (voices, lip sync and performance follow it) and the
     /// ORIGINAL clip is muxed into the mp4. Any AVFoundation-readable format;
