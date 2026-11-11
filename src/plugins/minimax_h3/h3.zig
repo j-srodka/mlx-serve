@@ -8285,6 +8285,22 @@ test "minimax h3: audio RefMods seed live ref_audios ordinals" {
     var label_buf: [32]u8 = undefined;
     try testing.expectEqualStrings("<Audio 1>: ", try h3v.labelFor(&label_buf, .audio, 1));
     try testing.expectEqualStrings("<Audio 2>: ", try h3v.labelFor(&label_buf, .audio, 2));
+
+    var res2 = switch (try resolveRefs(a, &.{}, &.{}, &audios, 864, 480, .match, RefLimits.generation, 2)) {
+        .ok => |r| r,
+        .reject => return error.TestUnexpectedResult,
+    };
+    defer res2.deinit();
+    try testing.expectEqual(@as(u32, 3), res2.refs[0].ordinal);
+    try testing.expectEqualStrings("<Audio 3>: ", try h3v.labelFor(&label_buf, .audio, 3));
+
+    var res0 = switch (try resolveRefs(a, &.{}, &.{}, &audios, 864, 480, .match, RefLimits.generation, 0)) {
+        .ok => |r| r,
+        .reject => return error.TestUnexpectedResult,
+    };
+    defer res0.deinit();
+    try testing.expectEqual(@as(u32, 1), res0.refs[0].ordinal);
+    try testing.expect(res0.refs[0].ordinal != 3);
 }
 
 test "minimax h3: audio ordinal base respects MAX_REF_AUDIOS cap" {
