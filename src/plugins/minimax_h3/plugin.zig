@@ -355,7 +355,8 @@ fn references(
     // Source dimensions are all `resolveRefs` sizes from: an unmeasurable reference is refused here, by field.
     const in_i = try a.alloc(h3.RefInput, images.items.len);
     for (images.items, in_i, 0..) |bytes, *r, i| {
-        const sz = image_pixels.nativeSize(bytes) orelse return req.refuseFmt(.unsupported, "a 'ref_images' entry could not be decoded (PNG/JPEG expected)", "could not decode 'ref_images'[{d}] (PNG/JPEG expected)", .{i});
+        const sz = image_pixels.nativeSize(bytes) orelse
+            return req.refuseFmt(.unsupported, "a 'ref_images' entry could not be decoded (PNG/JPEG expected)", "could not decode 'ref_images'[{d}] (PNG/JPEG expected)", .{i});
         r.* = .{ .kind = .image, .w = sz.w, .h = sz.h };
     }
     const in_v = try a.alloc(h3.RefInput, videos.items.len);
@@ -558,14 +559,24 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         return Verdict.named(.unsupported, "do not mix 'ref_mod_paths' with ref_images");
     if ((has_live_refs or has_ref_mod_paths) and !e.supports_refs)
         return bad("this MiniMax-H3 pack does not support references (it declares no 'ref2va' task) — load a REF2VA checkpoint");
+    const has_refs_intent = has_live_refs or has_ref_mod_paths;
+    const ref_pins_ok = e.supports_fl2va and e.supports_refs;
+    if (h3.refCompatError(has_refs_intent, chain_windows, latent_prefix_frames, latent_suffix_frames, ref_pins_ok)) |msg|
+        return Verdict.named(.unsupported, msg);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    if (has_latent_out) {
+        const raw = latent_out_raw.?;
+        if (!std.fs.path.isAbsolute(raw)) return bad("'latent_out' must be an absolute path");
+        const parent = std.fs.path.dirname(raw) orelse return bad("'latent_out' must be an absolute path");
+        const d = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch return bad("'latent_out' parent directory does not exist");
+        d.close(io);
+    }
     if (has_ref_mod_paths) if (refModPaths(req, &b, s, &refs) catch |err| return job.failure(err, "MiniMax-H3 generation failed")) |v| return v;
     const audio_ref_mods = countRefModAudioPacks(refs.items);
     if (has_live_refs) if (references(req, &b, width, height, shape.frame_count, s, &refs, h3.RefLimits.generation, audio_ref_mods) catch |err| return job.failure(err, "MiniMax-H3 generation failed")) |v| return v;
     if (refs.items.len > h3.MAX_REF_TOTAL)
         return req.refuseFmt(.unsupported, "too many references", "too many references: at most {d} files across live refs and ref_mod_paths combined", .{h3.MAX_REF_TOTAL});
-    const has_refs = has_live_refs or has_ref_mod_paths or refs.items.len > 0;
-    const ref_pins_ok = e.supports_fl2va and e.supports_refs;
-    if (h3.refCompatError(has_refs, chain_windows, latent_prefix_frames, latent_suffix_frames, ref_pins_ok)) |msg| return Verdict.named(.unsupported, msg);
+    const has_refs = has_refs_intent or refs.items.len > 0;
     const has_pins = latent_prefix_frames > 0 or latent_suffix_frames > 0;
     if (h3.refineRequestError(has_latent_init, has_latent_upscale, e.supports_fl2va, chain_windows, has_refs, has_pins, e.pdd != null)) |msg|
         return Verdict.named(.unsupported, msg);
@@ -636,14 +647,6 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
 
     var paths_c: [lora.MAX_LORAS][]const u8 = undefined;
     for (e.lora_paths[0..e.lora_n], 0..) |p, i| paths_c[i] = p;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    if (has_latent_out) {
-        const raw = latent_out_raw.?;
-        if (!std.fs.path.isAbsolute(raw)) return bad("'latent_out' must be an absolute path");
-        const parent = std.fs.path.dirname(raw) orelse return bad("'latent_out' must be an absolute path");
-        const d = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch return bad("'latent_out' parent directory does not exist");
-        d.close(io);
-    }
     if (has_latent_prefix_path) {
         const raw = latent_prefix_path_raw.?;
         if (!std.fs.path.isAbsolute(raw)) return bad("'latent_prefix_path' must be an absolute path");
@@ -1151,6 +1154,23 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
     };
 }
 
+/// Same weights as `conformanceFixture` but advertises `ref2va` for hybrid gate tests.
+pub fn hybridConformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
+    const fx = try conformanceFixture(a);
+    const files = try a.alloc(sdk.fixture.File, fx.files.len);
+    for (fx.files, files) |file, *dst| {
+        if (std.mem.eql(u8, file.name, "config.json")) {
+            dst.* = .{
+                .name = file.name,
+                .bytes = try std.mem.replaceOwned(u8, a, file.bytes, "\"tasks\":[\"t2va\",\"fl2va\"]", "\"tasks\":[\"t2va\",\"fl2va\",\"ref2va\"]"),
+            };
+        } else {
+            dst.* = file;
+        }
+    }
+    return .{ .files = files, .body = fx.body };
+}
+
 // ── tests ──
 
 const testing = std.testing;
@@ -1277,6 +1297,35 @@ test "minimax_h3 plugin: refmods canvas gate skips width/height on voice extract
     try testing.expectEqualStrings("missing 'width' or 'height'", refmodsCanvasError(false, 0, 0).?);
     try testing.expectEqualStrings("width and height must be multiples of 32", refmodsCanvasError(false, 70, 64).?);
     try testing.expect(refmodsCanvasError(false, 256, 256) == null);
+}
+
+const tiny_ref_png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR42mMQEREBAAB8AD2sffR3AAAAAElFTkSuQmCC";
+
+test "minimax_h3 plugin: ref compat and latent_out parent refuse before reference decode" {
+    const hybrid_table = table;
+    const hybrid_plugin = plugin;
+    const Hybrid = struct {
+        pub const plugin = hybrid_plugin;
+        pub const table = hybrid_table;
+        pub fn conformanceFixture(alloc: std.mem.Allocator) !sdk.fixture.Fixture {
+            return hybridConformanceFixture(alloc);
+        }
+    };
+    const HybridPack = @import("../../sdk/testing/media_pack.zig").MediaPack(Hybrid);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var pack = try HybridPack.open(arena.allocator());
+    defer pack.close();
+    const chain_body = try std.fmt.allocPrint(arena.allocator(), "{{\"prompt\":\"x\",\"num_frames\":56,\"width\":64,\"height\":64,\"ref_images\":[\"{s}\"],\"chain_windows\":2}}", .{tiny_ref_png_b64});
+    const latout_body = try std.fmt.allocPrint(arena.allocator(), "{{\"prompt\":\"x\",\"num_frames\":56,\"width\":64,\"height\":64,\"ref_images\":[\"{s}\"],\"latent_out\":\"/tmp/no_such_parent_dir_zz/latents.safetensors\"}}", .{tiny_ref_png_b64});
+    inline for (.{
+        .{ chain_body, "chained windows cannot be used with references or ref_mod_paths" },
+        .{ latout_body, "'latent_out' parent directory does not exist" },
+    }) |c| {
+        const out = try pack.run(c[0]);
+        try testing.expectEqualStrings(c[1], out.refused.why.slice());
+    }
 }
 
 const MediaPack = @import("../../sdk/testing/media_pack.zig").MediaPack(@This());
