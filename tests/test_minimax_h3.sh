@@ -158,13 +158,17 @@ if [ "$HAS_REF2VA" = "yes" ]; then
   else
     echo "FAIL: chain+refs returned $code ($(head -c 160 /tmp/h3_ref_chain.json))"; rc=1
   fi
-  code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
-    -d "{\"prompt\":\"x\",\"num_frames\":56,\"width\":64,\"height\":64,\"ref_images\":[\"$TINY_PNG\"],\"latent_prefix_path\":\"/tmp/x.safetensors\",\"latent_prefix_frames\":22}" \
-    -o /tmp/h3_ref_prefixpin.json -w "%{http_code}")
-  if [ "$code" = "400" ] && grep -q "latent_prefix_frames cannot be used with references" /tmp/h3_ref_prefixpin.json; then
-    echo "PASS: refs + latent_prefix_frames -> named 400"
+  if [ "$HAS_FL2VA" = "yes" ]; then
+    echo "SKIP: refs + latent_prefix_frames refusal (hybrid FL2VA+REF2VA allows pins+refs, 0206eead)"
   else
-    echo "FAIL: refs+prefix_frames returned $code ($(head -c 160 /tmp/h3_ref_prefixpin.json))"; rc=1
+    code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+      -d "{\"prompt\":\"x\",\"num_frames\":56,\"width\":64,\"height\":64,\"ref_images\":[\"$TINY_PNG\"],\"latent_prefix_path\":\"/tmp/x.safetensors\",\"latent_prefix_frames\":22}" \
+      -o /tmp/h3_ref_prefixpin.json -w "%{http_code}")
+    if [ "$code" = "400" ] && grep -q "latent_prefix_frames cannot be used with references" /tmp/h3_ref_prefixpin.json; then
+      echo "PASS: refs + latent_prefix_frames -> named 400"
+    else
+      echo "FAIL: refs+prefix_frames returned $code ($(head -c 160 /tmp/h3_ref_prefixpin.json))"; rc=1
+    fi
   fi
   if [ "$HAS_FL2VA" = "yes" ]; then
     code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
@@ -195,13 +199,26 @@ if [ "$HAS_REF2VA" = "yes" ]; then
         python3 - "$SIDE" <<'PY'
 import json, struct, sys
 from pathlib import Path
+
+# Mirrors geometry.temporalShape / videoLatentT in src/plugins/minimax_h3/geometry.zig (see h3.zig refineInitGeometryError + temporalShape(5)).
+def align_frame_count(n: int) -> int:
+    return n + ((22 - n % 17) % 17)
+
+def video_latent_t(frame_count: int) -> int:
+    if frame_count <= 5:
+        return 2
+    return ((frame_count - 5) // 17) * 5 + 2
+
+num_frames = 5
+want_t = video_latent_t(align_frame_count(num_frames))
+
 data = Path(sys.argv[1]).read_bytes()
 n = struct.unpack_from("<Q", data, 0)[0]
 header = json.loads(data[8:8 + n])
 assert header.get("__metadata__", {}).get("pack") == "fl2va", header.get("__metadata__")
 shape = header["video_latent"]["shape"]
-assert shape[2] == 1, f"video T {shape} != temporalShape(5).latent_t"
-print("PASS: hybrid latent_out sidecar pack=fl2va video T=1")
+assert shape[2] == want_t, f"video T {shape} != temporalShape({num_frames}).latent_t ({want_t})"
+print(f"PASS: hybrid latent_out sidecar pack=fl2va video T={want_t}")
 PY
         [ $? -eq 0 ] || rc=1
       else
