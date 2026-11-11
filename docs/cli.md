@@ -109,7 +109,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--max-resident-models N` | `3` | How many models stay loaded at once (LRU-evicted) |
 | `--idle-evict-secs N` | off | Unload models nobody is using after this many idle seconds |
 | `--no-warmup-eager` | off | Skip the eager warmup at boot (benchmarking / minimal-footprint deployments) |
-| `--skip-mem-preflight` | off | Skip the free-RAM pre-flight on load (the cap above is checked first, and still applies). Also skips MiniMax-H3 per-request canvas billing (`handleVideoH3`); set `MLX_SERVE_H3_SKIP_CANVAS_BILL=1` to skip only that gate. Either way, a load that would not fit in free RAM first unloads idle models when that makes it fit |
+| `--skip-mem-preflight` | off | Skip the free-RAM pre-flight on load (the cap above is checked first, and still applies). Also skips MiniMax-H3 per-request canvas billing (the staged-plan DiT check in the minimax_h3 plugin); uncatchable OOM mid-step is possible. Either way, a load that would not fit in free RAM first unloads idle models when that makes it fit |
 | `--no-tool-autocorrect` | off | Turn off schema-driven repair of model-emitted tool arguments |
 | `--log-level` | `info` | Log level (error, warn, info, debug) |
 | `--log-file PATH` | `~/.mlx-serve/logs/` | Where the server log goes |

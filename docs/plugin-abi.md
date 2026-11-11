@@ -1044,6 +1044,11 @@ The machine and launch facts a bill reads (the host fills them; a bill never rea
 | `low_mem` | `bool` | `false` | iOS, `MLXSERVE_LOWMEM=1`, or RAM at most 17 GiB: stage the large encoders per request. |
 | `ram_total` | `u64` | `0` | Host RAM in bytes, total and what the OS will grant now (free + file-backed + purgeable); 0 = unknown. |
 | `ram_available` | `u64` | `0` |  |
+| `skip_mem_preflight` | `bool` | `false` | `--skip-mem-preflight`: a media bill may proceed when it does not fit. |
+
+### `skipMemPreflight(m: *const Machine) bool`
+
+Whether the host set `--skip-mem-preflight` on this machine snapshot; false for an older host or smaller `size`.
 
 ### `LoadCtx` (extern struct)
 

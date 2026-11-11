@@ -22,6 +22,7 @@ pub fn settings(out: *host.Settings) void {
         .prefill_decode_share = prefill_interleave.prefillDecodeShare(),
         .mtp_head_kv_quant = @import("transformer.zig").cli().mtp_head_kv_quant,
         .explicit_prefill_chunk = generate_mod.explicitPrefillChunkU32(),
+        .skip_mem_preflight = scheduler_mod.skip_mem_preflight,
     };
 }
 

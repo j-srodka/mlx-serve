@@ -12,11 +12,13 @@ const low_mem = @import("../low_mem.zig");
 const status = @import("../../status.zig");
 const gen = @import("../gen.zig");
 const FsPackDir = @import("../../registry/pack_dir.zig").FsPackDir;
+const mlx_engine = @import("../../engines/mlx.zig");
 
 pub const MediaTable = abi.MediaTable;
 
 /// The launch and machine facts a bill reads.
 pub fn machine() abi.Machine {
+    const engine_settings = mlx_engine.settings();
     return .{
         .gpu_working_set = mlx.maxRecommendedWorkingSet(),
         .w8a8 = w8a8.w8a8State().enabled and w8a8.nax(),
@@ -26,6 +28,7 @@ pub fn machine() abi.Machine {
         .low_mem = low_mem.default(),
         .ram_total = status.getTotalMemBytes(),
         .ram_available = status.getAvailableMemBytes(),
+        .skip_mem_preflight = engine_settings.skip_mem_preflight,
     };
 }
 
@@ -126,3 +129,16 @@ pub const Engine = struct {
         return p.table.modality == .audio and @field(p.caps.routes, route);
     }
 };
+
+test "media plugin machine carries skip_mem_preflight from engine settings" {
+    const testing = std.testing;
+    const scheduler_mod = @import("../../../engines/mlx/scheduler.zig");
+    const prev = scheduler_mod.skip_mem_preflight;
+    defer scheduler_mod.skip_mem_preflight = prev;
+    scheduler_mod.skip_mem_preflight = true;
+    try testing.expect(mlx_engine.settings().skip_mem_preflight);
+    try testing.expect(machine().skip_mem_preflight);
+    scheduler_mod.skip_mem_preflight = false;
+    try testing.expect(!mlx_engine.settings().skip_mem_preflight);
+    try testing.expect(!machine().skip_mem_preflight);
+}

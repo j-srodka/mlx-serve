@@ -61,7 +61,15 @@ pub const Machine = extern struct {
     /// Host RAM in bytes, total and what the OS will grant now (free + file-backed + purgeable); 0 = unknown.
     ram_total: u64 = 0,
     ram_available: u64 = 0,
+    /// `--skip-mem-preflight`: a media bill may proceed when it does not fit.
+    skip_mem_preflight: bool = false,
 };
+
+/// Whether the host set `--skip-mem-preflight` on this machine snapshot; false for an older host or smaller `size`.
+pub fn skipMemPreflight(m: *const Machine) bool {
+    if (m.size < @offsetOf(Machine, "skip_mem_preflight") + @sizeOf(bool)) return false;
+    return m.skip_mem_preflight;
+}
 
 /// Valid during `load` only.
 pub const LoadCtx = extern struct {

@@ -136,6 +136,11 @@ pub fn canvasBill(dit: u64, activations: u64, host_avail: u64, gpu_limit: u64, g
     return .{ .need = activations, .avail = if (gpu_limit == 0) host_avail else gpu_limit -| gpu_active };
 }
 
+/// Staged DiT canvas gate: refuse when over budget unless the host passed `--skip-mem-preflight`.
+pub fn refuseStagedCanvasBill(dit: u64, need: u64, avail: u64, skip_preflight: bool) bool {
+    return dit > 0 and avail > 0 and need > avail and !skip_preflight;
+}
+
 /// Headroom kept free beyond the resident set: an eighth of the RAM it does not need, floored.
 pub fn residentMargin(total_ram: u64) u64 {
     return @max(10 * 1024 * 1024 * 1024, total_ram / 16);
@@ -280,6 +285,16 @@ test "h3 residency: free memory is the tighter of host RAM and the GPU working-s
     try std.testing.expectEqual(100 * gb, availBytes(100 * gb, 0, 40 * gb)); // no GPU limit known
     try std.testing.expectEqual(@as(u64, 0), availBytes(0, 192 * gb, 0)); // host unknown never keeps
     try std.testing.expectEqual(@as(u64, 0), availBytes(100 * gb, 192 * gb, 200 * gb)); // over the limit
+}
+
+test "refuseStagedCanvasBill: over budget refuses only without skip; dit==0 or avail==0 never refuses" {
+    const gb: u64 = 1 << 30;
+    try std.testing.expect(refuseStagedCanvasBill(1, 20 * gb, 10 * gb, false));
+    try std.testing.expect(!refuseStagedCanvasBill(1, 20 * gb, 10 * gb, true));
+    try std.testing.expect(!refuseStagedCanvasBill(1, 8 * gb, 10 * gb, false));
+    try std.testing.expect(!refuseStagedCanvasBill(1, 8 * gb, 10 * gb, true));
+    try std.testing.expect(!refuseStagedCanvasBill(0, 20 * gb, 10 * gb, false));
+    try std.testing.expect(!refuseStagedCanvasBill(1, 20 * gb, 0, false));
 }
 
 test "canvasBill: unified memory bills DiT + activations; CUDA bills the DiT to RAM, activations to the GPU" {

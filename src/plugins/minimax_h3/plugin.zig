@@ -604,7 +604,8 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         const bill = config.canvasBill(dit, activations, mem.host_avail, mem.gpu_limit, mem.gpu_active, mlx.cudaAvailable());
         const up_ws = if (has_latent_upscale) upscaler.workingSetBytes(0, height / h3.VAE_SPATIAL, width / h3.VAE_SPATIAL, shape.latent_t) else 0;
         const need = bill.need + up_ws;
-        if (dit > 0 and bill.avail > 0 and need > bill.avail) {
+        const skip_bill = abi.skipMemPreflight(req.machine orelse &abi.Machine{});
+        if (config.refuseStagedCanvasBill(dit, need, bill.avail, skip_bill)) {
             const gb = 1024.0 * 1024.0 * 1024.0;
             const cache = bcast_row > 0;
             return req.refuseFmt(.unsupported, "the canvas does not fit in memory: use a smaller canvas or fewer frames", "{d}x{d} x {d} frames needs ~{d:.1} GB ({d:.1} GB DiT{s} + {d:.1} GB for {d} sequence rows{s}) but {d:.1} GB is available: use a smaller canvas or fewer frames{s}", .{
@@ -612,6 +613,13 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
                 @as(f64, @floatFromInt(need)) / gb,                 @as(f64, @floatFromInt(dit)) / gb,         if (mlx.cudaAvailable()) " paged to RAM" else "",
                 @as(f64, @floatFromInt(activations)) / gb,          rows,                                      if (cache) " with the fast recipe's attention cache" else "",
                 @as(f64, @floatFromInt(bill.avail)) / gb,           if (cache) ", or \"turbo\", which keeps no attention cache" else "",
+            });
+        }
+        if (skip_bill and dit > 0 and bill.avail > 0 and need > bill.avail) {
+            const gb: f64 = 1024.0 * 1024.0 * 1024.0;
+            log.warn("[minimax-h3] canvas bill skipped ({d}x{d} x {d}f billed ~{d:.1} GB, {d:.1} GB available): --skip-mem-preflight — uncatchable OOM mid-step is possible\n", .{
+                width, height, shape.frame_count,
+                @as(f64, @floatFromInt(need)) / gb, @as(f64, @floatFromInt(bill.avail)) / gb,
             });
         }
     }

@@ -125,6 +125,7 @@ pub const Settings = struct {
     mtp_head_kv_quant: bool = false,
     /// `--prefill-chunk` when given, else 0.
     explicit_prefill_chunk: u32 = 0,
+    skip_mem_preflight: bool = false,
 };
 
 /// Live engine numbers the metrics sampler publishes.
