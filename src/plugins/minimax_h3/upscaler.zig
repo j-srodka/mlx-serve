@@ -576,7 +576,7 @@ fn temporal(self: *const Model, allocator: std.mem.Allocator, x_nhwc: A, idx: u3
     const a = try silu(n5, s);
     defer _ = mlx.mlx_array_free(a);
     const dw_k = keyBuf(&buf, "temporal_blocks.{d}.dwconv.weight", .{idx});
-    const dw = try conv3dPt(a, try must(&self.w, dw_k), self.w.get(keyBuf(&buf, "temporal_blocks.{d}.dwconv.bias", .{idx})), @intCast(self.arch.temporal_kernel / 2), @intCast(c), s);
+    const dw = try depthwiseTimeConv(a, try must(&self.w, dw_k), self.w.get(keyBuf(&buf, "temporal_blocks.{d}.dwconv.bias", .{idx})), @intCast(self.arch.temporal_kernel / 2), s);
     defer _ = mlx.mlx_array_free(dw);
     const pw = try conv3dPt(dw, try must(&self.w, keyBuf(&buf, "temporal_blocks.{d}.pwconv.weight", .{idx})), self.w.get(keyBuf(&buf, "temporal_blocks.{d}.pwconv.bias", .{idx})), 0, 1, s);
     defer _ = mlx.mlx_array_free(pw);
@@ -801,6 +801,35 @@ fn conv2dPt(x: A, w_pt: A, bias: ?A, pad: c_int, replicate: bool, s: S) !A {
     return o;
 }
 
+/// PT `Conv3d(C, C, (k,1,1), padding=(pad,0,0), groups=C)` on NDHWC `x`. MLX's conv3d takes no groups,
+/// so each pixel runs as a grouped conv1d over time.
+fn depthwiseTimeConv(x_ndhwc: A, w_pt: A, bias: ?A, pad_t: c_int, s: S) !A {
+    const sh = mlx.getShape(x_ndhwc);
+    const b = sh[0];
+    const t = sh[1];
+    const h = sh[2];
+    const w = sh[3];
+    const c = sh[4];
+    const k = mlx.getShape(w_pt)[2];
+    const xt = try transpose(x_ndhwc, &[_]c_int{ 0, 2, 3, 1, 4 }, s);
+    defer _ = mlx.mlx_array_free(xt);
+    const xs = try reshape(xt, &[_]c_int{ b * h * w, t, c }, s);
+    defer _ = mlx.mlx_array_free(xs);
+    const wk = try reshape(w_pt, &[_]c_int{ c, k, 1 }, s);
+    defer _ = mlx.mlx_array_free(wk);
+    var o = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx.mlx_conv1d(&o, xs, wk, 1, pad_t, 1, c, s));
+    const o5 = try reshape(o, &[_]c_int{ b, h, w, t, c }, s);
+    defer _ = mlx.mlx_array_free(o5);
+    const back = try transpose(o5, &[_]c_int{ 0, 3, 1, 2, 4 }, s);
+    if (bias) |bb| {
+        defer _ = mlx.mlx_array_free(back);
+        return addBiasLast(back, bb, s);
+    }
+    return back;
+}
+
 fn conv3dPt(x_ndhwc: A, w_pt: A, bias: ?A, pad_t: c_int, groups: c_int, s: S) !A {
     // PT [O, I/G, kD, kH, kW] → MLX [O, kD, kH, kW, I/G]
     const wt = try transpose(w_pt, &[_]c_int{ 0, 2, 3, 4, 1 }, s);
@@ -994,6 +1023,39 @@ test "minimax h3 upscaler: the scale/tier embedding is one row per frame" {
     }
 }
 
+test "minimax h3 upscaler: the temporal depthwise conv matches a direct zero-padded sum over time" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    const T = 4;
+    const HW = 2;
+    const C = 3;
+    const K = 3;
+    var x: [T * HW * C]f32 = undefined; // [1, T, H=2, W=1, C]
+    for (&x, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 7)) - 3.0;
+    var wt: [C * K]f32 = undefined; // PT [C, 1, K, 1, 1]
+    for (&wt, 0..) |*v, i| v.* = 0.25 * @as(f32, @floatFromInt(i + 1));
+    var bias = [_]f32{ 0.5, -1.0, 2.0 };
+    const xa = mlx.mlx_array_new_data(&x, &[_]c_int{ 1, T, HW, 1, C }, 5, .float32);
+    defer _ = mlx.mlx_array_free(xa);
+    const wa = mlx.mlx_array_new_data(&wt, &[_]c_int{ C, 1, K, 1, 1 }, 5, .float32);
+    defer _ = mlx.mlx_array_free(wa);
+    const ba = mlx.mlx_array_new_data(&bias, &[_]c_int{C}, 1, .float32);
+    defer _ = mlx.mlx_array_free(ba);
+    const got = try depthwiseTimeConv(xa, wa, ba, K / 2, s);
+    defer _ = mlx.mlx_array_free(got);
+    try mlx.check(mlx.mlx_array_eval(got));
+    try testing.expectEqualSlices(c_int, &[_]c_int{ 1, T, HW, 1, C }, mlx.getShape(got));
+    const out = mlx.mlx_array_data_float32(got).?[0 .. T * HW * C];
+    for (0..T) |t| for (0..HW) |p| for (0..C) |c| {
+        var want: f32 = bias[c];
+        for (0..K) |k| {
+            const src = @as(i32, @intCast(t + k)) - K / 2;
+            if (src < 0 or src >= T) continue;
+            want += wt[c * K + k] * x[(@as(usize, @intCast(src)) * HW + p) * C + c];
+        }
+        try testing.expectApproxEqAbs(want, out[(t * HW + p) * C + c], 1e-5);
+    };
+}
+
 test "minimax h3 upscaler: bilinear NHWC matches align_corners=False 1d" {
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.mlx_default_cpu_stream_new();
@@ -1091,5 +1153,6 @@ fn expectOracle(model: *const Model, a: std.mem.Allocator, x: A, dir: []const u8
     try mlx.check(mlx.mlx_array_item_float32(&dv, ds));
     const n: f32 = @floatFromInt(mlx.mlx_array_size(got));
     const rms_ratio = @sqrt(dv / n) / (@sqrt(wv / n) + 1e-8);
+    std.debug.print("[h3-upscaler] {s}: cos {d:.6} rms ratio {d:.6}\n", .{ name, cos, rms_ratio });
     try testing.expect(rms_ratio <= 0.01);
 }
