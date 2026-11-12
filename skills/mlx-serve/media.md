@@ -252,10 +252,27 @@ Pack folder `{model}/latent_upscaler/*.safetensors` also works on the request.
 | `latent_init_path` | Absolute `.safetensors` written by `latent_out`. Required. Canvas = sidecar latent × 16; frame count must match. |
 | `refine_sigmas` | Descending video-clock list ending at 0, e.g. `[0.9035, 0.6316, 0.3158, 0]`. Already shifted (do not pass unit-clock values). Alt: `refine_start_sigma` + `steps`. |
 | `refine_audio` | Default false: keep the init soundtrack. true re-noises audio too. |
-| `latent_upscale` | `{ "factor": 2.0, "tier": 1 }` or `{ "width", "height", "tier" }`. Video latent only. Missing weights → named 400, never interpolate. |
+| `latent_upscale` | `{ "factor": 2.0, "tier": 1 }`; the target canvas is the request's `width`/`height`. Video latent only. Missing weights → named 400, never interpolate. |
+| `refine` | `false` = upscale only (below). Default true. |
 
-FL2VA, `chain_windows` 1, no refs or prefix/suffix pins yet. `latent_out` still
-writes the refined window.
+FL2VA, `chain_windows` 1. `latent_out` writes the refined window, so it can be the
+next window's `latent_prefix_path`.
+
+**Windowed refine** (`"refine_pins":true`, `"refine_refs":true` on `/health`): a
+refine window takes `latent_prefix_frames` + `latent_prefix_path` (and suffix pins)
+like a normal render. The init sidecar covers the WHOLE window at the target grid;
+the pinned rows come from the prefix file's tail and override the init there. The
+pin sidecar must be on the same grid (refine the previous window first). On a
+hybrid FL2VA+REF2VA pack, `ref_images` / `ref_mod_paths` ride the window too.
+Memory: billed like a render of that grid plus refs; over budget is the usual
+named "needs ~X GB, Y GB is available" 400.
+
+**Upscale only** (`"latent_upscale_only":true`): `{"refine": false,
+"latent_init_path", "latent_upscale", "latent_out"}` plus `width`/`height` (or a
+`factor`). No DiT, no prompt; any latent T, so a whole run of joined takes
+upscales in one pass with the upscaler's temporal chunks spanning the joins. The
+audio latent is copied through. Response: `{"latent_out", "latent_t", "width",
+"height"}`. Pins, refs, keyframes, schedules and chains are refused by name.
 
 ## 3D: `POST /v1/3d/generations`
 

@@ -132,6 +132,9 @@ assert_contains "GET /health advertises ref_latent_out" '"ref_latent_out":true' 
 assert_contains "GET /health advertises ref_pins" '"ref_pins":true' "$RESP"
 assert_contains "GET /health advertises latent_refine" '"latent_refine":true' "$RESP"
 assert_contains "GET /health advertises latent_upscale" '"latent_upscale":' "$RESP"
+assert_contains "GET /health advertises refine_pins" '"refine_pins":true' "$RESP"
+assert_contains "GET /health advertises refine_refs" '"refine_refs":true' "$RESP"
+assert_contains "GET /health advertises latent_upscale_only" '"latent_upscale_only":true' "$RESP"
 echo ""
 
 # ── Test: Models ──

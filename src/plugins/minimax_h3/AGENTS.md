@@ -22,8 +22,8 @@ a student runs exactly its own), `seed`, `turbo` (needs `turbo_lora.safetensors`
 `chain_windows` 1-6 (FL2VA only; `num_frames` per window), FL2VA pins (`latent_prefix_frames`/`latent_suffix_frames` 5/22/39/56 + sidecar paths, `latent_out`), `first_frame_image` / `last_frame_image`, `ref_images` /
 `ref_videos` (`{frames, audio}`) / `ref_audios` + `ref_image_size` (REF2VA only), `ref_mod_paths` (absolute
 `.safetensors` packs; XOR with `ref_images`), `lora_paths`/`lora_scales`,
-`latent_init_path` + `refine_sigmas` / `refine_start_sigma` (FL2VA, one window, no refs/pins),
-`latent_upscale` `{factor|width+height, tier}` (`--h3-upscaler` or pack `latent_upscaler/`).
+`latent_init_path` + `refine_sigmas` / `refine_start_sigma` (FL2VA, one window; pins as a render, refs on hybrid),
+`latent_upscale` `{factor, tier}` (`--h3-upscaler` or pack `latent_upscaler/`), `refine: false` (upscale only, no DiT).
 `cfg_scale`/`stg_scale`/`pipeline` are ignored, not refused (the app sends them for every video backend).
 
 ## Rules
@@ -35,6 +35,7 @@ a student runs exactly its own), `seed`, `turbo` (needs `turbo_lora.safetensors`
   uncatchable). Live RAM comes from `Request.machine`.
 - A resident DiT skips the AdaLN precompute and keeps its adapters in the cache (`h3.Resident`): precompute frees the
   modulation weights for ONE schedule. Residency is all-or-nothing; another load releases it before refusing.
+- A refine's carried init audio is captured AFTER the pin splice: each step restores it whole, in packed pin layout.
 - Two reuse levers never stack: a forward after a step-cache skip recomputes attention (`attnBroadcastRefresh`).
 - The converted layouts BAKE OUT per-head interleaves; a sparse-attention pattern cannot be tuned into correctness.
 - FastH3 VSA: a per-block temporary of GBs is a fresh allocation in the server; pooling and assembly are kernels.

@@ -285,9 +285,9 @@ pub fn handleConnection(
         // server whose /health omits `latent_suffix`.
         const up = @import("../../plugins/minimax_h3/upscaler.zig");
         const health = if (up.weightsPresent(null))
-            "{\"status\":\"ok\",\"latent_suffix\":true,\"ref_latent_out\":true,\"ref_pins\":true,\"latent_refine\":true,\"latent_upscale\":true}"
+            "{\"status\":\"ok\",\"latent_suffix\":true,\"ref_latent_out\":true,\"ref_pins\":true,\"latent_refine\":true,\"refine_pins\":true,\"refine_refs\":true,\"latent_upscale_only\":true,\"latent_upscale\":true}"
         else
-            "{\"status\":\"ok\",\"latent_suffix\":true,\"ref_latent_out\":true,\"ref_pins\":true,\"latent_refine\":true,\"latent_upscale\":false}";
+            "{\"status\":\"ok\",\"latent_suffix\":true,\"ref_latent_out\":true,\"ref_pins\":true,\"latent_refine\":true,\"refine_pins\":true,\"refine_refs\":true,\"latent_upscale_only\":true,\"latent_upscale\":false}";
         try sendResponse(stream, "200 OK", "application/json", health);
         return;
     }

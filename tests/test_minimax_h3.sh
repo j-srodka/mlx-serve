@@ -49,8 +49,9 @@ case ",$TASKS," in (*,ref2va,*) HAS_REF2VA=yes;; (*) HAS_REF2VA=no;; esac
 echo "pack tasks: [$TASKS]"
 
 HEALTH=$(curl -sf "http://127.0.0.1:$PORT/health" || true)
-if echo "$HEALTH" | grep -q '"ref_latent_out":true' && echo "$HEALTH" | grep -q '"latent_suffix":true' && echo "$HEALTH" | grep -q '"ref_pins":true' && echo "$HEALTH" | grep -q '"latent_refine":true' && echo "$HEALTH" | grep -q '"latent_upscale":'; then
-  echo "PASS: /health advertises latent_suffix, ref_latent_out, ref_pins, latent_refine, and latent_upscale"
+if echo "$HEALTH" | grep -q '"ref_latent_out":true' && echo "$HEALTH" | grep -q '"latent_suffix":true' && echo "$HEALTH" | grep -q '"ref_pins":true' && echo "$HEALTH" | grep -q '"latent_refine":true' && echo "$HEALTH" | grep -q '"latent_upscale":' \
+  && echo "$HEALTH" | grep -q '"refine_pins":true' && echo "$HEALTH" | grep -q '"refine_refs":true' && echo "$HEALTH" | grep -q '"latent_upscale_only":true'; then
+  echo "PASS: /health advertises latent_suffix, ref_latent_out, ref_pins, latent_refine, latent_upscale, refine_pins, refine_refs, and latent_upscale_only"
 else
   echo "FAIL: /health missing pin/refine flags ($HEALTH)"; rc=1
 fi
