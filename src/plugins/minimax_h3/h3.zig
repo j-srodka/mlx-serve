@@ -3651,12 +3651,13 @@ pub fn upscaleOnlyRequestError(has_init: bool, has_upscale: bool, has_out: bool,
     return null;
 }
 
-pub fn refineRequestError(has_init: bool, has_upscale: bool, supports_fl2va: bool, chain_windows: u32, has_refs: bool, pdd: bool) ?[]const u8 {
+/// `ref_pins_ok` = a hybrid FL2VA+REF2VA pack: references ride a refine there as they ride pins.
+pub fn refineRequestError(has_init: bool, has_upscale: bool, supports_fl2va: bool, chain_windows: u32, has_refs: bool, ref_pins_ok: bool, pdd: bool) ?[]const u8 {
     if (!has_init and !has_upscale) return null;
     if (!has_init) return "latent_upscale requires latent_init_path";
     if (!supports_fl2va) return "latent refine is FL2VA only — load an FL2VA checkpoint";
     if (chain_windows > 1) return "latent refine does not support chain_windows > 1";
-    if (has_refs) return "latent refine does not support references yet";
+    if (has_refs and !ref_pins_ok) return "latent refine with references requires an FL2VA+REF2VA hybrid pack";
     if (pdd) return "latent refine is not a PDD student schedule — omit refine on this pack";
     return null;
 }
@@ -8632,10 +8633,11 @@ test "minimax h3: refine sigma list and start-sigma map" {
     try testing.expectEqual(@as(usize, 4), sched.len);
     try testing.expectApproxEqAbs(@as(f64, 0.9035), sched[0], 1e-12);
     try testing.expectEqual(@as(f64, 0), sched[sched.len - 1]);
-    try testing.expect(refineRequestError(true, false, true, 1, false, false) == null);
-    try testing.expectEqualStrings("latent_upscale requires latent_init_path", refineRequestError(false, true, true, 1, false, false).?);
-    try testing.expectEqualStrings("latent refine does not support chain_windows > 1", refineRequestError(true, false, true, 2, false, false).?);
-    try testing.expectEqualStrings("latent refine does not support references yet", refineRequestError(true, false, true, 1, true, false).?);
+    try testing.expect(refineRequestError(true, false, true, 1, false, false, false) == null);
+    try testing.expectEqualStrings("latent_upscale requires latent_init_path", refineRequestError(false, true, true, 1, false, false, false).?);
+    try testing.expectEqualStrings("latent refine does not support chain_windows > 1", refineRequestError(true, false, true, 2, false, false, false).?);
+    try testing.expectEqualStrings("latent refine with references requires an FL2VA+REF2VA hybrid pack", refineRequestError(true, false, true, 1, true, false, false).?);
+    try testing.expect(refineRequestError(true, false, true, 1, true, true, false) == null);
     try testing.expect(refinePinGeometryError("latent_prefix_path", 4, 4, 2, 9, 5, 64, 64) == null);
     try testing.expectEqualStrings("'latent_prefix_path' canvas must match the refine canvas (latent H×W × 16 = width×height)", refinePinGeometryError("latent_prefix_path", 2, 2, 2, 9, 5, 64, 64).?);
     try testing.expectEqualStrings("'latent_suffix_path' holds fewer latent frames than its pin needs", refinePinGeometryError("latent_suffix_path", 4, 4, 1, 1, 22, 64, 64).?);

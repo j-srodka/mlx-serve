@@ -681,7 +681,7 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     if (refs.items.len > h3.MAX_REF_TOTAL)
         return req.refuseFmt(.unsupported, "too many references", "too many references: at most {d} files across live refs and ref_mod_paths combined", .{h3.MAX_REF_TOTAL});
     const has_refs = has_refs_intent or refs.items.len > 0;
-    if (h3.refineRequestError(has_latent_init, has_latent_upscale, e.supports_fl2va, chain_windows, has_refs, e.pdd != null)) |msg|
+    if (h3.refineRequestError(has_latent_init, has_latent_upscale, e.supports_fl2va, chain_windows, has_refs, ref_pins_ok, e.pdd != null)) |msg|
         return Verdict.named(.unsupported, msg);
     var kf_has_first = false;
     var kf_has_last = false;
@@ -1592,16 +1592,6 @@ test "minimax_h3 plugin: a refine window keeps its prefix and suffix pins exact 
 const tiny_ref_png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR42mMQEREBAAB8AD2sffR3AAAAAElFTkSuQmCC";
 
 test "minimax_h3 plugin: ref compat and latent_out parent refuse before reference decode" {
-    const hybrid_table = table;
-    const hybrid_plugin = plugin;
-    const Hybrid = struct {
-        pub const plugin = hybrid_plugin;
-        pub const table = hybrid_table;
-        pub fn conformanceFixture(alloc: std.mem.Allocator) !sdk.fixture.Fixture {
-            return hybridConformanceFixture(alloc);
-        }
-    };
-    const HybridPack = @import("../../sdk/testing/media_pack.zig").MediaPack(Hybrid);
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1619,3 +1609,46 @@ test "minimax_h3 plugin: ref compat and latent_out parent refuse before referenc
 }
 
 const MediaPack = @import("../../sdk/testing/media_pack.zig").MediaPack(@This());
+
+const hybrid_table = table;
+const Hybrid = struct {
+    pub const plugin = config.plugin;
+    pub const table = hybrid_table;
+    pub const conformanceFixture = hybridConformanceFixture;
+};
+const HybridPack = @import("../../sdk/testing/media_pack.zig").MediaPack(Hybrid);
+
+test "minimax_h3 plugin: references ride a pinned refine window on a hybrid pack, billed like a render of that grid" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var pack = try HybridPack.open(aa);
+    defer pack.close();
+    const p = try sidecarPaths(aa, &pack.tmp);
+    const draft = try std.fmt.allocPrint(aa, "{{\"prompt\":\"a red ball rolls\",\"width\":64,\"height\":64,\"num_frames\":39,\"steps\":2,\"seed\":3,\"fast\":false,\"latent_out\":\"{s}\"}}", .{p.a});
+    _ = (try pack.run(draft)).ok;
+    // A latent image ref mod: the tiny pack has no vision tower for a live still.
+    const ref_lat = try rampArray(&.{ 1, 24, 1, 4, 4 }, 1.0);
+    defer _ = mlx.mlx_array_free(ref_lat);
+    try h3_refmod.save(aa, p.c, try h3_refmod.metaFromLatentShape(64, 64, ref_lat), ref_lat);
+    const refine = try std.fmt.allocPrint(aa, "{{{s},\"num_frames\":39,\"ref_mod_paths\":[\"{s}\"],\"latent_init_path\":\"{s}\",\"latent_prefix_frames\":5,\"latent_prefix_path\":\"{s}\",\"latent_suffix_frames\":5,\"latent_suffix_path\":\"{s}\",\"latent_out\":\"{s}\"}}", .{ refine_window, p.c, p.a, p.a, p.a, p.b });
+    _ = (try pack.run(refine)).ok;
+    try expectPinnedRefine(aa, p, pack.stream);
+
+    // Past the live memory, the same window is the render's named "needs ~X GB" refusal.
+    const m: abi.Machine = .{ .ram_total = 1 << 30, .ram_available = 1 << 20 };
+    var buf: [512]u8 = undefined;
+    var len: usize = 0;
+    const dir = pack.mem.packDir();
+    const req: abi.Request = .{ .body = .of(refine), .machine = &m, .dir = &dir, .message = .{ .ptr = &buf, .cap = buf.len, .len = &len } };
+    const Quiet = struct {
+        fn report(_: ?*anyopaque, _: abi.Str, _: u32, _: u32) callconv(.c) void {}
+        fn boundary(_: ?*anyopaque) callconv(.c) bool {
+            return false;
+        }
+    };
+    const v = table.step(pack.engine, &req, &.{ .ctx = null, .report = Quiet.report, .boundary = Quiet.boundary });
+    try testing.expect(v.code == .unsupported);
+    try testing.expect(std.mem.startsWith(u8, buf[0..len], "64x64 x 39 frames needs ~"));
+    try testing.expect(std.mem.endsWith(u8, buf[0..len], "GB is available: use a smaller canvas or fewer frames"));
+}
