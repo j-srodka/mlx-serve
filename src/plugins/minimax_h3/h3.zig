@@ -3618,6 +3618,16 @@ pub fn refineScheduleFromStart(allocator: std.mem.Allocator, start: f64, steps: 
     return sched;
 }
 
+/// A pin sidecar on a refine window sits on the window's grid and holds the pinned span (`null` = ok): a
+/// draft-size prefix beside a target-size init is the windowed client's likely slip.
+pub fn refinePinGeometryError(comptime field: []const u8, v_h: u32, v_w: u32, v_t: u32, a_t: u32, pin_frames: u32, width: u32, height: u32) ?[]const u8 {
+    if (v_h != height / VAE_SPATIAL or v_w != width / VAE_SPATIAL)
+        return "'" ++ field ++ "' canvas must match the refine canvas (latent H×W × 16 = width×height)";
+    if (v_t < overlapVideoLatentT(pin_frames) or a_t < overlapAudioLatentT(pin_frames))
+        return "'" ++ field ++ "' holds fewer latent frames than its pin needs";
+    return null;
+}
+
 /// Video `[1,24,T,H,W]` / audio `[1,32,2,Ta]` vs the request canvas (`null` = ok).
 pub fn refineInitGeometryError(v_n: usize, v_c: u32, v_t: u32, v_h: u32, v_w: u32, a_t: u32, width: u32, height: u32, frames: u32) ?[]const u8 {
     if (v_n != 5 or v_c != 24) return "'latent_init_path' video_latent must be [1, 24, T, H, W]";
@@ -3641,13 +3651,12 @@ pub fn upscaleOnlyRequestError(has_init: bool, has_upscale: bool, has_out: bool,
     return null;
 }
 
-pub fn refineRequestError(has_init: bool, has_upscale: bool, supports_fl2va: bool, chain_windows: u32, has_refs: bool, has_pins: bool, pdd: bool) ?[]const u8 {
+pub fn refineRequestError(has_init: bool, has_upscale: bool, supports_fl2va: bool, chain_windows: u32, has_refs: bool, pdd: bool) ?[]const u8 {
     if (!has_init and !has_upscale) return null;
     if (!has_init) return "latent_upscale requires latent_init_path";
     if (!supports_fl2va) return "latent refine is FL2VA only — load an FL2VA checkpoint";
     if (chain_windows > 1) return "latent refine does not support chain_windows > 1";
     if (has_refs) return "latent refine does not support references yet";
-    if (has_pins) return "latent refine does not support prefix/suffix pins yet";
     if (pdd) return "latent refine is not a PDD student schedule — omit refine on this pack";
     return null;
 }
@@ -4958,7 +4967,6 @@ fn generateOne(
             } else {
                 _ = mlx.mlx_array_free(audio_x);
                 audio_x = arows;
-                carry_audio = try contig(arows, s);
             }
         }
         log.info("[minimax-h3] refine from latent_init sigma0 {d:.4} (audio {s})\n", .{
@@ -5034,6 +5042,8 @@ fn generateOne(
             s,
         );
     }
+    // Captured AFTER the pin splice: every step restores it whole, so it carries the packed pin layout.
+    if (req.init_audio_latent != null and !req.refine_audio) carry_audio = try contig(audio_x, s);
 
     const max_t: f64 = if (req.pdd) |p| p.max_t else 1.0;
     const sigmas = if (req.refine_sigmas) |rs|
@@ -8622,11 +8632,13 @@ test "minimax h3: refine sigma list and start-sigma map" {
     try testing.expectEqual(@as(usize, 4), sched.len);
     try testing.expectApproxEqAbs(@as(f64, 0.9035), sched[0], 1e-12);
     try testing.expectEqual(@as(f64, 0), sched[sched.len - 1]);
-    try testing.expect(refineRequestError(true, false, true, 1, false, false, false) == null);
-    try testing.expectEqualStrings("latent_upscale requires latent_init_path", refineRequestError(false, true, true, 1, false, false, false).?);
-    try testing.expectEqualStrings("latent refine does not support chain_windows > 1", refineRequestError(true, false, true, 2, false, false, false).?);
-    try testing.expectEqualStrings("latent refine does not support references yet", refineRequestError(true, false, true, 1, true, false, false).?);
-    try testing.expectEqualStrings("latent refine does not support prefix/suffix pins yet", refineRequestError(true, false, true, 1, false, true, false).?);
+    try testing.expect(refineRequestError(true, false, true, 1, false, false) == null);
+    try testing.expectEqualStrings("latent_upscale requires latent_init_path", refineRequestError(false, true, true, 1, false, false).?);
+    try testing.expectEqualStrings("latent refine does not support chain_windows > 1", refineRequestError(true, false, true, 2, false, false).?);
+    try testing.expectEqualStrings("latent refine does not support references yet", refineRequestError(true, false, true, 1, true, false).?);
+    try testing.expect(refinePinGeometryError("latent_prefix_path", 4, 4, 2, 9, 5, 64, 64) == null);
+    try testing.expectEqualStrings("'latent_prefix_path' canvas must match the refine canvas (latent H×W × 16 = width×height)", refinePinGeometryError("latent_prefix_path", 2, 2, 2, 9, 5, 64, 64).?);
+    try testing.expectEqualStrings("'latent_suffix_path' holds fewer latent frames than its pin needs", refinePinGeometryError("latent_suffix_path", 4, 4, 1, 1, 22, 64, 64).?);
     try testing.expect(refineInitGeometryError(5, 24, temporalShape(5).latent_t, 4, 4, temporalShape(5).audio_t, 64, 64, 5) == null);
     try testing.expect(refineInitGeometryError(5, 24, 1, 8, 4, 1, 64, 64, 5) != null);
 }

@@ -681,8 +681,7 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     if (refs.items.len > h3.MAX_REF_TOTAL)
         return req.refuseFmt(.unsupported, "too many references", "too many references: at most {d} files across live refs and ref_mod_paths combined", .{h3.MAX_REF_TOTAL});
     const has_refs = has_refs_intent or refs.items.len > 0;
-    const has_pins = latent_prefix_frames > 0 or latent_suffix_frames > 0;
-    if (h3.refineRequestError(has_latent_init, has_latent_upscale, e.supports_fl2va, chain_windows, has_refs, has_pins, e.pdd != null)) |msg|
+    if (h3.refineRequestError(has_latent_init, has_latent_upscale, e.supports_fl2va, chain_windows, has_refs, e.pdd != null)) |msg|
         return Verdict.named(.unsupported, msg);
     var kf_has_first = false;
     var kf_has_last = false;
@@ -855,6 +854,13 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         const as = mlx.getShape(init_a.?);
         if (h3.refineInitGeometryError(vs.len, @intCast(vs[1]), @intCast(vs[2]), @intCast(vs[3]), @intCast(vs[4]), @intCast(as[3]), width, height, shape.frame_count)) |msg|
             return Verdict.named(.unsupported, msg);
+        inline for (.{ .{ "latent_prefix_path", prefix_v, prefix_a, latent_prefix_frames }, .{ "latent_suffix_path", suffix_v, suffix_a, latent_suffix_frames } }) |p| {
+            if (p[1]) |pv| {
+                const ps = mlx.getShape(pv);
+                if (h3.refinePinGeometryError(p[0], @intCast(ps[3]), @intCast(ps[4]), @intCast(ps[2]), @intCast(mlx.getShape(p[2].?)[3]), p[3], width, height)) |msg|
+                    return Verdict.named(.unsupported, msg);
+            }
+        }
     }
 
     var res = h3.generate(gpa, io, paths, .{
@@ -1500,7 +1506,90 @@ test "minimax_h3 plugin: refine:false upscales any latent T to latent_out, carri
     try testing.expectEqualStrings("'refine' must be true or false", (try pack.run("{\"refine\":0}")).refused.why.slice());
 }
 
-const tiny_ref_png_b64 ="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR42mMQEREBAAB8AD2sffR3AAAAAElFTkSuQmCC";
+/// `x[lo..hi)` on `axis` (owned).
+fn sliceAt(x: A, axis: usize, lo: c_int, hi: c_int) !A {
+    const sh = mlx.getShape(x);
+    var start: [5]c_int = @splat(0);
+    var stop: [5]c_int = @splat(0);
+    const step1: [5]c_int = @splat(1);
+    for (sh, 0..) |d, i| stop[i] = d;
+    start[axis] = lo;
+    stop[axis] = hi;
+    var out = mlx.mlx_array_new();
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    try mlx.check(mlx.mlx_slice(&out, x, &start, sh.len, &stop, sh.len, &step1, sh.len, s));
+    return out;
+}
+
+fn expectSameSlices(a: A, axis: usize, a_lo: c_int, b: A, b_lo: c_int, n: c_int) !void {
+    const x = try sliceAt(a, axis, a_lo, a_lo + n);
+    defer _ = mlx.mlx_array_free(x);
+    const y = try sliceAt(b, axis, b_lo, b_lo + n);
+    defer _ = mlx.mlx_array_free(y);
+    try expectSameArray(x, y);
+}
+
+const SidecarPaths = struct { a: [:0]u8, b: [:0]u8, c: [:0]u8 };
+
+fn sidecarPaths(aa: std.mem.Allocator, tmp: *testing.TmpDir) !SidecarPaths {
+    const buf = try aa.alloc(u8, std.fs.max_path_bytes);
+    const root = buf[0..try tmp.dir.realPath(testing.io, buf)];
+    return .{
+        .a = try std.fmt.allocPrintSentinel(aa, "{s}/a.safetensors", .{root}, 0),
+        .b = try std.fmt.allocPrintSentinel(aa, "{s}/b.safetensors", .{root}, 0),
+        .c = try std.fmt.allocPrintSentinel(aa, "{s}/c.safetensors", .{root}, 0),
+    };
+}
+
+/// B (refined from A, pinned to A's tail and head) holds A's pinned latents exactly, and A's audio between them.
+fn expectPinnedRefine(aa: std.mem.Allocator, p: SidecarPaths, s: mlx.mlx_stream) !void {
+    const a = try h3.loadLatentSidecar(aa, p.a.ptr, s);
+    defer _ = mlx.mlx_array_free(a.video);
+    defer _ = mlx.mlx_array_free(a.audio);
+    const b = try h3.loadLatentSidecar(aa, p.b.ptr, s);
+    defer _ = mlx.mlx_array_free(b.video);
+    defer _ = mlx.mlx_array_free(b.audio);
+    const t: c_int = mlx.getShape(a.video)[2];
+    const ta: c_int = mlx.getShape(a.audio)[3];
+    const pv: c_int = @intCast(h3.overlapVideoLatentT(5));
+    const pa: c_int = @intCast(h3.overlapAudioLatentT(5));
+    try expectSameSlices(a.video, 2, t - pv, b.video, 0, pv);
+    try expectSameSlices(a.video, 2, 0, b.video, t - pv, pv);
+    try expectSameSlices(a.audio, 3, ta - pa, b.audio, 0, pa);
+    try expectSameSlices(a.audio, 3, pa, b.audio, pa, ta - 2 * pa);
+    try expectSameSlices(a.audio, 3, 0, b.audio, ta - pa, pa);
+}
+
+const refine_window = "\"prompt\":\"a red ball rolls\",\"width\":64,\"height\":64,\"steps\":2,\"seed\":4,\"fast\":false,\"refine_sigmas\":[0.5,0.2,0]";
+
+test "minimax_h3 plugin: a refine window keeps its prefix and suffix pins exact and carries the init audio between them" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var pack = try MediaPack.open(aa);
+    defer pack.close();
+    const p = try sidecarPaths(aa, &pack.tmp);
+    const draft = try std.fmt.allocPrint(aa, "{{\"prompt\":\"a red ball rolls\",\"width\":64,\"height\":64,\"num_frames\":39,\"steps\":2,\"seed\":3,\"fast\":false,\"latent_out\":\"{s}\"}}", .{p.a});
+    _ = (try pack.run(draft)).ok;
+    const refine = try std.fmt.allocPrint(aa, "{{{s},\"num_frames\":39,\"latent_init_path\":\"{s}\",\"latent_prefix_frames\":5,\"latent_prefix_path\":\"{s}\",\"latent_suffix_frames\":5,\"latent_suffix_path\":\"{s}\",\"latent_out\":\"{s}\"}}", .{ refine_window, p.a, p.a, p.a, p.b });
+    _ = (try pack.run(refine)).ok;
+    try expectPinnedRefine(aa, p, pack.stream);
+
+    // The init covers the whole window, pins included; a pin sidecar sits on the window's grid.
+    const short = try std.fmt.allocPrint(aa, "{{{s},\"num_frames\":22,\"latent_init_path\":\"{s}\",\"latent_prefix_frames\":5,\"latent_prefix_path\":\"{s}\"}}", .{ refine_window, p.a, p.a });
+    try testing.expectEqualStrings("'latent_init_path' frame count must match num_frames", (try pack.run(short)).refused.why.slice());
+    const shape = h3.temporalShape(39);
+    const big_v = try rampArray(&.{ 1, 24, @intCast(shape.latent_t), 8, 8 }, 1.0);
+    defer _ = mlx.mlx_array_free(big_v);
+    const big_a = try rampArray(&.{ 1, 32, 2, @intCast(shape.audio_t) }, 0.5);
+    defer _ = mlx.mlx_array_free(big_a);
+    try h3.saveLatentSidecar(p.c.ptr, big_v, big_a, pack.stream);
+    const wide = try std.fmt.allocPrint(aa, "{{\"prompt\":\"x\",\"width\":128,\"height\":128,\"steps\":2,\"refine_sigmas\":[0.5,0],\"num_frames\":39,\"latent_init_path\":\"{s}\",\"latent_prefix_frames\":5,\"latent_prefix_path\":\"{s}\"}}", .{ p.c, p.a });
+    try testing.expectEqualStrings("'latent_prefix_path' canvas must match the refine canvas (latent H×W × 16 = width×height)", (try pack.run(wide)).refused.why.slice());
+}
+
+const tiny_ref_png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR42mMQEREBAAB8AD2sffR3AAAAAElFTkSuQmCC";
 
 test "minimax_h3 plugin: ref compat and latent_out parent refuse before reference decode" {
     const hybrid_table = table;
