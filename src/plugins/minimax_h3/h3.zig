@@ -3631,6 +3631,16 @@ pub fn refineInitGeometryError(v_n: usize, v_c: u32, v_t: u32, v_h: u32, v_w: u3
     return null;
 }
 
+/// `"refine": false`: upscale the init sidecar to `latent_out` and stop (`null` = ok). Nothing a DiT would read rides it.
+pub fn upscaleOnlyRequestError(has_init: bool, has_upscale: bool, has_out: bool, has_schedule: bool, has_conditions: bool) ?[]const u8 {
+    if (!has_init) return "refine:false (upscale only) needs latent_init_path";
+    if (!has_upscale) return "refine:false (upscale only) needs latent_upscale";
+    if (!has_out) return "refine:false (upscale only) needs latent_out";
+    if (has_schedule) return "refine:false (upscale only) takes no refine_sigmas, refine_start_sigma or refine_audio";
+    if (has_conditions) return "refine:false (upscale only) takes no pins, references, keyframes or chain_windows";
+    return null;
+}
+
 pub fn refineRequestError(has_init: bool, has_upscale: bool, supports_fl2va: bool, chain_windows: u32, has_refs: bool, has_pins: bool, pdd: bool) ?[]const u8 {
     if (!has_init and !has_upscale) return null;
     if (!has_init) return "latent_upscale requires latent_init_path";

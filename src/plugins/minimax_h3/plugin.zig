@@ -431,11 +431,135 @@ fn residentFor(e: *Engine, dir: *const abi.PackDir, activations: u64, mem: Mem) 
     return .{ .r = &e.resident, .bytes = need };
 }
 
+const UpscaleSpec = struct { tier: u32 = 1, factor: ?f64 = null };
+
+/// `latent_upscale` `{factor?, tier?}` (the target canvas is the request's width/height).
+fn parseUpscale(b: *const job.Body, out: *UpscaleSpec) ?Verdict {
+    const uv = b.get("latent_upscale").?;
+    if (uv != .object) return bad("'latent_upscale' must be an object with factor or width+height");
+    const o = uv.object;
+    if (o.get("tier")) |t| {
+        const n: i64 = switch (t) {
+            .integer => |i| i,
+            else => return bad("'latent_upscale.tier' must be an integer 1–6"),
+        };
+        if (n < 1 or n > 6) return bad("'latent_upscale.tier' must be an integer 1–6");
+        out.tier = @intCast(n);
+    }
+    if (o.get("factor")) |f| {
+        out.factor = switch (f) {
+            .float => |x| x,
+            .integer => |n| @floatFromInt(n),
+            else => return bad("'latent_upscale.factor' must be a number in [1, 4]"),
+        };
+        if (out.factor.? < upscaler.SCALE_MIN or out.factor.? > upscaler.SCALE_MAX)
+            return bad("'latent_upscale.factor' must be a number in [1, 4]");
+    }
+    return null;
+}
+
+const UPSCALER_MISSING = "latent_upscale weights not found — pass --h3-upscaler or put a 2D v1 safetensors in the pack's latent_upscaler/";
+
+/// `"refine": false`: the init sidecar's video latent through LatentResizer2D to the target grid, written to
+/// `latent_out` with its audio copied through. No DiT and any latent T, so the upscaler's temporal chunks run across a
+/// whole run of joined takes. The target is the request's width/height, else the factor times the sidecar's grid.
+fn upscaleOnly(e: *Engine, req: *const abi.Request, b: *const job.Body) Verdict {
+    const init_raw = b.str("latent_init_path") orelse "";
+    const out_raw = b.str("latent_out") orelse "";
+    const has_schedule = fieldSet(b, "refine_sigmas") or fieldSet(b, "refine_start_sigma") or fieldSet(b, "refine_audio");
+    const has_conditions = for ([_][]const u8{
+        "latent_prefix_frames", "latent_suffix_frames", "latent_prefix_path", "latent_suffix_path",
+        "ref_images",           "ref_videos",           "ref_audios",         "ref_mod_paths",
+        "first_frame_image",    "last_frame_image",     "chain_windows",
+    }) |k| {
+        if (fieldSet(b, k)) break true;
+    } else false;
+    if (h3.upscaleOnlyRequestError(init_raw.len > 0, fieldSet(b, "latent_upscale"), out_raw.len > 0, has_schedule, has_conditions)) |msg|
+        return Verdict.named(.unsupported, msg);
+    var up: UpscaleSpec = .{};
+    if (parseUpscale(b, &up)) |v| return v;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    if (!std.fs.path.isAbsolute(init_raw)) return bad("'latent_init_path' must be an absolute path");
+    if (!std.fs.path.isAbsolute(out_raw)) return bad("'latent_out' must be an absolute path");
+    const parent = std.fs.path.dirname(out_raw) orelse return bad("'latent_out' must be an absolute path");
+    (std.Io.Dir.openDirAbsolute(io, parent, .{}) catch return bad("'latent_out' parent directory does not exist")).close(io);
+    const wpath = (upscaler.resolvePath(gpa, e.model_dir) catch return bad(UPSCALER_MISSING)) orelse return bad(UPSCALER_MISSING);
+    defer gpa.free(wpath);
+
+    const s = e.stream;
+    const init_z = gpa.dupeSentinel(u8, init_raw, 0) catch return job.failure(error.OutOfMemory, "out of memory");
+    defer gpa.free(init_z);
+    const loaded = h3.loadLatentSidecar(gpa, init_z, s) catch |err| return switch (err) {
+        error.BadLatentSidecarPack => bad("'latent_init_path' sidecar must declare pack fl2va"),
+        error.MissingVideoLatent => bad("'latent_init_path' sidecar missing video_latent"),
+        error.MissingAudioLatent => bad("'latent_init_path' sidecar missing audio_latent"),
+        else => bad("'latent_init_path' could not be loaded"),
+    };
+    defer _ = mlx.mlx_array_free(loaded.video);
+    defer _ = mlx.mlx_array_free(loaded.audio);
+    const vs = mlx.getShape(loaded.video);
+    if (vs.len != 5 or vs[1] != upscaler.IN_CH) return bad("'latent_init_path' video_latent must be [1, 24, T, H, W]");
+    const lat_t: u32 = @intCast(vs[2]);
+    const src_h: u32 = @intCast(vs[3]);
+    const src_w: u32 = @intCast(vs[4]);
+    var dst_h: u32 = undefined;
+    var dst_w: u32 = undefined;
+    if (fieldSet(b, "width") or fieldSet(b, "height")) {
+        const width = u32Field(b, "width", 0);
+        const height = u32Field(b, "height", 0);
+        if (width == 0 or height == 0 or width % 32 != 0 or height % 32 != 0) return bad("width and height must be multiples of 32");
+        dst_h = height / h3.VAE_SPATIAL;
+        dst_w = width / h3.VAE_SPATIAL;
+        if (up.factor) |f| if (@round(@as(f64, @floatFromInt(src_h)) * f) != @as(f64, @floatFromInt(dst_h)) or
+            @round(@as(f64, @floatFromInt(src_w)) * f) != @as(f64, @floatFromInt(dst_w)))
+            return bad("'latent_upscale.factor' does not match request width/height");
+    } else {
+        const f = up.factor orelse return bad("refine:false (upscale only) needs width+height or latent_upscale.factor");
+        dst_h = @intFromFloat(@round(@as(f64, @floatFromInt(src_h)) * f));
+        dst_w = @intFromFloat(@round(@as(f64, @floatFromInt(src_w)) * f));
+        if (dst_h % 2 != 0 or dst_w % 2 != 0) return bad("latent_upscale.factor must land on width and height multiples of 32");
+    }
+
+    // The upscaler's chunk working set plus the whole run in and out (f32), against live memory.
+    const run_bytes = @as(u64, lat_t) * upscaler.IN_CH * 4 * (@as(u64, src_h) * src_w + 2 * @as(u64, dst_h) * dst_w);
+    const need = upscaler.workingSetBytes(0, dst_h, dst_w, lat_t) + run_bytes;
+    const mem = memNow(req);
+    const avail = config.availBytes(mem.host_avail, mem.gpu_limit, mem.gpu_active);
+    if (avail > 0 and need > avail and !abi.skipMemPreflight(req.machine orelse &abi.Machine{})) {
+        const gb = 1024.0 * 1024.0 * 1024.0;
+        return req.refuseFmt(.unsupported, "the latent upscale does not fit in memory: upscale fewer frames", "latent upscale of {d} latent frames to {d}x{d} needs ~{d:.1} GB but {d:.1} GB is available: upscale fewer frames", .{
+            lat_t, dst_w * h3.VAE_SPATIAL, dst_h * h3.VAE_SPATIAL, @as(f64, @floatFromInt(need)) / gb, @as(f64, @floatFromInt(avail)) / gb,
+        });
+    }
+
+    var um = upscaler.Model.load(gpa, wpath) catch return bad("latent_upscale weights could not be loaded");
+    defer um.deinit();
+    const scaled = um.forward(gpa, loaded.video, dst_h, dst_w, up.tier, s) catch |err| return job.failure(err, "MiniMax-H3 latent upscale failed");
+    defer _ = mlx.mlx_array_free(scaled);
+    const out_z = gpa.dupeSentinel(u8, out_raw, 0) catch return job.failure(error.OutOfMemory, "out of memory");
+    defer gpa.free(out_z);
+    h3.saveLatentSidecar(out_z, scaled, loaded.audio, s) catch return Verdict.refuse(.failed, "MiniMax-H3 failed to write latent_out");
+    log.info("[minimax-h3] latent upscale only: {d} latent frames {d}x{d} -> {d}x{d} (tier {d}), audio carried\n", .{ lat_t, src_w, src_h, dst_w, dst_h, up.tier });
+
+    var esc: std.ArrayList(u8) = .empty;
+    defer esc.deinit(gpa);
+    appendJsonEscaped(gpa, &esc, out_raw) catch return job.failure(error.OutOfMemory, "out of memory");
+    const members = std.fmt.allocPrint(gpa, "\"latent_out\":\"{s}\",\"latent_t\":{d},\"width\":{d},\"height\":{d}", .{ esc.items, lat_t, dst_w * h3.VAE_SPATIAL, dst_h * h3.VAE_SPATIAL }) catch
+        return job.failure(error.OutOfMemory, "out of memory");
+    gpa.free(e.result);
+    e.result = members;
+    return .ok;
+}
+
 fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) callconv(.c) Verdict {
     const e: *Engine = @ptrCast(@alignCast(ep));
     const dir = req.dir orelse return Verdict.refuse(.failed, "minimax_h3: the host gave no pack dir");
     var b = job.Body.parse(gpa, req.body.slice()) orelse return bad("invalid JSON body");
     defer b.deinit();
+    if (b.get("refine")) |v| {
+        if (v != .bool) return bad("'refine' must be true or false");
+        if (!v.bool) return upscaleOnly(e, req, &b);
+    }
     const prompt = b.str("prompt") orelse return bad("missing 'prompt'");
     if (prompt.len == 0) return bad("empty 'prompt'");
     // `cfg_scale` / `stg_scale` / `pipeline` are ignored, not refused: the app sends them for every video backend and
@@ -496,30 +620,10 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     }
     if ((refine_sigmas != null or refine_audio or has_latent_upscale) and !has_latent_init)
         return bad("latent_init_path is required for refine / latent_upscale");
-    var up_tier: u32 = 1;
-    var up_factor: ?f64 = null;
-    if (has_latent_upscale) {
-        const uv = b.get("latent_upscale").?;
-        if (uv != .object) return bad("'latent_upscale' must be an object with factor or width+height");
-        const o = uv.object;
-        if (o.get("tier")) |t| {
-            const n: i64 = switch (t) {
-                .integer => |i| i,
-                else => return bad("'latent_upscale.tier' must be an integer 1–6"),
-            };
-            if (n < 1 or n > 6) return bad("'latent_upscale.tier' must be an integer 1–6");
-            up_tier = @intCast(n);
-        }
-        if (o.get("factor")) |f| {
-            up_factor = switch (f) {
-                .float => |x| x,
-                .integer => |n| @floatFromInt(n),
-                else => return bad("'latent_upscale.factor' must be a number in [1, 4]"),
-            };
-            if (up_factor.? < upscaler.SCALE_MIN or up_factor.? > upscaler.SCALE_MAX)
-                return bad("'latent_upscale.factor' must be a number in [1, 4]");
-        }
-    }
+    var up: UpscaleSpec = .{};
+    if (has_latent_upscale) if (parseUpscale(&b, &up)) |v| return v;
+    const up_tier = up.tier;
+    const up_factor = up.factor;
     const has_latent_out = latent_out_raw != null and latent_out_raw.?.len > 0;
     const has_latent_prefix_path = latent_prefix_path_raw != null and latent_prefix_path_raw.?.len > 0;
     const has_latent_suffix_path = latent_suffix_path_raw != null and latent_suffix_path_raw.?.len > 0;
@@ -727,8 +831,7 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         init_v = loaded.video;
         init_a = loaded.audio;
         if (has_latent_upscale) {
-            const wpath = (upscaler.resolvePath(gpa, e.model_dir) catch return bad("latent_upscale weights not found — pass --h3-upscaler or put a 2D v1 safetensors in the pack's latent_upscaler/")) orelse
-                return bad("latent_upscale weights not found — pass --h3-upscaler or put a 2D v1 safetensors in the pack's latent_upscaler/");
+            const wpath = (upscaler.resolvePath(gpa, e.model_dir) catch return bad(UPSCALER_MISSING)) orelse return bad(UPSCALER_MISSING);
             defer gpa.free(wpath);
             var um = upscaler.Model.load(gpa, wpath) catch return bad("latent_upscale weights could not be loaded");
             defer um.deinit();
@@ -1299,7 +1402,105 @@ test "minimax_h3 plugin: refmods canvas gate skips width/height on voice extract
     try testing.expect(refmodsCanvasError(false, 256, 256) == null);
 }
 
-const tiny_ref_png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR42mMQEREBAAB8AD2sffR3AAAAAElFTkSuQmCC";
+/// The tiny pack's config and tokenizer plus a 32-wide LatentResizer2D (one in and one out block) and no DiT, text
+/// encoder or VAE files: an upscale-only job that reached any of them fails.
+fn upscaleOnlyFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
+    const C = 32;
+    var w = sdk.tensors.Tensors.init(a, 104);
+    try w.rand("resizer.conv_in.weight", .{}, &.{ C, 24, 3, 3 }, .F32, 0.05);
+    try w.rand("resizer.conv_in.bias", .{}, &.{C}, .F32, 0.05);
+    try w.rand("resizer.embed.linear.0.weight", .{}, &.{ C, 96 }, .F32, 0.05);
+    try w.rand("resizer.embed.linear.2.weight", .{}, &.{ C, C }, .F32, 0.05);
+    inline for (.{ "resizer.in_blocks.0", "resizer.out_blocks.0" }) |p| {
+        inline for (.{ ".in_layers.0", ".out_norm" }) |n| {
+            try w.fill(p ++ n ++ ".weight", .{}, &.{C}, .F32, 1);
+            try w.fill(p ++ n ++ ".bias", .{}, &.{C}, .F32, 0);
+        }
+        try w.rand(p ++ ".in_layers.2.weight", .{}, &.{ C, C, 3, 3 }, .F32, 0.05);
+        try w.rand(p ++ ".out_layers.2.weight", .{}, &.{ C, C, 3, 3 }, .F32, 0.05);
+        try w.rand(p ++ ".emb_layers.1.weight", .{}, &.{ 2 * C, C }, .F32, 0.05);
+    }
+    try w.fill("resizer.norm_out.weight", .{}, &.{C}, .F32, 1);
+    try w.fill("resizer.norm_out.bias", .{}, &.{C}, .F32, 0);
+    try w.rand("resizer.conv_out.weight", .{}, &.{ 24, C, 3, 3 }, .F32, 0.05);
+    const fx = try conformanceFixture(a);
+    var files: std.ArrayList(sdk.fixture.File) = .empty;
+    for (fx.files) |f| if (!std.mem.endsWith(u8, f.name, ".safetensors")) try files.append(a, f);
+    try files.append(a, .{ .name = "latent_upscaler/tiny.safetensors", .bytes = try w.bytes() });
+    return .{ .files = try files.toOwnedSlice(a), .body = fx.body };
+}
+
+/// A deterministic `[shape]` f32 ramp (owned).
+fn rampArray(shape: []const c_int, scale: f32) !A {
+    var n: usize = 1;
+    for (shape) |d| n *= @intCast(d);
+    const buf = try testing.allocator.alloc(f32, n);
+    defer testing.allocator.free(buf);
+    for (buf, 0..) |*v, i| v.* = scale * @as(f32, @floatFromInt(@as(i64, @intCast(i % 97)) - 48)) / 48.0;
+    return mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float32);
+}
+
+fn expectSameArray(want: A, got: A) !void {
+    try testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, want, got, false, s));
+    try mlx.check(mlx.mlx_array_eval(eq));
+    var same = false;
+    try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+    try testing.expect(same);
+}
+
+test "minimax_h3 plugin: refine:false upscales any latent T to latent_out, carries the audio, and never needs the DiT" {
+    const up_table = table;
+    const UpOnly = struct {
+        pub const plugin = config.plugin;
+        pub const table = up_table;
+        pub const conformanceFixture = upscaleOnlyFixture;
+    };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var pack = try @import("../../sdk/testing/media_pack.zig").MediaPack(UpOnly).open(aa);
+    defer pack.close();
+    const root_buf = try aa.alloc(u8, std.fs.max_path_bytes);
+    const root = root_buf[0..try pack.tmp.dir.realPath(testing.io, root_buf)];
+    const init_path = try std.fmt.allocPrintSentinel(aa, "{s}/run.safetensors", .{root}, 0);
+    const out_path = try std.fmt.allocPrintSentinel(aa, "{s}/run_up.safetensors", .{root}, 0);
+
+    // 40 latent frames: off the 17k+5 grid and past one upscaler chunk.
+    const v = try rampArray(&.{ 1, 24, 40, 4, 4 }, 1.0);
+    defer _ = mlx.mlx_array_free(v);
+    const au = try rampArray(&.{ 1, 32, 2, 61 }, 0.5);
+    defer _ = mlx.mlx_array_free(au);
+    try h3.saveLatentSidecar(init_path.ptr, v, au, pack.stream);
+
+    const body = try std.fmt.allocPrint(aa, "{{\"refine\":false,\"latent_init_path\":\"{s}\",\"latent_upscale\":{{\"factor\":2,\"tier\":1}},\"latent_out\":\"{s}\"}}", .{ init_path, out_path });
+    const got = (try pack.run(body)).ok;
+    const want = try std.fmt.allocPrint(aa, "\"latent_out\":\"{s}\",\"latent_t\":40,\"width\":128,\"height\":128", .{out_path});
+    try testing.expectEqualStrings(want, got);
+    const out = try h3.loadLatentSidecar(aa, out_path.ptr, pack.stream);
+    defer _ = mlx.mlx_array_free(out.video);
+    defer _ = mlx.mlx_array_free(out.audio);
+    try testing.expectEqualSlices(c_int, &.{ 1, 24, 40, 8, 8 }, mlx.getShape(out.video));
+    try expectSameArray(au, out.audio);
+
+    const base = try std.fmt.allocPrint(aa, "\"refine\":false,\"latent_init_path\":\"{s}\",\"latent_upscale\":{{\"factor\":2}}", .{init_path});
+    inline for (.{
+        .{ "", "refine:false (upscale only) needs latent_out" },
+        .{ ",\"latent_out\":\"/tmp/x.safetensors\",\"refine_sigmas\":[0.5,0]", "refine:false (upscale only) takes no refine_sigmas, refine_start_sigma or refine_audio" },
+        .{ ",\"latent_out\":\"/tmp/x.safetensors\",\"latent_prefix_frames\":5", "refine:false (upscale only) takes no pins, references, keyframes or chain_windows" },
+        .{ ",\"latent_out\":\"/tmp/x.safetensors\",\"width\":96,\"height\":128", "'latent_upscale.factor' does not match request width/height" },
+    }) |c| {
+        const bad_body = try std.fmt.allocPrint(aa, "{{{s}{s}}}", .{ base, c[0] });
+        try testing.expectEqualStrings(c[1], (try pack.run(bad_body)).refused.why.slice());
+    }
+    try testing.expectEqualStrings("'refine' must be true or false", (try pack.run("{\"refine\":0}")).refused.why.slice());
+}
+
+const tiny_ref_png_b64 ="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR42mMQEREBAAB8AD2sffR3AAAAAElFTkSuQmCC";
 
 test "minimax_h3 plugin: ref compat and latent_out parent refuse before reference decode" {
     const hybrid_table = table;
