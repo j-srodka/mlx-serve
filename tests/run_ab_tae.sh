@@ -270,11 +270,12 @@ PY
 stop_server
 trap - EXIT
 
-if [[ "${RESTART_HYBRID_AFTER:-1}" != "0" && -x "$REPO/start-minimax-h3-hybrid.sh" ]]; then
+HYBRID="${H3_TOOLS_ROOT:-$REPO/../h3-tools}/start-minimax-h3-hybrid.sh"
+if [[ "${RESTART_HYBRID_AFTER:-1}" != "0" && -x "$HYBRID" ]]; then
   echo "=== Restarting hybrid mlx-serve on 11361 ===" >&2
   pkill -f 'mlx-serve.*--port 11361' 2>/dev/null || true
   sleep 2
-  nohup "$REPO/start-minimax-h3-hybrid.sh" >>"$HOME/.mlx-serve/logs/hybrid-11361-restart.log" 2>&1 &
+  nohup "$HYBRID" >>"$HOME/.mlx-serve/logs/hybrid-11361-restart.log" 2>&1 &
   for _ in $(seq 1 90); do
     if curl -sf "http://127.0.0.1:11361/health" >/dev/null 2>&1; then
       echo "hybrid health ok" >&2

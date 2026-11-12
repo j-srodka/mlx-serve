@@ -49,7 +49,7 @@ fi
 
 # Launchers and timeline tooling (live in ../h3-tools after hygiene split)
 need_tool start-minimax-h3.sh
-need start-minimax-h3-hybrid.sh
+need_tool start-minimax-h3-hybrid.sh
 need_tool start-minimax-h3-ref2va.sh
 need_tool h3_timeline.py
 need_tool generate_h3.py
