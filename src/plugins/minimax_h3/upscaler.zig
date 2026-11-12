@@ -390,7 +390,8 @@ fn embed(self: *const Model, scale_h: f64, scale_w: f64, tier: u32, rows: u32, s
     const dim = fourierInDim(self.arch.freq, self.arch.tier_dim);
     var code: [96]f32 = undefined;
     fourierCode(scale_h, scale_w, @floatFromInt(tier), self.arch.freq, self.arch.tier_dim, code[0..dim]);
-    const raw = mlx.mlx_array_new_data(code[0..dim].ptr, &[_]c_int{@intCast(dim)}, 1, .float32);
+    // [1, dim]: a 1-D code repeats along its only axis into one long row, not a row per frame.
+    const raw = mlx.mlx_array_new_data(code[0..dim].ptr, &[_]c_int{ 1, @intCast(dim) }, 2, .float32);
     defer _ = mlx.mlx_array_free(raw);
     const x1 = try linear(raw, try must(&self.w, "resizer.embed.linear.0.weight"), self.w.get("resizer.embed.linear.0.bias"), s);
     defer _ = mlx.mlx_array_free(x1);
@@ -974,6 +975,23 @@ test "minimax h3 upscaler: fourier code is sin/cos of 2^k without pi" {
     try testing.expectApproxEqAbs(@sin(1.5 * 1.0), buf[32], 1e-6);
     try testing.expectApproxEqAbs(@sin(0.0), buf[64], 1e-6); // tier-1 = 0
     try testing.expectApproxEqAbs(@cos(0.0), buf[80], 1e-6);
+}
+
+test "minimax h3 upscaler: the scale/tier embedding is one row per frame" {
+    const a = std.testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    const e: c_int = 4;
+    var w0: [4 * 96]f32 = @splat(0.01);
+    var w2: [4 * 4]f32 = @splat(0.02);
+    var model = Model{ .w = Weights.init(a), .arch = .{ .embed_dim = 4 }, .bytes = 0 };
+    defer model.deinit();
+    try model.w.put("resizer.embed.linear.0.weight", mlx.mlx_array_new_data(&w0, &[_]c_int{ e, 96 }, 2, .float32));
+    try model.w.put("resizer.embed.linear.2.weight", mlx.mlx_array_new_data(&w2, &[_]c_int{ e, e }, 2, .float32));
+    for ([_]u32{ 1, 37 }) |rows| {
+        const emb = try embed(&model, 2.0, 2.0, 1, rows, s);
+        defer _ = mlx.mlx_array_free(emb);
+        try testing.expectEqualSlices(c_int, &[_]c_int{ @intCast(rows), e }, mlx.getShape(emb));
+    }
 }
 
 test "minimax h3 upscaler: bilinear NHWC matches align_corners=False 1d" {
