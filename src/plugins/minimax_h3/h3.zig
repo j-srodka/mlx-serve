@@ -910,6 +910,20 @@ pub const PackedLayout = struct {
         unreachable;
     }
 
+    /// Rows the last layer emits for one stream: its target segment plus its pins, in packed order.
+    /// Zero only when the layout carries no rows for that stream at all — an image layout has no
+    /// audio rows, while a target whose pins take every row still has all of them.
+    pub fn streamRows(self: *const PackedLayout, kinds: []const SegmentKind) u32 {
+        var n: u32 = 0;
+        for (self.segments) |seg| {
+            for (kinds) |k| if (seg.kind == k) {
+                n += seg.end - seg.start;
+                break;
+            };
+        }
+        return n;
+    }
+
     /// The packed order as VSA reads it: one dense run per segment (keyframe rows as one run, as
     /// FastVideo packs them), each video segment as its grid. Caller frees.
     pub fn vsaSegments(self: *const PackedLayout, a: std.mem.Allocator) ![]h3_vsa.Seg {
@@ -2969,19 +2983,20 @@ pub const Model = struct {
         defer if (fmods_owned) for (&fmods) |*p| {
             _ = mlx.mlx_array_free(p.*);
         };
-        const vout = try concatTargetStreamHead(self, h, fmods, layout, plan, &.{ .video_pin, .video }, heads.video_w, heads.video_b, s);
-        errdefer _ = mlx.mlx_array_free(vout);
+        const video = blk: {
+            const vout = try concatTargetStreamHead(self, h, fmods, layout, plan, &.{ .video_pin, .video }, heads.video_w, heads.video_b, s);
+            defer _ = mlx.mlx_array_free(vout);
 
-        // The sampler integrates a flat ODE on the VIDEO schedule. Scaling the
-        // audio velocity by d(sigma_a)/d(sigma_v) makes that equal the audio
-        // stream's true ODE on its own schedule. Both are negated: the model
-        // predicts velocity, the sampler wants the denoise direction.
-        const negv = try scalarLike(-1.0, vout, s);
-        defer _ = mlx.mlx_array_free(negv);
-        const video = try mulA(vout, negv, s);
-        _ = mlx.mlx_array_free(vout);
+            // The sampler integrates a flat ODE on the VIDEO schedule. Scaling the
+            // audio velocity by d(sigma_a)/d(sigma_v) makes that equal the audio
+            // stream's true ODE on its own schedule. Both are negated: the model
+            // predicts velocity, the sampler wants the denoise direction.
+            const negv = try scalarLike(-1.0, vout, s);
+            defer _ = mlx.mlx_array_free(negv);
+            break :blk try mulA(vout, negv, s);
+        };
         errdefer _ = mlx.mlx_array_free(video);
-        if (layout.audio_update.len == 0) return .{ .video = video, .audio = .{ .ctx = null } };
+        if (layout.streamRows(&.{ .audio_pin, .audio }) == 0) return .{ .video = video, .audio = .{ .ctx = null } };
 
         const aout_raw = try concatTargetStreamHead(self, h, fmods, layout, plan, &.{ .audio_pin, .audio }, heads.audio_w, heads.audio_b, s);
         defer _ = mlx.mlx_array_free(aout_raw);
@@ -7707,25 +7722,32 @@ test "minimax h3: latent pin rows use conditioning timesteps, not generation noi
     }
 }
 
-test "minimax h3: pins covering every audio row still leave the rows for the last layer" {
+test "minimax h3: the last layer emits every audio row a layout carries" {
     const a = testing.allocator;
     const shape = temporalShape(5);
     const p = shape.audio_t / 2;
-    // No free audio segment at all: prefix + suffix take every row, so `initFull`
-    // appends no `.audio` segment. The rows exist, so the forward must still emit
-    // the audio stream — only an image layout has none, and it is the layout whose
-    // `audio_update` is empty.
-    var full = try PackedLayout.initFull(a, 8, shape.latent_t, 4, 4, shape.audio_t, &.{}, 5, &.{}, 0, 0, p, shape.audio_t - p);
-    defer full.deinit();
+    const audio_kinds = [_]SegmentKind{ .audio_pin, .audio };
+
+    // Pins take EVERY row: no free `.audio` segment exists, and the head still emits the stream.
+    var pinned = try PackedLayout.initFull(a, 8, shape.latent_t, 4, 4, shape.audio_t, &.{}, 5, &.{}, 0, 0, p, shape.audio_t - p);
+    defer pinned.deinit();
     var free_audio: u32 = 0;
-    for (full.segments) |seg| {
+    for (pinned.segments) |seg| {
         if (seg.kind == .audio) free_audio += 1;
     }
     try testing.expectEqual(@as(u32, 0), free_audio);
-    try testing.expectEqual(shape.audio_t * 2, @as(u32, @intCast(full.audio_update.len)));
+    try testing.expectEqual(shape.audio_t * 2, pinned.streamRows(&audio_kinds));
 
+    // A free segment and its pins together are every row, in packed order.
+    var partly = try PackedLayout.initFull(a, 8, shape.latent_t, 4, 4, shape.audio_t, &.{}, 5, &.{}, 0, 0, p, 0);
+    defer partly.deinit();
+    try testing.expectEqual(shape.audio_t * 2, partly.streamRows(&audio_kinds));
+
+    // An image layout is the only one with nothing to emit — and it is also the only one with no
+    // audio rows at all, so the row count and the early return cannot disagree.
     var image = try PackedLayout.initFull(a, 8, 1, 4, 4, 0, &.{}, 1, &.{}, 0, 0, 0, 0);
     defer image.deinit();
+    try testing.expectEqual(@as(u32, 0), image.streamRows(&audio_kinds));
     try testing.expectEqual(@as(usize, 0), image.audio_update.len);
 }
 
