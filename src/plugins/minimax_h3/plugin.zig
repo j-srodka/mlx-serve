@@ -460,6 +460,39 @@ fn parseUpscale(b: *const job.Body, out: *UpscaleSpec) ?Verdict {
 
 const UPSCALER_MISSING = "latent_upscale weights not found — pass --h3-upscaler or put a 2D v1 safetensors in the pack's latent_upscaler/";
 
+const parseAudioHoldError = error{ BadAudioHold, TooManyAudioHolds };
+
+fn jsonU32Field(v: std.json.Value) ?u32 {
+    return switch (v) {
+        .integer => |n| if (n < 0) null else @intCast(n),
+        .float => |f| if (f < 0) null else @intFromFloat(f),
+        else => null,
+    };
+}
+
+fn parseAudioHolds(b: *const job.Body, buf: *[8]h3.AudioHoldRange) parseAudioHoldError![]const h3.AudioHoldRange {
+    const v = b.get("audio_hold") orelse return &.{};
+    if (v != .array) return error.BadAudioHold;
+    if (v.array.items.len > buf.len) return error.TooManyAudioHolds;
+    for (v.array.items, 0..) |item, i| {
+        switch (item) {
+            .array => |arr| {
+                if (arr.items.len != 2) return error.BadAudioHold;
+                const a = jsonU32Field(arr.items[0]) orelse return error.BadAudioHold;
+                const hi = jsonU32Field(arr.items[1]) orelse return error.BadAudioHold;
+                buf[i] = .{ .start = a, .end = hi };
+            },
+            .object => |o| {
+                const a = jsonU32Field(o.get("start") orelse return error.BadAudioHold) orelse return error.BadAudioHold;
+                const hi = jsonU32Field(o.get("end") orelse return error.BadAudioHold) orelse return error.BadAudioHold;
+                buf[i] = .{ .start = a, .end = hi };
+            },
+            else => return error.BadAudioHold,
+        }
+    }
+    return buf[0..v.array.items.len];
+}
+
 /// `"refine": false`: the init sidecar's video latent through LatentResizer2D to the target grid, written to
 /// `latent_out` with its audio copied through. No DiT and any latent T, so the upscaler's temporal chunks run across a
 /// whole run of joined takes. The target is the request's width/height, else the factor times the sidecar's grid.
@@ -472,6 +505,7 @@ fn upscaleOnly(e: *Engine, req: *const abi.Request, b: *const job.Body) Verdict 
         "ref_images",           "ref_videos",           "ref_audios",         "ref_mod_paths",
         "first_frame_image",    "last_frame_image",     "chain_windows",
         "latent_mask_path",     "mask_hold",            "mask_feather",
+        "audio_only",           "audio_hold",
     }) |k| {
         if (fieldSet(b, k)) break true;
     } else false;
@@ -572,6 +606,7 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
             "latent_prefix_frames", "latent_suffix_frames", "latent_prefix_path", "latent_suffix_path", "latent_init_path",
             "latent_upscale",       "ref_images",      "ref_videos",      "ref_audios",        "ref_mod_paths",
             "first_frame_image",    "last_frame_image", "turbo",          "lora_paths",        "lora_scales",
+            "audio_only",           "audio_hold",
         }) |field| {
             if (fieldSet(&b, field)) return bad("'" ++ field ++ "' is not supported with 'encode_only'");
         }
@@ -593,6 +628,13 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     // `cfg_scale` / `stg_scale` / `pipeline` are ignored, not refused: the app sends them for every video backend and
     // H3 is CFG-distilled and single-pipeline, so there is nothing they could have selected.
 
+    const audio_only = b.flag("audio_only");
+    var audio_hold_buf: [8]h3.AudioHoldRange = undefined;
+    const audio_holds = parseAudioHolds(&b, &audio_hold_buf) catch |msg| return switch (msg) {
+        error.BadAudioHold => bad("'audio_hold' must be an array of [start, end] source-frame ranges"),
+        error.TooManyAudioHolds => bad("too many audio_hold ranges (max 8)"),
+    };
+    var audio_only_steps_snap_from: ?u32 = null;
     const turbo = b.flag("turbo");
     const pdd_steps: ?u32 = if (e.pdd) |p| p.steps() else null;
     const two_time = if (e.geometry.two_time) |*tt| tt else null;
@@ -602,7 +644,17 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
 
     const width = u32Field(&b, "width", 256);
     const height = u32Field(&b, "height", 256);
-    const steps = if (pdd_steps) |n|
+    const steps = if (audio_only) ao: {
+        if (b.get("steps")) |v| {
+            const raw: u32 = switch (v) {
+                .integer => |n| @intCast(n),
+                .float => |f| @intFromFloat(f),
+                else => return bad("'steps' must be in [1,100]"),
+            };
+            if (raw != h3.AUDIO_ONLY_STEPS) audio_only_steps_snap_from = raw;
+        }
+        break :ao h3.AUDIO_ONLY_STEPS;
+    } else if (pdd_steps) |n|
         stepsIn(&b, n, n, n) orelse return req.refuseFmt(.unsupported, "this pack runs a fixed step count — omit 'steps'", "this pack is a distilled student that runs exactly {d} steps — omit 'steps' or send {d}", .{ n, n })
     else if (two_time) |tt| tts: {
         const n = stepsIn(&b, tt.default_steps, 1, h3.TwoTime.MAX_STEPS) orelse 0;
@@ -658,8 +710,10 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     }
     if (h3.editMaskRequestError(has_latent_mask, has_latent_init, chain_windows, mask_hold_raw)) |msg|
         return Verdict.named(.unsupported, msg);
+    if (audio_only and !has_latent_init) return bad("audio_only requires latent_init_path");
     if ((refine_sigmas != null or refine_audio or has_latent_upscale or has_latent_mask) and !has_latent_init)
         return bad("latent_init_path is required for refine / latent_upscale");
+    if (audio_only and refine_sigmas != null) return Verdict.named(.unsupported, "audio_only takes a fixed 9-point audio schedule — omit refine_sigmas");
     var up: UpscaleSpec = .{};
     if (has_latent_upscale) if (parseUpscale(&b, &up)) |v| return v;
     const up_tier = up.tier;
@@ -670,6 +724,16 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
 
     // Snapped to the model's own ladder, and said so: a silently different length drifts the client's audio mux.
     const shape = h3.temporalShape(requested_frames);
+    if (h3.audioOnlyRequestError(
+        audio_only,
+        has_latent_init,
+        chain_windows,
+        latent_prefix_frames,
+        latent_suffix_frames,
+        refine_sigmas != null or b.float("refine_start_sigma") != null or refine_audio,
+        audio_holds,
+        shape.audio_t,
+    )) |msg| return Verdict.named(.unsupported, msg);
     if (h3.latentPrefixRequestError(latent_prefix_frames, chain_windows, shape.frame_count, e.supports_fl2va, has_latent_prefix_path)) |msg| return Verdict.named(.unsupported, msg);
     if (h3.latentSuffixRequestError(latent_suffix_frames, chain_windows, shape.frame_count, e.supports_fl2va, has_latent_suffix_path)) |msg| return Verdict.named(.unsupported, msg);
     if (h3.latentPinWindowError(latent_prefix_frames, latent_suffix_frames, shape.frame_count)) |msg| return Verdict.named(.unsupported, msg);
@@ -739,7 +803,7 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
 
     // The request's own activations price the resident plan; when it does not fit, the staged DiT stage is checked
     // here, before any stage loads, since a Metal OOM mid-step is uncatchable.
-    const distilled = turbo or pdd_steps != null or two_time != null;
+    const distilled = turbo or pdd_steps != null or two_time != null or audio_only;
     const fast: ?bool = if (b.get("fast")) |v| (if (v == .bool) v.bool else null) else null;
     const speed = h3.resolveSpeed(fast, distilled);
     const bcast_row: u64 = if (speed.bcast_k > 0) @as(u64, e.geometry.dit.num_layers) * e.geometry.dit.hidden_size * 2 else 0;
@@ -985,6 +1049,9 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         .mask_hold = mask_hold,
         .refine_sigmas = refine_sigmas,
         .refine_audio = refine_audio,
+        .audio_only = audio_only,
+        .audio_holds = audio_holds,
+        .audio_only_steps_snap_from = audio_only_steps_snap_from,
         .keyframes = kfs.buf[0..kfs.n],
         .refs = refs.items,
     }, job.progressOf(progress), s) catch |err| return switch (err) {
@@ -1541,6 +1608,9 @@ test "minimax_h3 plugin: a seeded clip on the tiny pack is deterministic JSON me
         .{ "{\"prompt\":\"x\",\"latent_init_path\":\"/tmp/no_h3_init.safetensors\",\"latent_mask_path\":\"m.safetensors\"}", "'latent_mask_path' must be an absolute path" },
         .{ "{\"prompt\":\"x\",\"latent_init_path\":\"/tmp/no_h3_init.safetensors\",\"latent_mask_path\":\"/tmp/m.safetensors\",\"chain_windows\":2}", "latent refine edit mask does not support chain_windows > 1" },
         .{ "{\"prompt\":\"x\",\"latent_init_path\":\"/tmp/no_h3_init.safetensors\",\"latent_mask_path\":\"/tmp/m.safetensors\",\"mask_hold\":\"frozen\"}", "'mask_hold' must be \"clean\" or \"noisy\"" },
+        .{ "{\"prompt\":\"x\",\"audio_only\":true}", "audio_only requires latent_init_path" },
+        .{ "{\"prompt\":\"x\",\"audio_only\":true,\"latent_init_path\":\"/tmp/no_h3_init.safetensors\",\"chain_windows\":2}", "audio_only does not support chain_windows > 1" },
+        .{ "{\"prompt\":\"x\",\"audio_only\":true,\"latent_init_path\":\"/tmp/no_h3_init.safetensors\",\"latent_prefix_frames\":5}", "audio_only does not support latent_prefix_frames or latent_suffix_frames — use audio_hold for held audio tails" },
         .{ "{\"prompt\":\"x\",\"ref_images\":[\"AAAA\"]}", "this MiniMax-H3 pack does not support references (it declares no 'ref2va' task) — load a REF2VA checkpoint" },
         .{ "{\"prompt\":\"x\",\"turbo\":true}", "this pack has no turbo_lora.safetensors — download minimax_h3_turbo_4step_ema_ckpt850.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora (Apache-2.0) into the model folder as turbo_lora.safetensors" },
         .{ "{\"prompt\":\"x\",\"first_frame_image\":\"!!\"}", "keyframe image is not valid base64" },
@@ -1935,6 +2005,19 @@ fn expectSameSlices(a: A, axis: usize, a_lo: c_int, b: A, b_lo: c_int, n: c_int)
     try expectSameArray(x, y);
 }
 
+fn expectSlicesDiffer(a: A, b: A) !void {
+    try testing.expectEqualSlices(c_int, mlx.getShape(a), mlx.getShape(b));
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, a, b, false, s));
+    try mlx.check(mlx.mlx_array_eval(eq));
+    var same = false;
+    try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+    try testing.expect(!same);
+}
+
 const SidecarPaths = struct { a: [:0]u8, b: [:0]u8, c: [:0]u8, d: [:0]u8 };
 
 fn sidecarPaths(aa: std.mem.Allocator, tmp: *testing.TmpDir) !SidecarPaths {
@@ -2151,6 +2234,49 @@ test "minimax h3: mask feather applies only at the boundary" {
     try testing.expect(data[6] > 0 and data[6] < 1);
     try testing.expect(data[8] > 0 and data[8] < 1);
     try testing.expect(data[0] == 1);
+}
+
+test "minimax_h3 plugin: audio_only Re-voice holds video latents exact, snaps steps, respects audio_hold" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var pack = try MediaPack.open(aa);
+    defer pack.close();
+    const p = try sidecarPaths(aa, &pack.tmp);
+    const shape = h3.temporalShape(39);
+    const v = try rampArray(&.{ 1, 24, @intCast(shape.latent_t), 4, 4 }, 2.0);
+    defer _ = mlx.mlx_array_free(v);
+    const au = try rampArray(&.{ 1, 32, 2, @intCast(shape.audio_t) }, 1.0);
+    defer _ = mlx.mlx_array_free(au);
+    try h3.saveLatentSidecar(p.a.ptr, v, au, pack.stream);
+    const body = try std.fmt.allocPrint(aa, "{{\"prompt\":\"a red ball rolls\",\"width\":64,\"height\":64,\"num_frames\":39,\"steps\":30,\"seed\":7,\"audio_only\":true,\"audio_hold\":[[0,10]],\"latent_init_path\":\"{s}\",\"latent_out\":\"{s}\"}}", .{ p.a, p.b });
+    _ = (try pack.run(body)).ok;
+    const out = try h3.loadLatentSidecar(aa, p.b.ptr, pack.stream);
+    defer _ = mlx.mlx_array_free(out.video);
+    defer _ = mlx.mlx_array_free(out.audio);
+    try expectSameArray(v, out.video);
+    const hold_hi: c_int = 11;
+    try expectSameSlices(au, 3, 0, out.audio, 0, hold_hi);
+    const mid_lo = hold_hi;
+    const mid_n: c_int = @as(c_int, @intCast(shape.audio_t)) - mid_lo;
+    try testing.expect(mid_n > 0);
+    const mid_out = try sliceAt(out.audio, 3, mid_lo, mid_lo + mid_n);
+    defer _ = mlx.mlx_array_free(mid_out);
+    const mid_init = try sliceAt(au, 3, mid_lo, mid_lo + mid_n);
+    defer _ = mlx.mlx_array_free(mid_init);
+    try expectSlicesDiffer(mid_init, mid_out);
+    const arows = try h3.audioLatentToRows(au, pack.stream);
+    defer _ = mlx.mlx_array_free(arows);
+    const rsh = mlx.getShape(arows);
+    const noise = try h3.randomNormal(rsh, 8, mlx.mlx_dtype.float32, pack.stream);
+    defer _ = mlx.mlx_array_free(noise);
+    const frozen_rows = try h3.mixInit(arows, noise, 1.0, pack.stream);
+    defer _ = mlx.mlx_array_free(frozen_rows);
+    const frozen_lat = try h3.audioRowsToLatent(frozen_rows, shape.audio_t, pack.stream);
+    defer _ = mlx.mlx_array_free(frozen_lat);
+    const mid_frozen = try sliceAt(frozen_lat, 3, mid_lo, mid_lo + mid_n);
+    defer _ = mlx.mlx_array_free(mid_frozen);
+    try expectSlicesDiffer(mid_frozen, mid_out);
 }
 
 test "minimax_h3 plugin: references ride a pinned refine window on a hybrid pack, billed like a render of that grid" {

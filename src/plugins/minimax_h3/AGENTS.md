@@ -27,6 +27,7 @@ a student runs exactly its own), `seed`, `turbo` (needs `turbo_lora.safetensors`
 `latent_init_path` + `refine_sigmas` / `refine_start_sigma` (FL2VA, one window; pins as a render, refs on hybrid);
 `latent_mask_path` on the row grid (`[T_lat, H/32, W/32]`, 1 = redraw), `mask_hold` (`noisy`|`clean`), `mask_feather`;
 mask blends the refine window only — prefix/suffix pins restore after the mask each step;
+`audio_only` + `audio_hold` (Re-voice: held picture, 9-step audio schedule; pins refused — use `audio_hold`),
 `latent_upscale` `{factor, tier}` (`--h3-upscaler` or pack `latent_upscaler/`), `refine: false` (upscale only, no DiT).
 `encode_only: true` + `video_frames` + `latent_out`: VAE-encode only; frames snap DOWN on the ladder; optional `audio`.
 A two-time pack samples only its trained step counts (`two_time.sigma_grids`), default `default_steps`; no `turbo`.

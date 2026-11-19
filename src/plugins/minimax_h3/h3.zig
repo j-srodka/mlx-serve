@@ -3761,6 +3761,51 @@ fn restorePackedAudioPins(
     return out;
 }
 
+/// Copy held audio-latent spans from the init rows back into a packed stream.
+pub fn restoreAudioHoldRanges(
+    rows: mlx.mlx_array,
+    init_rows: mlx.mlx_array,
+    holds: []const AudioHoldRange,
+    audio_t: u32,
+    s: S,
+) !mlx.mlx_array {
+    if (holds.len == 0) return rows;
+    const t: c_int = @intCast(audio_t);
+    var cur = rows;
+    for (holds) |h| {
+        const span = audioHoldLatentTRange(h.start, h.end);
+        if (span.lo >= span.hi or span.hi > audio_t) continue;
+        const lo: c_int = @intCast(span.lo);
+        const hi: c_int = @intCast(span.hi);
+        const l_hold = try sliceRows(init_rows, lo, hi, s);
+        const r_hold = try sliceRows(init_rows, t + lo, t + hi, s);
+        var lp: [3]mlx.mlx_array = undefined;
+        var ln: usize = 0;
+        if (lo > 0) lp[ln] = try sliceRows(cur, 0, lo, s);
+        if (lo > 0) ln += 1;
+        lp[ln] = l_hold;
+        ln += 1;
+        if (hi < t) lp[ln] = try sliceRows(cur, hi, t, s);
+        if (hi < t) ln += 1;
+        var rp: [3]mlx.mlx_array = undefined;
+        var rn: usize = 0;
+        if (lo > 0) rp[rn] = try sliceRows(cur, t, t + lo, s);
+        if (lo > 0) rn += 1;
+        rp[rn] = r_hold;
+        rn += 1;
+        if (hi < t) rp[rn] = try sliceRows(cur, t + hi, t + t, s);
+        if (hi < t) rn += 1;
+        const l_ch = try concat(lp[0..ln], 0, s);
+        defer _ = mlx.mlx_array_free(l_ch);
+        const r_ch = try concat(rp[0..rn], 0, s);
+        defer _ = mlx.mlx_array_free(r_ch);
+        const merged = try concat(&[_]mlx.mlx_array{ l_ch, r_ch }, 0, s);
+        _ = mlx.mlx_array_free(cur);
+        cur = merged;
+    }
+    return cur;
+}
+
 /// Inverse of `spliceAudioPinLayout` for `audioRowsToLatent`. `rows` is freed.
 fn audioLayoutToChannelMajor(rows: mlx.mlx_array, audio_t: u32, pin_pre_t: u32, pin_suf_t: u32, s: S) !mlx.mlx_array {
     const pre: c_int = @intCast(pin_pre_t);
@@ -3945,6 +3990,44 @@ pub fn refineRequestError(has_init: bool, has_upscale: bool, supports_fl2va: boo
     if (pdd) return "latent refine is not a PDD student schedule — omit refine on this pack";
     if (two_time) return "latent refine is not a two-time pack's trained step grid — omit refine on this pack";
     return null;
+}
+
+/// Re-voice: init sidecar with video held and a fixed audio schedule (`null` = ok).
+pub fn audioOnlyRequestError(
+    audio_only: bool,
+    has_init: bool,
+    chain_windows: u32,
+    latent_prefix_frames: u32,
+    latent_suffix_frames: u32,
+    has_refine_schedule: bool,
+    holds: []const AudioHoldRange,
+    num_frames: u32,
+) ?[]const u8 {
+    if (!audio_only) return null;
+    if (!has_init) return "audio_only requires latent_init_path";
+    if (chain_windows > 1) return "audio_only does not support chain_windows > 1";
+    if (latent_prefix_frames > 0 or latent_suffix_frames > 0)
+        return "audio_only does not support latent_prefix_frames or latent_suffix_frames — use audio_hold for held audio tails";
+    if (has_refine_schedule)
+        return "audio_only takes a fixed 9-point audio schedule — omit refine_sigmas, refine_start_sigma and refine_audio";
+    for (holds) |h| {
+        if (h.start >= h.end) return "audio_hold ranges need start < end";
+        if (h.end > num_frames) return "audio_hold range extends past the init's num_frames";
+    }
+    return null;
+}
+
+/// Nine diffusion steps on the audio shift → ten sigmas ending at 0 (caller owns).
+pub fn audioOnlySigmas(allocator: std.mem.Allocator) ![]f64 {
+    return sigmaSchedule(allocator, AUDIO_ONLY_STEPS, SIGMA_SHIFT_AUDIO);
+}
+
+/// Source-frame span → half-open audio-latent T indices for `audio_hold`.
+pub fn audioHoldLatentTRange(start_src: u32, end_src: u32) struct { lo: u32, hi: u32 } {
+    return .{
+        .lo = if (start_src == 0) 0 else audioLatentTHiExclusiveForKeepEnd(start_src),
+        .hi = audioLatentTHiExclusiveForKeepEnd(end_src),
+    };
 }
 
 /// A FastH3 PDD student (FastVideo `fastvideo/layers/pdd.py`): its output heads
@@ -4190,6 +4273,11 @@ pub const GenRequest = struct {
     refine_sigmas: ?[]const f64 = null,
     /// Re-noise the init audio latent too (default: carry it clean).
     refine_audio: bool = false,
+    /// Re-voice: hold every video row from the init; denoise audio on `audioOnlySigmas`.
+    audio_only: bool = false,
+    audio_holds: []const AudioHoldRange = &.{},
+    /// Logged when `steps` in the body disagreed with `AUDIO_ONLY_STEPS` (snapped).
+    audio_only_steps_snap_from: ?u32 = null,
     /// fl2va keyframes (0-2: first and/or last), conditioned through their VAE
     /// latents as cond rows.
     ///
@@ -4540,6 +4628,15 @@ pub const LatentMaskKeys = struct {
 pub const MaskHold = enum {
     noisy,
     clean,
+};
+
+/// Re-voice: hold the init picture, denoise audio on a fixed 9-step schedule (`/health`).
+pub const audio_only_supported = true;
+pub const AUDIO_ONLY_STEPS: u32 = 9;
+
+pub const AudioHoldRange = struct {
+    start: u32,
+    end: u32,
 };
 
 /// Video-latent tail length for a source-frame overlap.
@@ -5541,6 +5638,10 @@ fn generateOne(
     defer if (carry_audio) |c| {
         _ = mlx.mlx_array_free(c);
     };
+    var carry_video: ?mlx.mlx_array = null;
+    defer if (carry_video) |c| {
+        _ = mlx.mlx_array_free(c);
+    };
     var init_video_rows: ?mlx.mlx_array = null;
     defer if (init_video_rows) |x| {
         _ = mlx.mlx_array_free(x);
@@ -5549,7 +5650,30 @@ fn generateOne(
     defer if (video_epsilon) |x| {
         _ = mlx.mlx_array_free(x);
     };
-    if (req.init_video_latent) |iv| {
+    var audio_hold_init: ?mlx.mlx_array = null;
+    defer if (audio_hold_init) |c| {
+        _ = mlx.mlx_array_free(c);
+    };
+    if (req.audio_only) {
+        const iv = req.init_video_latent orelse return error.MissingVideoLatent;
+        const z = try patchifyVideo(iv, s);
+        defer _ = mlx.mlx_array_free(z);
+        _ = mlx.mlx_array_free(video_x);
+        video_x = try contig(z, s);
+        carry_video = try contig(video_x, s);
+        if (req.init_audio_latent) |ia| {
+            const arows = try audioLatentToRows(ia, s);
+            defer _ = mlx.mlx_array_free(arows);
+            audio_hold_init = try contig(arows, s);
+            const am = try mixInit(arows, audio_x, 1.0, s);
+            _ = mlx.mlx_array_free(audio_x);
+            audio_x = try restoreAudioHoldRanges(am, audio_hold_init.?, req.audio_holds, shape.audio_t, s);
+        }
+        if (req.audio_only_steps_snap_from) |from|
+            log.info("[minimax-h3] audio_only: 9-point audio schedule (steps snapped from {d} to {d})\n", .{ from, AUDIO_ONLY_STEPS })
+        else
+            log.info("[minimax-h3] audio_only: 9-point audio schedule (10 sigmas)\n", .{});
+    } else if (req.init_video_latent) |iv| {
         const sigma0 = if (req.refine_sigmas) |rs| rs[0] else 1.0;
         const z = try patchifyVideo(iv, s);
         defer _ = mlx.mlx_array_free(z);
@@ -5689,7 +5813,9 @@ fn generateOne(
     const two_time = req.geometry.two_time != null;
     // Few-step samplers integrate the audio stream on its exact mapped clock (`audioStepFactor`).
     const distilled = req.turbo or req.pdd != null or two_time;
-    const sigmas = if (req.refine_sigmas) |rs|
+    const sigmas = if (req.audio_only)
+        try audioOnlySigmas(allocator)
+    else if (req.refine_sigmas) |rs|
         try allocator.dupe(f64, rs)
     else if (req.pdd) |*p|
         try p.sigmas(allocator, req.shift_video)
@@ -5905,6 +6031,10 @@ fn generateOne(
                 const nv = try addA(video_x, stepv, s);
                 _ = mlx.mlx_array_free(video_x);
                 video_x = nv;
+                if (carry_video) |cv| {
+                    _ = mlx.mlx_array_free(video_x);
+                    video_x = try contig(cv, s);
+                }
                 if (carry_audio) |ca| {
                     _ = mlx.mlx_array_free(audio_x);
                     audio_x = try contig(ca, s);
@@ -5953,9 +6083,15 @@ fn generateOne(
                 );
                 video_x = pinned[0];
                 audio_x = pinned[1];
+                if (carry_video) |cv| {
+                    _ = mlx.mlx_array_free(video_x);
+                    video_x = try contig(cv, s);
+                }
                 if (carry_audio) |ca| {
                     _ = mlx.mlx_array_free(audio_x);
                     audio_x = try contig(ca, s);
+                } else if (audio_hold_init) |ah| {
+                    audio_x = try restoreAudioHoldRanges(audio_x, ah, req.audio_holds, shape.audio_t, s);
                 }
                 try mlx.check(mlx.mlx_array_eval(video_x));
                 try mlx.check(mlx.mlx_array_eval(audio_x));
@@ -6026,6 +6162,10 @@ fn generateOne(
             const nv = try addA(video_x, stepv, s);
             _ = mlx.mlx_array_free(video_x);
             video_x = nv;
+            if (carry_video) |cv| {
+                _ = mlx.mlx_array_free(video_x);
+                video_x = try contig(cv, s);
+            }
 
             if (carry_audio) |ca| {
                 _ = mlx.mlx_array_free(audio_x);
@@ -6074,9 +6214,15 @@ fn generateOne(
             );
             video_x = pinned[0];
             audio_x = pinned[1];
+            if (carry_video) |cv| {
+                _ = mlx.mlx_array_free(video_x);
+                video_x = try contig(cv, s);
+            }
             if (carry_audio) |ca| {
                 _ = mlx.mlx_array_free(audio_x);
                 audio_x = try contig(ca, s);
+            } else if (audio_hold_init) |ah| {
+                audio_x = try restoreAudioHoldRanges(audio_x, ah, req.audio_holds, shape.audio_t, s);
             }
 
             if (sc_thresh > 0) {
@@ -9433,6 +9579,14 @@ test "minimax h3: refine sigma list and start-sigma map" {
     try testing.expect(refineMaskGeometryError(2, 2, 2, 2, 4, 4) == null);
     try testing.expectEqualStrings("'latent_mask_path' frame count must match latent_init_path", refineMaskGeometryError(1, 2, 2, 2, 4, 4).?);
     try testing.expectEqualStrings("'latent_mask_path' mask values must be 0 or 1 unless mask_feather is set", latentMaskBinaryError(&.{0.5}, 0).?);
+    const ao_sig = try audioOnlySigmas(a);
+    defer a.free(ao_sig);
+    try testing.expectEqual(@as(usize, 10), ao_sig.len);
+    try testing.expectEqual(@as(f64, 0), ao_sig[ao_sig.len - 1]);
+    try testing.expectEqualStrings("audio_only requires latent_init_path", audioOnlyRequestError(true, false, 1, 0, 0, false, &.{}, 39).?);
+    try testing.expectEqualStrings("audio_only does not support chain_windows > 1", audioOnlyRequestError(true, true, 2, 0, 0, false, &.{}, 39).?);
+    try testing.expectEqualStrings("audio_only does not support latent_prefix_frames or latent_suffix_frames — use audio_hold for held audio tails", audioOnlyRequestError(true, true, 1, 5, 0, false, &.{}, 39).?);
+    try testing.expectEqualStrings("audio_hold range extends past the init's num_frames", audioOnlyRequestError(true, true, 1, 0, 0, false, &.{.{ .start = 0, .end = 40 }}, 39).?);
 }
 
 test "minimax h3: mask-held target rows ride the visual conditioning timestep" {
@@ -9441,7 +9595,7 @@ test "minimax h3: mask-held target rows ride the visual conditioning timestep" {
     defer l.deinit();
     const tags = try maskHoldTagsFromData(a, &.{ 1, 1, 0, 0 });
     l.video_hold_tags = tags;
-    var p = try buildTimestepPlan(a, &l, 0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{});
+    var p = try buildTimestepPlan(a, &l, 0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{}, null);
     defer p.deinit();
     const vseg = l.videoSegment();
     for (p.runs) |r| {

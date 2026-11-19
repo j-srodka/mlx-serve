@@ -249,6 +249,20 @@ legal: `last_frame_image` + prefix pin (the proven engine combo),
 a chain: prefix file → window 0 opens on its tail; suffix file → the final
 window finishes at its head.
 
+### MiniMax H3: Re-voice (`audio_only`)
+
+Keep the picture from a `latent_out` sidecar; replace the soundtrack on a fixed **9-step**
+audio schedule (`steps` in the body snaps to 9). `GET /health` `"audio_only":true`.
+
+| field | notes |
+|---|---|
+| `audio_only` | `true` with `latent_init_path`. Video latent byte-identical to the init; audio re-denoised from σ 1.0. |
+| `audio_hold` | Optional `[[start,end],…]` source-frame ranges whose audio stays from the init (seams / carried tails). |
+| `latent_out` | Unchanged `video_latent` plus new `audio_latent`. |
+
+FL2VA, `chain_windows` 1. `refine_sigmas` / pins refused — use `audio_hold` instead.
+Refs on a hybrid pack stay legal. Hermetic: `minimax_h3 plugin: audio_only Re-voice`.
+
 ### MiniMax H3: latent refine and upscale
 
 Low-res render → `latent_out` sidecar → optional 2D latent upscale → few-step
