@@ -9,6 +9,23 @@ pub const CONN_DRAIN_MS: i64 = 30_000;
 /// Process exit when shutdown grace expires with work still unwinding.
 pub const EXIT_GRACE_EXPIRED: u8 = 2;
 
+/// Latched by the serve drain or inference join when the shared deadline passes; the caller exits.
+pub var shutdown_timed_out = std.atomic.Value(bool).init(false);
+
+pub const InferenceJoinOutcome = enum { complete, latch_timeout };
+
+/// Wedged past deadline → latch only; `processExitCode` is the sole exit-status source (not join-local exit).
+pub fn inferenceJoinOutcome(at_deadline: bool, job_done: bool) InferenceJoinOutcome {
+    if (job_done) return .complete;
+    if (at_deadline) return .latch_timeout;
+    return .complete;
+}
+
+pub fn processExitCode() u8 {
+    if (shutdown_timed_out.load(.acquire)) return EXIT_GRACE_EXPIRED;
+    return 0;
+}
+
 /// Monotonic deadline for draining live connection threads after cancel.
 /// Idle shutdown (`in_flight == false`) returns `now_ms` so the wait is a no-op.
 pub fn drainDeadlineMs(now_ms: i64, armed_deadline_ms: i64, in_flight: bool) i64 {
@@ -83,4 +100,22 @@ test "shutdown grace: a wedged in-flight job expires at the drain deadline" {
     const deadline = drainDeadlineMs(1_000, 1_500, true);
     try std.testing.expect(!graceExpired(deadline, 1_499));
     try std.testing.expect(graceExpired(deadline, 1_500));
+}
+
+test "shutdown grace: wedged at deadline latches status 2 for caller exit not join exit" {
+    shutdown_timed_out.store(false, .release);
+    try std.testing.expectEqual(@as(u8, 0), processExitCode());
+    try std.testing.expectEqual(.latch_timeout, inferenceJoinOutcome(true, false));
+    shutdown_timed_out.store(true, .release);
+    try std.testing.expectEqual(EXIT_GRACE_EXPIRED, processExitCode());
+    try std.testing.expectEqual(.complete, inferenceJoinOutcome(false, true));
+    shutdown_timed_out.store(false, .release);
+}
+
+test "shutdown grace: drainDeadlineMs is the inference join bound not flush plus slack" {
+    const start: i64 = 1_000;
+    const armed: i64 = 46_000;
+    const join_until = drainDeadlineMs(start, armed, true);
+    try std.testing.expectEqual(armed, join_until);
+    try std.testing.expect(join_until < armed + CONN_DRAIN_MS);
 }

@@ -39,8 +39,6 @@ const LoadedModel = model_registry_mod.LoadedModel;
 const shutdown_grace = @import("../shutdown/grace.zig");
 /// Global flag set by signal handler for graceful shutdown.
 pub var shutdown_requested = std.atomic.Value(bool).init(false);
-/// Set when connection threads outlive the shutdown grace window.
-pub var shutdown_timed_out = std.atomic.Value(bool).init(false);
 /// Number of live per-connection threads. Incremented before each spawn,
 /// decremented when the thread's handler returns. On shutdown, `serve` waits
 /// for this to reach 0 before returning (which runs `scheduler.deinit`) — a
@@ -171,7 +169,7 @@ fn signalHandler(_: std.posix.SIG) callconv(.c) void {
 }
 
 fn shutdownExitIfNeeded() void {
-    if (!shutdown_timed_out.load(.acquire)) return;
+    if (!shutdown_grace.shutdown_timed_out.load(.acquire)) return;
     log.err("shutdown: exiting with status {d} (grace window expired)\n", .{shutdown_grace.EXIT_GRACE_EXPIRED});
     std.process.exit(shutdown_grace.EXIT_GRACE_EXPIRED);
 }
@@ -419,6 +417,7 @@ pub fn serve(
     defer startup.stop();
 
     var scheduler = try mlx_engine.start(allocator, io, load_params, max_concurrent);
+    // LIFO: register shutdownExitIfNeeded first so it runs after scheduler.deinit returns.
     defer shutdownExitIfNeeded();
     defer scheduler.deinit();
     startup.stop();
@@ -526,7 +525,7 @@ pub fn serve(
     mlx_engine.api().set_gen_yield(gen_yield);
     if (!gen_yield)
         log.info("chat does not interleave with media jobs on CUDA: a chat waits for the running image/audio job\n", .{});
-    shutdown_timed_out.store(false, .release);
+    shutdown_grace.shutdown_timed_out.store(false, .release);
     // Install signal handlers for graceful shutdown (POSIX; on Windows Ctrl+C ends the process).
     if (comptime builtin.os.tag != .windows) {
         const sigact = std.posix.Sigaction{
@@ -718,14 +717,14 @@ pub fn serve(
             const now_ms = nowMsMonotonic(io);
             if (shutdown_grace.graceExpired(deadline_ms, now_ms)) {
                 const remaining = active_conn_threads.load(.acquire);
-                shutdown_timed_out.store(true, .release);
+                shutdown_grace.shutdown_timed_out.store(true, .release);
                 log.err("shutdown: grace window expired with {d} connection thread(s) still active\n", .{remaining});
                 break;
             }
             crt.sleepMs(20);
         }
         const remaining = active_conn_threads.load(.acquire);
-        if (remaining > 0 and !shutdown_timed_out.load(.acquire))
+        if (remaining > 0 and !shutdown_grace.shutdown_timed_out.load(.acquire))
             log.warn("shutdown: {d} connection thread(s) still active after {d}ms — proceeding\n", .{ remaining, nowMsMonotonic(io) - start_ms });
     }
 
