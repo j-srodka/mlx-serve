@@ -141,7 +141,7 @@ fn layersAgree(gpa: std.mem.Allocator, lo: usize, hi: usize, fp4: bool) !void {
 }
 
 test "dsv41 dec layers ubench: a decode step through layers 20..40, fused vs today's chain, 1 and 6 rows" {
-    if (!ubenchOn() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!ubenchOn() or !mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const iou = @import("../../../sdk/util/io_util.zig");
@@ -172,5 +172,6 @@ test "dsv41 dec layers ubench: a decode step through layers 20..40, fused vs tod
 
 test {
     _ = fixture;
+    _ = @import("exact_test.zig");
     inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, ffn_in, moe_up, moe_down }) |k| _ = k;
 }

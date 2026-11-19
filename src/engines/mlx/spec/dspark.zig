@@ -5,7 +5,6 @@ const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
 const dsv4_mod = @import("../../../plugins/deepseek_v4/deepseek_v4.zig");
 const dsv41_mod = @import("../../../plugins/deepseek_v41/deepseek_v41.zig");
-const mlx_stream = @import("../modules/stream.zig");
 const tokenizer_mod = @import("../../../sdk/tokenizer/tokenizer.zig");
 const model_mod = @import("../../../sdk/config/model.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
@@ -91,7 +90,7 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
     // A skipped round is a tick of the serial pipeline; the first drafted round after it drains the pipeline.
     if (self.dspark_pol) |*pol| {
-        if (!pol.drafting.shouldDraft() and self.dflashCanPipeline()) return try self.dsparkPlainPipelined(allocator);
+        if (pol.pin_rows == 0 and !pol.drafting.shouldDraft() and self.dflashCanPipeline()) return try self.dsparkPlainPipelined(allocator);
         pol.plain_watch = null;
         if (self.has_pending_logits or self.has_pending_token) switch (try self.drainPipelineForSpec(allocator)) {
             .drained => |tok| return try mtpSerialOneToken(allocator, tok),
@@ -100,11 +99,6 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         };
     }
     if (try self.checkStop()) return null; // t1 is this block's first emit: stop before drafting
-    if (self.xfm.mlx_stream_ext) |m| {
-        const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
-        const r = try mlx_stream.round(m, allocator, self.next_token_id, cap);
-        return self.commitDsparkRound(allocator, .{ .tokens = r.tokens, .accepted = r.accepted, .next_token = r.next_token }, mlx_stream.position(m));
-    }
     if (plugin_driver.nativeDrafter(self.xfm) != null) return nativeRound(self, allocator);
     return modules.call("dspark_round", .{ self, allocator });
 }
@@ -152,6 +146,8 @@ fn nativeRound(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResu
 pub fn moduleRound(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
     if (intree.dsv41(self.xfm)) |mdl| {
         try plugin_settle.activate(self.xfm, &self.ctx);
+        // An exact greedy accept masks what the serial sampler masks.
+        mdl.suppress = self.xfm.suppress_mask orelse .{ .ctx = null };
         if (try self.dsparkCopyStep(allocator, mdl)) |res| return res;
         return self.dsparkPolicyStep(allocator, mdl);
     }
@@ -165,7 +161,7 @@ pub fn dsparkCopyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv4
     const t1 = self.next_token_id;
     const idx = try self.mtpLookupIndex(allocator);
     const found = idx.matchBest(t1, @intCast(dsv41_mod.maxVerifyDrafts(mdl)));
-    const n = dsparkCopyLen(found, self.max_tokens -| self.completion_tokens -| 1, mdl.ds_block);
+    const n = dsparkCopyLen(found, self.max_tokens -| self.completion_tokens -| 1, dsv41_mod.copyBlock(mdl));
     if (n == 0) return null;
     const ids = try allocator.alloc(u32, n + 1);
     ids[0] = t1;
@@ -219,7 +215,9 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
     const t1 = self.next_token_id;
     var d = try dsv41_mod.dsparkDraft(mdl, allocator, st, t1);
     defer d.deinit(allocator);
-    d.len = dsparkVerifyDrafts(d.confidence[0..d.len], &pol.calib, pol.plain.ms);
+    d.len = if (pol.pin_rows > 0) @min(d.len, pol.pin_rows - 1) else dsparkVerifyDrafts(d.confidence[0..d.len], &pol.calib, pol.plain.ms);
+    // An exact verify stays within the decode-width rows (`maxVerifyDrafts`; the block itself otherwise).
+    d.len = @min(d.len, dsv41_mod.maxVerifyDrafts(mdl));
     const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
     const round = if (self.dspark_stochastic)
         try self.dsparkStochasticRound(allocator, dsv41_mod, mdl, t1, cap, &d)

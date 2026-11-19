@@ -2,9 +2,9 @@
 //! `log.zig`, the MLX error latch in `mlx/ffi.zig`, a kernel cache it owns, the environment (until `src/env.zig`),
 //! `--metrics`' counters, the memory ceiling the caller supplies, and the Neural Engine (`plugin_ane.zig`). Built-ins and outside plugins get the same table.
 //!
-//! `HostGpu` delegates to the shims compiled with mlx-stream (`sdk/weights/streamed/csrc/`: `mlx_event_shim.cpp`,
-//! `mlx_alloc_shim.cpp` with its `mlx_launch_cache.inc` and `mimo_gpu_address.inc`, `q3_event_shim.mm`): the one implementation over MLX's
-//! internals until P4 moves it here. A graph without them (Linux, Windows) refuses every call `unsupported`.
+//! `HostGpu` delegates to the expert stream's shims (`sdk/weights/streamed/csrc/`: `mlx_event_shim.cpp`,
+//! `mlx_alloc_shim.cpp` with its `mlx_launch_cache.inc` and `mimo_gpu_address.inc`, `q3_event_shim.mm`): the one
+//! implementation over MLX's internals. A graph without them (Linux, Windows) refuses every call `unsupported`.
 
 const std = @import("std");
 const env = @import("../env.zig");
@@ -47,6 +47,7 @@ pub const Builtin = struct {
             .memory_ceiling = memoryCeiling,
             .gpu = &gpu_table,
             .ane = @import("plugin_ane.zig").table(),
+            .quant_claimant = quantClaimant,
         } };
     }
 
@@ -80,6 +81,11 @@ pub fn processHost() *const abi.Host {
     }
     @import("host_table.zig").published.get().host = p.builtin.host();
     return p.builtin.host();
+}
+
+/// The quant plugins the host loaded (`outside.register`, at startup): the one claiming `block_json`.
+fn quantClaimant(_: ?*anyopaque, block_json: abi.Str, config_json: abi.Str) callconv(.c) ?*const @import("../abi/quant.zig").QuantTable {
+    return @import("../sdk/quant/outside.zig").claimant(block_json.slice(), config_json.slice());
 }
 
 fn self_(ctx: ?*anyopaque) *Builtin {
@@ -244,8 +250,8 @@ fn workingSetHeadroom(_: ?*anyopaque) u64 {
 
 // ── HostGpu ──
 
-/// The mlx-stream shims, on the graphs that compile them.
-const shims: ?type = if (@import("build_options").mlx_stream) struct {
+/// The expert stream's MLX shims (`sdk/weights/streamed/csrc/`), on the macOS graphs that compile them.
+const shims: ?type = if (@import("builtin").os.tag == .macos) struct {
     pub extern "c" fn dsv41ev_create_metal(start: u64, object: *u64) i32;
     pub extern "c" fn dsv41ev_create_host(word: *i64, timeout_ns: i64) i32;
     pub extern "c" fn dsv41ev_wait(xs: [*]const mlx.mlx_array, n: usize, event: i32, value: u64, deps: ?[*]const mlx.mlx_array, n_deps: usize, track_inputs: bool, s: mlx.mlx_stream, outs: [*]mlx.mlx_array) c_int;
@@ -414,6 +420,36 @@ test "builtin host: the allocator round-trips through the table (std.mem.Allocat
     try testing.expect(std.mem.isAligned(@intFromPtr(p.ptr), 64));
     a.free(p);
     // testing.allocator reports a leak or a mismatched free at the end of the test
+}
+
+test "builtin host: quant_claimant answers the registered table that claims a block, null for none or a tie" {
+    const outside = @import("../sdk/quant/outside.zig");
+    const quant = @import("../abi/quant.zig");
+    const Q = struct {
+        fn claims(block: quant.Str, _: quant.Str) callconv(.c) quant.Claim {
+            return if (std.mem.indexOf(u8, block.slice(), "\"q\"") != null) .by_type else .no;
+        }
+    };
+    // A claim reads only `claims`, and a tie's line the names.
+    var one: quant.QuantTable = undefined;
+    one.name = .of("q-one");
+    one.claims = &Q.claims;
+    var two = one;
+    two.name = .of("q-two");
+    const saved = outside.tables.get().*;
+    defer outside.tables.get().* = saved;
+    outside.tables.get().* = .{};
+    outside.register(&one);
+
+    var b: Builtin = undefined;
+    b.init(.{ .allocator = testing.allocator });
+    defer b.deinit();
+    const h = b.host();
+    const claimant = abi.quantClaimantOf(h).?;
+    try testing.expectEqual(@as(?*const quant.QuantTable, &one), claimant(h.ctx, .of("{\"mode\":\"q\"}"), .of("{}")));
+    try testing.expect(claimant(h.ctx, .of("{\"mode\":\"affine\"}"), .of("{}")) == null);
+    outside.register(&two);
+    try testing.expect(claimant(h.ctx, .of("{\"mode\":\"q\"}"), .of("{}")) == null);
 }
 
 test "builtin host: a log line reaches the log sink at its level" {

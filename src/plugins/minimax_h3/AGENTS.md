@@ -4,7 +4,9 @@ MiniMax-H3 text-to-audio-video on `/v1/video/generations`: Qwen3-VL text encoder
 joint audio/video flow DiT, a transformer video VAE decoder (24 fps) and an audio VAE (32 kHz stereo). Partitions by
 the pack's declared `tasks` (the ONLY discriminator; the files are identical): FL2VA (keyframes, chained windows),
 REF2VA (references), FastH3 Omni (REF2VA's 8-step PDD student with trained VSA sparse attention). Packs:
-`ddalcu/MiniMax-H3-MLX-Serve-{4bit,8bit}`, converter `tests/convert_minimax_h3_weights.py`.
+`ddalcu/MiniMax-H3-MLX-Serve-{4bit,8bit}`, converter `tests/convert_minimax_h3_weights.py`. HyperFlow H3 Flash
+(`--partition flash-ref2va` / `flash-fl2va`, from its Q8_0 GGUFs) is a two-time DiT: blocks dropped, low-rank linears,
+`two_time` schedule; its keyframe and reference rows stay at r == t.
 
 ## Files
 - `plugin.zig`: the media table (request parse, keyframes, references, residency plan, the clip as JSON members), the
@@ -24,6 +26,7 @@ a student runs exactly its own), `seed`, `turbo` (needs `turbo_lora.safetensors`
 `.safetensors` packs; XOR with `ref_images`), `lora_paths`/`lora_scales`,
 `latent_init_path` + `refine_sigmas` / `refine_start_sigma` (FL2VA, one window; pins as a render, refs on hybrid),
 `latent_upscale` `{factor, tier}` (`--h3-upscaler` or pack `latent_upscaler/`), `refine: false` (upscale only, no DiT).
+A two-time pack samples only its trained step counts (`two_time.sigma_grids`), default `default_steps`; no `turbo`.
 `cfg_scale`/`stg_scale`/`pipeline` are ignored, not refused (the app sends them for every video backend).
 
 ## Rules
@@ -38,12 +41,14 @@ a student runs exactly its own), `seed`, `turbo` (needs `turbo_lora.safetensors`
 - A refine's carried init audio is captured AFTER the pin splice: each step restores it whole, in packed pin layout.
 - Two reuse levers never stack: a forward after a step-cache skip recomputes attention (`attnBroadcastRefresh`).
 - The converted layouts BAKE OUT per-head interleaves; a sparse-attention pattern cannot be tuned into correctness.
+- A two-time DiT keys modulation rows by the PAIR (t, r): at step 0 video and audio share t = 0 but aim at different r.
 - FastH3 VSA: a per-block temporary of GBs is a fresh allocation in the server; pooling and assembly are kernels.
 
 ## Fixtures
 - `conformanceFixture`: DiT at 64 (two 32-wide heads, one block + one refiner), text encoder at 64, VAE decoder at 32,
   byte tokenizer, no audio VAE (the clip is silent); 64x64 x 5 frames, 2 steps on CPU.
 - Oracles: `tests/dump_minimax_h3_fixtures.py` (toy DiT block, layout, vision) in `h3.zig` tests.
+  `tests/dump_minimax_h3_flash_fixture.py`: one Flash DiT forward vs stable-diffusion.cpp (`minimax h3 flash parity`).
 
 ## The row from the root architecture table
 
