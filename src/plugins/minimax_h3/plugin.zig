@@ -1014,6 +1014,7 @@ fn alignAudioLatentToLayout(z: mlx.mlx_array, frames: u32, s: mlx.mlx_stream) !m
 fn silentAudioLatentForLayout(frames: u32, s: mlx.mlx_stream) !mlx.mlx_array {
     const want_t = h3.temporalShape(frames).audio_t;
     var audio = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(audio);
     try mlx.check(mlx.mlx_zeros(&audio, &[_]c_int{ 1, 32, 2, @intCast(want_t) }, 4, .float32, s));
     return audio;
 }
@@ -1025,7 +1026,7 @@ fn encodeOnlyActivationBytes(width: u32, height: u32, frames: u32) u64 {
     const pixels = @as(u64, frames) * height * width * 3 * 4;
     const video_lat = @as(u64, shape.latent_t) * lat_h * lat_w * 24 * 4;
     const audio_lat = @as(u64, shape.audio_t) * 32 * 2 * 4;
-    return config.REQUEST_BASE_BYTES + pixels + video_lat + audio_lat;
+    return pixels + video_lat + audio_lat;
 }
 
 fn appendJsonEscaped(allocator: std.mem.Allocator, w: *std.ArrayList(u8), raw: []const u8) !void {
@@ -1081,8 +1082,11 @@ fn runEncodeOnly(e: *Engine, req: *const abi.Request, b: *const job.Body, width:
     defer enc.deinit();
     const video = enc.encodeVideo(pixels, gpa, s) catch return job.failure(error.OutOfMemory, "MiniMax-H3: VAE encode failed");
     defer _ = mlx.mlx_array_free(video);
-    var audio = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(audio);
+    var audio: mlx.mlx_array = undefined;
+    var audio_live = false;
+    defer {
+        if (audio_live) _ = mlx.mlx_array_free(audio);
+    }
     if (b.get("audio")) |v| {
         if (v != .string) return bad("'audio' must be a base64 WAV string");
         const pcm = wav32kStereo(v.string) catch return bad("'audio' must be a PCM16/PCM24/float32 WAV");
@@ -1093,13 +1097,12 @@ fn runEncodeOnly(e: *Engine, req: *const abi.Request, b: *const job.Body, width:
         defer gpa.free(apath);
         var aw = model_mod.loadWeightsSingleFile(gpa, apath) catch return bad("this pack has no audio_vae.safetensors");
         defer aw.deinit();
-        _ = mlx.mlx_array_free(audio);
-        audio = mlx.mlx_array_new();
-        audio = audio_mod.encode(gpa, &aw, wf, s) catch return job.failure(error.OutOfMemory, "MiniMax-H3: audio encode failed");
-        audio = alignAudioLatentToLayout(audio, n, s) catch return Verdict.refuse(.busy, "out of memory");
+        const encoded = audio_mod.encode(gpa, &aw, wf, s) catch return job.failure(error.OutOfMemory, "MiniMax-H3: audio encode failed");
+        audio = alignAudioLatentToLayout(encoded, n, s) catch return Verdict.refuse(.busy, "out of memory");
+        audio_live = true;
     } else {
-        _ = mlx.mlx_array_free(audio);
         audio = silentAudioLatentForLayout(n, s) catch return Verdict.refuse(.busy, "out of memory");
+        audio_live = true;
     }
     const path_z = gpa.dupeSentinel(u8, out, 0) catch return Verdict.refuse(.busy, "out of memory");
     defer gpa.free(path_z);
@@ -1708,6 +1711,7 @@ test "minimax_h3 plugin: encode-only canvas preflight scales with width height a
     const big = try std.fmt.allocPrint(arena.allocator(), "{{\"encode_only\":true,\"video_frames\":[\"{s}\",\"{s}\",\"{s}\",\"{s}\",\"{s}\"],\"latent_out\":\"/tmp/x.safetensors\",\"width\":4096,\"height\":4096}}", .{ tiny_ref_png_b64, tiny_ref_png_b64, tiny_ref_png_b64, tiny_ref_png_b64, tiny_ref_png_b64 });
     const small = try std.fmt.allocPrint(arena.allocator(), "{{\"encode_only\":true,\"video_frames\":[\"{s}\",\"{s}\",\"{s}\",\"{s}\",\"{s}\"],\"latent_out\":\"/tmp/x.safetensors\",\"width\":64,\"height\":64}}", .{ tiny_ref_png_b64, tiny_ref_png_b64, tiny_ref_png_b64, tiny_ref_png_b64, tiny_ref_png_b64 });
     const tiny_m: abi.Machine = .{ .ram_total = 1 << 30, .ram_available = 1 << 20 };
+    const roomy_m: abi.Machine = .{ .ram_total = 512 << 20, .ram_available = 512 << 20 };
     const dir = pack.mem.packDir();
     const Quiet = struct {
         fn report(_: ?*anyopaque, _: abi.Str, _: u32, _: u32) callconv(.c) void {}
@@ -1715,14 +1719,12 @@ test "minimax_h3 plugin: encode-only canvas preflight scales with width height a
             return false;
         }
     };
-    const big_req: abi.Request = .{ .body = .of(big), .machine = &tiny_m, .dir = &dir };
-    const big_v = table.step(pack.engine, &big_req, &.{ .ctx = null, .report = Quiet.report, .boundary = Quiet.boundary });
+    const progress: abi.Progress = .{ .ctx = null, .report = Quiet.report, .boundary = Quiet.boundary };
+    const big_v = table.step(pack.engine, &abi.Request{ .body = .of(big), .machine = &tiny_m, .dir = &dir }, &progress);
     try testing.expect(big_v.code == .unsupported);
     try testing.expectEqualStrings("the VAE encode does not fit in memory: use a smaller canvas or fewer frames", big_v.why.slice());
-    switch (try pack.run(small)) {
-        .ok => {},
-        .refused => |v| try testing.expect(!std.mem.eql(u8, v.why.slice(), "the VAE encode does not fit in memory: use a smaller canvas or fewer frames")),
-    }
+    const small_v = table.step(pack.engine, &abi.Request{ .body = .of(small), .machine = &roomy_m, .dir = &dir }, &progress);
+    try testing.expect(!std.mem.eql(u8, small_v.why.slice(), "the VAE encode does not fit in memory: use a smaller canvas or fewer frames"));
 }
 
 test "minimax_h3 plugin: latent sidecar round trips video and silent audio" {
