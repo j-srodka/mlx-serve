@@ -21,12 +21,12 @@ REF2VA (references), FastH3 Omni (REF2VA's 8-step PDD student with trained VSA s
 ## Request contract
 `prompt`, `width`/`height` (multiples of 32), `num_frames` (snapped UP to 17k+5, said so in the log), `steps` ([1,100];
 a student runs exactly its own), `seed`, `turbo` (needs `turbo_lora.safetensors`, >= 4 steps), `fast` (default on),
-`chain_windows` 1-6 (FL2VA only; `num_frames` per window), FL2VA pins (`latent_prefix_frames`/`latent_suffix_frames` 5/22/39/56 + sidecar paths, `latent_out`), `first_frame_image` / `last_frame_image`, `ref_images` /
+`chain_windows` 1-6 (FL2VA only; `num_frames` per window), FL2VA pins (`latent_prefix_frames`/`latent_suffix_frames` 5/22/39/56 + sidecar paths, `latent_out`, optional `latent_prefix_from_step`/`latent_suffix_from_step`, `latent_prefix_output`/`latent_suffix_output`, `latent_pin_noise`), `first_frame_image` / `last_frame_image`, `ref_images` /
 `ref_videos` (`{frames, audio}`) / `ref_audios` + `ref_image_size` (REF2VA only), `ref_mod_paths` (absolute
 `.safetensors` packs; XOR with `ref_images`), `lora_paths`/`lora_scales`,
 `latent_init_path` + `refine_sigmas` / `refine_start_sigma` (FL2VA, one window; pins as a render, refs on hybrid);
 `latent_mask_path` on the row grid (`[T_lat, H/32, W/32]`, 1 = redraw), `mask_hold` (`noisy`|`clean`), `mask_feather`;
-mask blends the refine window only — prefix/suffix pins restore after the mask each step;
+mask blends the refine window only; each step restores mask held rows, then `audio_only` video carry, then prefix/suffix pins (pins win);
 `audio_only` + `audio_hold` (Re-voice: held picture, 9-step audio schedule; pins refused — use `audio_hold`),
 `latent_upscale` `{factor, tier}` (`--h3-upscaler` or pack `latent_upscaler/`), `refine: false` (upscale only, no DiT).
 `encode_only: true` + `video_frames` + `latent_out`: VAE-encode only; frames snap DOWN on the ladder; optional `audio`.
@@ -43,7 +43,7 @@ A two-time pack samples only its trained step counts (`two_time.sigma_grids`), d
   uncatchable). Live RAM comes from `Request.machine`.
 - A resident DiT skips the AdaLN precompute and keeps its adapters in the cache (`h3.Resident`): precompute frees the
   modulation weights for ONE schedule. Residency is all-or-nothing; another load releases it before refusing.
-- A refine's carried init audio is captured AFTER the pin splice: each step restores it whole, in packed pin layout.
+- A refine's carried init audio is captured AFTER the pin splice: each step restores it whole, in packed pin layout; `from_step` defers that restore, `output:false` cuts pin rows from decode/`latent_out` only.
 - Two reuse levers never stack: a forward after a step-cache skip recomputes attention (`attnBroadcastRefresh`).
 - The converted layouts BAKE OUT per-head interleaves; a sparse-attention pattern cannot be tuned into correctness.
 - A two-time DiT keys modulation rows by the PAIR (t, r): at step 0 video and audio share t = 0 but aim at different r.

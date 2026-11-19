@@ -248,6 +248,9 @@ legal: `last_frame_image` + prefix pin (the proven engine combo),
 (`latent_prefix_frames`/`latent_suffix_frames`, legal 5/22/39/56) and may seed
 a chain: prefix file → window 0 opens on its tail; suffix file → the final
 window finishes at its head.
+Optional pin schedule: `latent_prefix_from_step` / `latent_suffix_from_step` (default 0 = lock from step 0),
+`latent_prefix_output` / `latent_suffix_output` (default true; `false` cuts pin rows from decode and `latent_out`),
+`latent_pin_noise` in [0,1] (default 0; fades to 0 at the pin's inner edge).
 
 ### MiniMax H3: Re-voice (`audio_only`)
 

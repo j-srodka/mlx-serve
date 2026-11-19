@@ -3706,6 +3706,124 @@ fn appendPinnedRows(dst: mlx.mlx_array, pin_rows: mlx.mlx_array, pin_n: c_int, s
     return out;
 }
 
+fn blendPinRowsWithNoise(pin: mlx.mlx_array, noise: mlx.mlx_array, side: PinSide, span_t: u32, rows_per_t: u32, amount: f32, s: S) !mlx.mlx_array {
+    if (amount <= 0) return contig(pin, s);
+    std.debug.assert(span_t > 0);
+    std.debug.assert(@as(u32, @intCast(mlx.getShape(pin)[0])) == span_t * rows_per_t);
+    var parts: [32]mlx.mlx_array = undefined;
+    var n: usize = 0;
+    for (0..span_t) |ti| {
+        const scale = pinNoiseScale(side, @intCast(ti), span_t, amount);
+        const row0: c_int = @intCast(ti * rows_per_t);
+        const row1: c_int = row0 + @as(c_int, @intCast(rows_per_t));
+        const prow = try sliceRows(pin, row0, row1, s);
+        defer _ = mlx.mlx_array_free(prow);
+        const nrow = try sliceRows(noise, row0, row1, s);
+        defer _ = mlx.mlx_array_free(nrow);
+        if (scale <= 0) {
+            parts[n] = try contig(prow, s);
+        } else if (scale >= 1) {
+            parts[n] = try contig(nrow, s);
+        } else {
+            const one_s = try scalarLike(1.0, prow, s);
+            defer _ = mlx.mlx_array_free(one_s);
+            const sc = try scalarLike(scale, prow, s);
+            defer _ = mlx.mlx_array_free(sc);
+            const inv = try subA(one_s, sc, s);
+            defer _ = mlx.mlx_array_free(inv);
+            const a = try mulA(prow, inv, s);
+            defer _ = mlx.mlx_array_free(a);
+            const b = try mulA(nrow, sc, s);
+            defer _ = mlx.mlx_array_free(b);
+            parts[n] = try addA(a, b, s);
+        }
+        n += 1;
+    }
+    const out = try concat(parts[0..n], 0, s);
+    _ = mlx.mlx_array_free(pin);
+    return out;
+}
+
+/// Rows fed to unpatchify / sidecar write; pin rows drop when their output flag is false.
+pub fn videoRowsForDecode(
+    video_x: mlx.mlx_array,
+    pin_v_prefix_row_n: c_int,
+    pin_v_suffix_row_n: c_int,
+    prefix_output: bool,
+    suffix_output: bool,
+    s: S,
+) !mlx.mlx_array {
+    const total: c_int = @intCast(mlx.getShape(video_x)[0]);
+    const lo: c_int = if (prefix_output) 0 else pin_v_prefix_row_n;
+    const hi: c_int = if (suffix_output) total else total - pin_v_suffix_row_n;
+    if (lo == 0 and hi == total) return video_x;
+    const sl = try sliceRows(video_x, lo, hi, s);
+    defer _ = mlx.mlx_array_free(sl);
+    return contig(sl, s);
+}
+
+/// Packed-layout audio rows for decode, dropping pin spans when output flags demand it.
+pub fn packedAudioRowsForDecode(
+    rows: mlx.mlx_array,
+    pin_a_prefix_t: u32,
+    pin_a_suffix_t: u32,
+    audio_t: u32,
+    prefix_output: bool,
+    suffix_output: bool,
+    s: S,
+) !mlx.mlx_array {
+    if (prefix_output and suffix_output) return rows;
+    const total: c_int = @intCast(mlx.getShape(rows)[0]);
+    var lo: c_int = 0;
+    var hi: c_int = total;
+    if (!prefix_output and pin_a_prefix_t > 0) lo += @intCast(pin_a_prefix_t * 2);
+    if (!suffix_output and pin_a_suffix_t > 0) hi -= @intCast(pin_a_suffix_t * 2);
+    std.debug.assert(lo < hi);
+    _ = audio_t;
+    const sl = try sliceRows(rows, lo, hi, s);
+    defer _ = mlx.mlx_array_free(sl);
+    const out = try contig(sl, s);
+    _ = mlx.mlx_array_free(rows);
+    return out;
+}
+
+fn restorePinnedLatentStep(
+    vx: mlx.mlx_array,
+    ax: mlx.mlx_array,
+    step: u32,
+    vpre: ?mlx.mlx_array,
+    vsuf: ?mlx.mlx_array,
+    vpre_n: c_int,
+    vsuf_n: c_int,
+    apre: ?mlx.mlx_array,
+    asuf: ?mlx.mlx_array,
+    apre_t: u32,
+    asuf_t: u32,
+    audio_t: u32,
+    prefix_from_step: u32,
+    suffix_from_step: u32,
+    ss: S,
+) !struct { mlx.mlx_array, mlx.mlx_array } {
+    const lock_pre = step >= prefix_from_step;
+    const lock_suf = step >= suffix_from_step;
+    var v = vx;
+    if (lock_pre and vpre != null and vpre_n > 0) v = try prependPinnedRows(v, vpre.?, vpre_n, ss);
+    if (lock_suf and vsuf != null and vsuf_n > 0) v = try appendPinnedRows(v, vsuf.?, vsuf_n, ss);
+    var a = ax;
+    if (apre_t > 0 or asuf_t > 0) {
+        a = try restorePackedAudioPins(
+            a,
+            if (lock_pre) apre else null,
+            if (lock_pre) apre_t else 0,
+            if (lock_suf) asuf else null,
+            if (lock_suf) asuf_t else 0,
+            audio_t,
+            ss,
+        );
+    }
+    return .{ v, a };
+}
+
 /// Noise is channel-major `[L 0..T)(R 0..T)`. Packed layout is
 /// `[pin head | free | pin tail]` with stereo rows channel-major inside each
 /// span: `[L pre)(R pre)(L mid)(R mid)(L suf)(R suf)`.
@@ -3724,7 +3842,10 @@ fn spliceAudioPinLayout(
     var parts: [6]mlx.mlx_array = undefined;
     var n: usize = 0;
     if (pin_pre_t > 0) {
-        parts[n] = pin_pre_rows.?;
+        parts[n] = if (pin_pre_rows) |pr|
+            pr
+        else
+            try audioPinNoiseRowsFromChannelMajor(noise, pin_pre_t, audio_t, s);
         n += 1;
     }
     if (mid > 0) {
@@ -3734,12 +3855,36 @@ fn spliceAudioPinLayout(
         n += 1;
     }
     if (pin_suf_t > 0) {
-        parts[n] = pin_suf_rows.?;
+        parts[n] = if (pin_suf_rows) |sr|
+            sr
+        else
+            try audioPinSuffixNoiseRowsFromChannelMajor(noise, pin_suf_t, audio_t, s);
         n += 1;
     }
     const out = try concat(parts[0..n], 0, s);
     _ = mlx.mlx_array_free(noise);
     return out;
+}
+
+/// Packed pin rows from channel-major noise (late lock before `from_step`).
+fn audioPinNoiseRowsFromChannelMajor(noise: mlx.mlx_array, pin_t: u32, audio_t: u32, s: S) !mlx.mlx_array {
+    const pre: c_int = @intCast(pin_t);
+    const full: c_int = @intCast(audio_t);
+    const l = try sliceRows(noise, 0, pre, s);
+    defer _ = mlx.mlx_array_free(l);
+    const r = try sliceRows(noise, full, full + pre, s);
+    defer _ = mlx.mlx_array_free(r);
+    return concat(&[_]mlx.mlx_array{ l, r }, 0, s);
+}
+
+fn audioPinSuffixNoiseRowsFromChannelMajor(noise: mlx.mlx_array, pin_t: u32, audio_t: u32, s: S) !mlx.mlx_array {
+    const full: c_int = @intCast(audio_t);
+    const lo: c_int = full - @as(c_int, @intCast(pin_t));
+    const l = try sliceRows(noise, lo, full, s);
+    defer _ = mlx.mlx_array_free(l);
+    const r = try sliceRows(noise, full + lo, full + full, s);
+    defer _ = mlx.mlx_array_free(r);
+    return concat(&[_]mlx.mlx_array{ l, r }, 0, s);
 }
 
 /// Re-inject fixed pin rows into a packed-layout audio stream after Euler.
@@ -4277,6 +4422,16 @@ pub const GenRequest = struct {
     /// Arrival clip's video/audio latent head (HTTP `latent_suffix_path`).
     chain_suffix_video_latent: ?mlx.mlx_array = null,
     chain_suffix_audio_latent: ?mlx.mlx_array = null,
+    /// Pin locks only from this denoise step (0 = every step; FL2VA prefix pin).
+    latent_prefix_from_step: u32 = 0,
+    /// Pin locks only from this denoise step (0 = every step; FL2VA suffix pin).
+    latent_suffix_from_step: u32 = 0,
+    /// When false, prefix pin rows condition the forward but are cut from decode and `latent_out`.
+    latent_prefix_output: bool = true,
+    /// When false, suffix pin rows condition the forward but are cut from decode and `latent_out`.
+    latent_suffix_output: bool = true,
+    /// Noise mixed into pinned init, fading to 0 at the inner edge (0 = exact pin).
+    latent_pin_noise: f32 = 0,
     /// `latent_out` sidecar to start from. Video is mixed with noise at σ₀;
     /// audio is carried (conditioning timestep) unless `refine_audio`.
     init_video_latent: ?mlx.mlx_array = null,
@@ -4627,6 +4782,35 @@ pub const isLegalLatentSuffixFrames = isLegalLatentPrefixFrames;
 
 /// HTTP builds with suffix / both-ends pins expose this on `/health`.
 pub const latent_suffix_supported = true;
+pub const late_pin_supported = true;
+pub const pin_output_flag_supported = true;
+pub const pin_noise_supported = true;
+
+pub const PinSide = enum { prefix, suffix };
+
+/// Per-pin-row noise scale: 0 at the inner edge (meeting free rows), `amount` at the outer edge.
+pub fn pinNoiseScale(side: PinSide, index: u32, count: u32, amount: f32) f32 {
+    if (amount <= 0 or count <= 1) return 0;
+    const t = @as(f32, @floatFromInt(index)) / @as(f32, @floatFromInt(count - 1));
+    return switch (side) {
+        .prefix => amount * (1.0 - t),
+        .suffix => amount * t,
+    };
+}
+
+pub fn outputVideoLatentT(latent_t: u32, pin_v_prefix_t: u32, pin_v_suffix_t: u32, prefix_output: bool, suffix_output: bool) u32 {
+    var t = latent_t;
+    if (!prefix_output) t -= pin_v_prefix_t;
+    if (!suffix_output) t -= pin_v_suffix_t;
+    return t;
+}
+
+pub fn outputAudioLatentT(audio_t: u32, pin_a_prefix_t: u32, pin_a_suffix_t: u32, prefix_output: bool, suffix_output: bool) u32 {
+    var t = audio_t;
+    if (!prefix_output) t -= pin_a_prefix_t;
+    if (!suffix_output) t -= pin_a_suffix_t;
+    return t;
+}
 /// This binary accepts `latent_out` together with refs on a hybrid pack (`/health`, pre-load).
 pub const ref_latent_out_supported = true;
 /// Refs may ride `latent_prefix_frames` / `latent_suffix_frames` on hybrid FL2VA+REF2VA packs.
@@ -4829,6 +5013,35 @@ pub fn latentPinWindowError(
     }
     if (v_pin >= shape.latent_t) return "latent pin spans must leave at least one free video latent frame";
     if (a_pin >= shape.audio_t) return "latent pin spans must leave at least one free audio latent step";
+    return null;
+}
+
+pub fn latentPinAdvancedRequestError(
+    prefix_from: u32,
+    suffix_from: u32,
+    prefix_output: bool,
+    suffix_output: bool,
+    pin_noise: f32,
+    prefix_frames: u32,
+    suffix_frames: u32,
+    chain_windows: u32,
+    schedule_steps: u32,
+    request_steps: u32,
+) ?[]const u8 {
+    const has_pin = prefix_frames > 0 or suffix_frames > 0;
+    if (prefix_from == 0 and suffix_from == 0 and prefix_output and suffix_output and pin_noise == 0) return null;
+    if (prefix_from > 0 or suffix_from > 0) {
+        if (!has_pin) return "latent_prefix_from_step and latent_suffix_from_step require latent pins";
+        if (chain_windows > 1) return "latent_prefix_from_step and latent_suffix_from_step cannot be used with chain_windows > 1";
+        if (prefix_frames > 0 and prefix_from >= schedule_steps) return "latent_prefix_from_step must be less than the sampling schedule length";
+        if (suffix_frames > 0 and suffix_from >= schedule_steps) return "latent_suffix_from_step must be less than the sampling schedule length";
+        if (prefix_frames > 0 and prefix_from >= request_steps) return "latent_prefix_from_step must be less than steps";
+        if (suffix_frames > 0 and suffix_from >= request_steps) return "latent_suffix_from_step must be less than steps";
+    }
+    if (!prefix_output and prefix_frames == 0) return "latent_prefix_output:false requires latent_prefix_frames";
+    if (!suffix_output and suffix_frames == 0) return "latent_suffix_output:false requires latent_suffix_frames";
+    if (pin_noise < 0 or pin_noise > 1) return "latent_pin_noise must be in [0, 1]";
+    if (pin_noise > 0 and !has_pin) return "latent_pin_noise requires latent pins";
     return null;
 }
 
@@ -5804,18 +6017,54 @@ fn generateOne(
         defer _ = mlx.mlx_array_free(arows);
         pin_audio_suffix_rows = try contig(arows, s);
     }
+    const frame_rows_u: u32 = (lat_h / PATCH_H) * (lat_w / PATCH_W);
+    if (req.latent_pin_noise > 0) {
+        const pin_noise_v = try randomNormal(&[_]c_int{ pin_v_prefix_row_n + pin_v_suffix_row_n, vpatch }, req.seed +% 17, mlx.mlx_dtype.float32, s);
+        defer _ = mlx.mlx_array_free(pin_noise_v);
+        const pin_noise_a = try randomNormal(
+            &[_]c_int{ @intCast((pin_a_prefix_t + pin_a_suffix_t) * 2), @intCast(req.geometry.dit.audio_latents_dim) },
+            req.seed +% 18,
+            mlx.mlx_dtype.float32,
+            s,
+        );
+        defer _ = mlx.mlx_array_free(pin_noise_a);
+        var v_off: c_int = 0;
+        if (pin_video_prefix_rows) |*p| {
+            const n = try sliceRows(pin_noise_v, v_off, v_off + pin_v_prefix_row_n, s);
+            defer _ = mlx.mlx_array_free(n);
+            p.* = try blendPinRowsWithNoise(p.*, n, .prefix, pin_v_prefix_t, frame_rows_u, req.latent_pin_noise, s);
+            v_off += pin_v_prefix_row_n;
+        }
+        if (pin_video_suffix_rows) |*p| {
+            const n = try sliceRows(pin_noise_v, v_off, v_off + pin_v_suffix_row_n, s);
+            defer _ = mlx.mlx_array_free(n);
+            p.* = try blendPinRowsWithNoise(p.*, n, .suffix, pin_v_suffix_t, frame_rows_u, req.latent_pin_noise, s);
+        }
+        var a_off: c_int = 0;
+        if (pin_audio_prefix_rows) |*p| {
+            const n = try sliceRows(pin_noise_a, a_off, a_off + @as(c_int, @intCast(pin_a_prefix_t * 2)), s);
+            defer _ = mlx.mlx_array_free(n);
+            p.* = try blendPinRowsWithNoise(p.*, n, .prefix, pin_a_prefix_t, 2, req.latent_pin_noise, s);
+            a_off += @intCast(pin_a_prefix_t * 2);
+        }
+        if (pin_audio_suffix_rows) |*p| {
+            const n = try sliceRows(pin_noise_a, a_off, a_off + @as(c_int, @intCast(pin_a_suffix_t * 2)), s);
+            defer _ = mlx.mlx_array_free(n);
+            p.* = try blendPinRowsWithNoise(p.*, n, .suffix, pin_a_suffix_t, 2, req.latent_pin_noise, s);
+        }
+    }
     if (have_latent_prefix or have_latent_suffix) {
-        if (have_latent_prefix) {
+        if (have_latent_prefix and req.latent_prefix_from_step == 0) {
             video_x = try prependPinnedRows(video_x, pin_video_prefix_rows.?, pin_v_prefix_row_n, s);
         }
-        if (have_latent_suffix) {
+        if (have_latent_suffix and req.latent_suffix_from_step == 0) {
             video_x = try appendPinnedRows(video_x, pin_video_suffix_rows.?, pin_v_suffix_row_n, s);
         }
         audio_x = try spliceAudioPinLayout(
             audio_x,
-            pin_audio_prefix_rows,
+            if (have_latent_prefix and req.latent_prefix_from_step == 0) pin_audio_prefix_rows else null,
             pin_a_prefix_t,
-            pin_audio_suffix_rows,
+            if (have_latent_suffix and req.latent_suffix_from_step == 0) pin_audio_suffix_rows else null,
             pin_a_suffix_t,
             shape.audio_t,
             s,
@@ -5981,32 +6230,6 @@ fn generateOne(
         var sc_consec: u32 = 0;
         var sc_skipped: u32 = 0;
 
-        const restorePinnedLatent = struct {
-            fn f(
-                vx: mlx.mlx_array,
-                ax: mlx.mlx_array,
-                vpre: ?mlx.mlx_array,
-                vsuf: ?mlx.mlx_array,
-                vpre_n: c_int,
-                vsuf_n: c_int,
-                apre: ?mlx.mlx_array,
-                asuf: ?mlx.mlx_array,
-                apre_t: u32,
-                asuf_t: u32,
-                audio_t: u32,
-                ss: S,
-            ) !struct { mlx.mlx_array, mlx.mlx_array } {
-                var v = vx;
-                if (vpre != null and vpre_n > 0) v = try prependPinnedRows(v, vpre.?, vpre_n, ss);
-                if (vsuf != null and vsuf_n > 0) v = try appendPinnedRows(v, vsuf.?, vsuf_n, ss);
-                var a = ax;
-                if (apre_t > 0 or asuf_t > 0) {
-                    a = try restorePackedAudioPins(a, apre, apre_t, asuf, asuf_t, audio_t, ss);
-                }
-                return .{ v, a };
-            }
-        }.f;
-
         // I2V / chain windows pin the first temporal slice; T2V uses mid-clip.
         var preview_first_frame = false;
         for (req.keyframes) |kf| {
@@ -6053,10 +6276,6 @@ fn generateOne(
                 const nv = try addA(video_x, stepv, s);
                 _ = mlx.mlx_array_free(video_x);
                 video_x = nv;
-                if (carry_video) |cv| {
-                    _ = mlx.mlx_array_free(video_x);
-                    video_x = try contig(cv, s);
-                }
                 if (carry_audio) |ca| {
                     _ = mlx.mlx_array_free(audio_x);
                     audio_x = try contig(ca, s);
@@ -6093,9 +6312,14 @@ fn generateOne(
                         s,
                     );
                 }
-                const pinned = try restorePinnedLatent(
+                if (carry_video) |cv| {
+                    _ = mlx.mlx_array_free(video_x);
+                    video_x = try contig(cv, s);
+                }
+                const pinned = try restorePinnedLatentStep(
                     video_x,
                     audio_x,
+                    @intCast(i),
                     pin_video_prefix_rows,
                     pin_video_suffix_rows,
                     pin_v_prefix_row_n,
@@ -6105,14 +6329,12 @@ fn generateOne(
                     pin_a_prefix_t,
                     pin_a_suffix_t,
                     shape.audio_t,
+                    req.latent_prefix_from_step,
+                    req.latent_suffix_from_step,
                     s,
                 );
                 video_x = pinned[0];
                 audio_x = pinned[1];
-                if (carry_video) |cv| {
-                    _ = mlx.mlx_array_free(video_x);
-                    video_x = try contig(cv, s);
-                }
                 if (carry_audio) |ca| {
                     _ = mlx.mlx_array_free(audio_x);
                     audio_x = try contig(ca, s);
@@ -6187,10 +6409,6 @@ fn generateOne(
             const nv = try addA(video_x, stepv, s);
             _ = mlx.mlx_array_free(video_x);
             video_x = nv;
-            if (carry_video) |cv| {
-                _ = mlx.mlx_array_free(video_x);
-                video_x = try contig(cv, s);
-            }
 
             if (carry_audio) |ca| {
                 _ = mlx.mlx_array_free(audio_x);
@@ -6228,9 +6446,14 @@ fn generateOne(
                     s,
                 );
             }
-            const pinned = try restorePinnedLatent(
+            if (carry_video) |cv| {
+                _ = mlx.mlx_array_free(video_x);
+                video_x = try contig(cv, s);
+            }
+            const pinned = try restorePinnedLatentStep(
                 video_x,
                 audio_x,
+                @intCast(i),
                 pin_video_prefix_rows,
                 pin_video_suffix_rows,
                 pin_v_prefix_row_n,
@@ -6240,14 +6463,12 @@ fn generateOne(
                 pin_a_prefix_t,
                 pin_a_suffix_t,
                 shape.audio_t,
+                req.latent_prefix_from_step,
+                req.latent_suffix_from_step,
                 s,
             );
             video_x = pinned[0];
             audio_x = pinned[1];
-            if (carry_video) |cv| {
-                _ = mlx.mlx_array_free(video_x);
-                video_x = try contig(cv, s);
-            }
             if (carry_audio) |ca| {
                 _ = mlx.mlx_array_free(audio_x);
                 audio_x = try contig(ca, s);
@@ -6295,7 +6516,12 @@ fn generateOne(
     // ── 4. VAE decode ──
     // Unpatchify the video rows back to a latent volume: rows are
     // (t, h/2, w/2) major with C*2*2 per row.
-    const zlat = try unpatchifyVideoRows(video_x, shape.latent_t, lat_h, lat_w, s);
+    const decode_v = try videoRowsForDecode(video_x, pin_v_prefix_row_n, pin_v_suffix_row_n, req.latent_prefix_output, req.latent_suffix_output, s);
+    defer {
+        if (decode_v.ctx != video_x.ctx) _ = mlx.mlx_array_free(decode_v);
+    }
+    const out_v_t = outputVideoLatentT(shape.latent_t, pin_v_prefix_t, pin_v_suffix_t, req.latent_prefix_output, req.latent_suffix_output);
+    const zlat = try unpatchifyVideoRows(decode_v, out_v_t, lat_h, lat_w, s);
     errdefer _ = mlx.mlx_array_free(zlat);
 
     if (progress) |p| p.emit("Decoding video", req.steps, req.steps);
@@ -6310,10 +6536,18 @@ fn generateOne(
     _ = mlx.mlx_clear_cache();
     log.info("[minimax-h3] video decoded in {d} ms (load+decode)\n", .{phase_timer.lapMs()});
 
+    const out_a_t = outputAudioLatentT(shape.audio_t, pin_a_prefix_t, pin_a_suffix_t, req.latent_prefix_output, req.latent_suffix_output);
     if (have_latent_prefix or have_latent_suffix) {
-        audio_x = try audioLayoutToChannelMajor(audio_x, shape.audio_t, pin_a_prefix_t, pin_a_suffix_t, s);
+        if (!req.latent_prefix_output or !req.latent_suffix_output) {
+            audio_x = try packedAudioRowsForDecode(audio_x, pin_a_prefix_t, pin_a_suffix_t, shape.audio_t, req.latent_prefix_output, req.latent_suffix_output, s);
+            const lay_pre = if (req.latent_prefix_output) pin_a_prefix_t else 0;
+            const lay_suf = if (req.latent_suffix_output) pin_a_suffix_t else 0;
+            audio_x = try audioLayoutToChannelMajor(audio_x, out_a_t, lay_pre, lay_suf, s);
+        } else {
+            audio_x = try audioLayoutToChannelMajor(audio_x, shape.audio_t, pin_a_prefix_t, pin_a_suffix_t, s);
+        }
     }
-    const audio_latent = try audioRowsToLatent(audio_x, shape.audio_t, s);
+    const audio_latent = try audioRowsToLatent(audio_x, out_a_t, s);
     errdefer _ = mlx.mlx_array_free(audio_latent);
 
     // ── 5. audio VAE (optional) ──
@@ -9223,7 +9457,110 @@ test "minimax h3: latent prefix — pin is the time-grid head, denoise continues
     }
 }
 
-test "minimax h3: pin request validators name the refusal" {
+test "minimax h3: pin noise fade is zero at the inner edge and full at the outer" {
+    try testing.expectEqual(@as(f32, 0), pinNoiseScale(.prefix, 4, 5, 0.3));
+    try testing.expectApproxEqAbs(@as(f32, 0.3), pinNoiseScale(.prefix, 0, 5, 0.3), 1e-6);
+    try testing.expectEqual(@as(f32, 0), pinNoiseScale(.suffix, 0, 5, 0.3));
+    try testing.expectApproxEqAbs(@as(f32, 0.3), pinNoiseScale(.suffix, 4, 5, 0.3), 1e-6);
+    try testing.expectEqual(@as(f32, 0), pinNoiseScale(.prefix, 0, 1, 0.3));
+}
+
+test "minimax h3: pin advanced defaults match legacy output geometry" {
+    const shape = temporalShape(56);
+    const k = overlapVideoLatentT(22);
+    const pin_a = overlapAudioLatentT(22);
+    try testing.expectEqual(shape.latent_t, outputVideoLatentT(shape.latent_t, k, 0, true, true));
+    try testing.expectEqual(shape.latent_t - k, outputVideoLatentT(shape.latent_t, k, 0, false, true));
+    try testing.expectEqual(shape.audio_t, outputAudioLatentT(shape.audio_t, pin_a, 0, true, true));
+    try testing.expectEqual(shape.audio_t - pin_a, outputAudioLatentT(shape.audio_t, pin_a, 0, false, true));
+}
+
+test "minimax h3: late pin lock defers restore until from_step" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const pin_n: c_int = 2;
+    const rows: c_int = 6;
+
+    var pin_buf: [8]f32 = undefined;
+    for (&pin_buf, 0..) |*v, i| v.* = @floatFromInt(i);
+    const pin = mlx.mlx_array_new_data(&pin_buf, &[_]c_int{ pin_n, 4 }, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(pin);
+
+    var early_dst_buf: [24]f32 = undefined;
+    for (&early_dst_buf, 0..) |*v, i| v.* = @floatFromInt(100 + i);
+    const early_dst = mlx.mlx_array_new_data(&early_dst_buf, &[_]c_int{ rows, 4 }, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(early_dst);
+    var early_ax_buf: [24]f32 = undefined;
+    for (&early_ax_buf, 0..) |*v, i| v.* = @floatFromInt(200 + i);
+    const early_ax = mlx.mlx_array_new_data(&early_ax_buf, &[_]c_int{ rows, 4 }, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(early_ax);
+
+    const early = try restorePinnedLatentStep(early_dst, early_ax, 1, pin, null, pin_n, 0, null, null, 0, 0, 0, 3, 0, s);
+    defer {
+        if (early[0].ctx != early_dst.ctx) _ = mlx.mlx_array_free(early[0]);
+        if (early[1].ctx != early_ax.ctx) _ = mlx.mlx_array_free(early[1]);
+    }
+    try testing.expectEqual(@as(f32, 100), try readRow0F32(early[0], s));
+    try testing.expectEqual(@as(f32, 200), try readRow0F32(early[1], s));
+
+    var late_dst_buf: [24]f32 = undefined;
+    for (&late_dst_buf, 0..) |*v, i| v.* = @floatFromInt(100 + i);
+    const late_dst = mlx.mlx_array_new_data(&late_dst_buf, &[_]c_int{ rows, 4 }, 2, mlx.mlx_dtype.float32);
+    var late_ax_buf: [24]f32 = undefined;
+    for (&late_ax_buf, 0..) |*v, i| v.* = @floatFromInt(200 + i);
+    const late_ax = mlx.mlx_array_new_data(&late_ax_buf, &[_]c_int{ rows, 4 }, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(late_ax);
+
+    const late = try restorePinnedLatentStep(late_dst, late_ax, 3, pin, null, pin_n, 0, null, null, 0, 0, 0, 3, 0, s);
+    defer _ = mlx.mlx_array_free(late[0]);
+    defer {
+        if (late[1].ctx != late_ax.ctx) _ = mlx.mlx_array_free(late[1]);
+    }
+    try testing.expectEqual(@as(f32, 0), try readRow0F32(late[0], s));
+}
+
+fn readRow0F32(x: mlx.mlx_array, stream: mlx.mlx_stream) !f32 {
+    const c = try contig(x, stream);
+    defer _ = mlx.mlx_array_free(c);
+    try mlx.check(mlx.mlx_array_eval(c));
+    const raw = mlx.mlx_array_data_float32(c) orelse return error.NoData;
+    return raw[0];
+}
+
+test "minimax h3: pin advanced defaults leave decode row selection unchanged" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const rows: c_int = 8;
+    var buf: [64]f32 = undefined;
+    for (&buf, 0..) |*v, i| v.* = @floatFromInt(i);
+    const x = mlx.mlx_array_new_data(&buf, &[_]c_int{ rows, 8 }, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(x);
+    const same = try videoRowsForDecode(x, 0, 0, true, true, s);
+    defer {
+        if (same.ctx != x.ctx) _ = mlx.mlx_array_free(same);
+    }
+    try testing.expectEqual(rows, mlx.getShape(same)[0]);
+    const sliced = try videoRowsForDecode(x, 2, 2, false, false, s);
+    defer _ = mlx.mlx_array_free(sliced);
+    try testing.expectEqual(@as(c_int, 4), mlx.getShape(sliced)[0]);
+}
+
+test "minimax h3: pin output false drops exactly the pin spans from latent T" {
+    const shape = temporalShape(73);
+    const k = overlapVideoLatentT(22);
+    const pin_a = overlapAudioLatentT(22);
+    try testing.expectEqual(shape.latent_t - k, outputVideoLatentT(shape.latent_t, k, k, false, true));
+    try testing.expectEqual(shape.latent_t - k, outputVideoLatentT(shape.latent_t, k, k, true, false));
+    try testing.expectEqual(shape.latent_t - k - k, outputVideoLatentT(shape.latent_t, k, k, false, false));
+    try testing.expectEqual(shape.audio_t - pin_a - pin_a, outputAudioLatentT(shape.audio_t, pin_a, pin_a, false, false));
+}
+
+test "minimax h3: pin advanced request validators name the refusal" {
+    try testing.expectEqualStrings("latent_pin_noise requires latent pins", latentPinAdvancedRequestError(0, 0, true, true, 0.2, 0, 0, 1, 2, 30).?);
+    try testing.expectEqualStrings("latent_prefix_output:false requires latent_prefix_frames", latentPinAdvancedRequestError(0, 0, false, true, 0, 0, 22, 1, 2, 30).?);
+    try testing.expectEqualStrings("latent_suffix_from_step must be less than the sampling schedule length", latentPinAdvancedRequestError(0, 2, true, true, 0, 22, 22, 1, 2, 30).?);
+    try testing.expectEqualStrings("latent_prefix_from_step and latent_suffix_from_step cannot be used with chain_windows > 1", latentPinAdvancedRequestError(1, 0, true, true, 0, 22, 0, 2, 4, 4).?);
+    try testing.expect(latentPinAdvancedRequestError(0, 0, true, true, 0, 22, 0, 1, 4, 4) == null);
     try testing.expectEqualStrings("latent_prefix_frames requires chain_windows > 1", latentPrefixRequestError(22, 1, 56, true, false).?);
     try testing.expectEqualStrings("latent_suffix_frames requires latent_suffix_path", latentSuffixRequestError(22, 1, 56, true, false).?);
     try testing.expectEqualStrings("latent prefix/suffix pins with references require an FL2VA+REF2VA hybrid pack", refCompatError(true, 1, 22, 0, false).?);

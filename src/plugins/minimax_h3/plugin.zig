@@ -166,6 +166,35 @@ fn fieldSet(b: *const job.Body, key: []const u8) bool {
     return v != .null;
 }
 
+fn pinNoiseField(b: *const job.Body) ?Verdict {
+    const v = b.get("latent_pin_noise") orelse return null;
+    return switch (v) {
+        .float => |f| if (f < 0 or f > 1) bad("'latent_pin_noise' must be a number in [0, 1]") else null,
+        .integer => |n| blk: {
+            const f = @as(f32, @floatFromInt(n));
+            break :blk if (f < 0 or f > 1) bad("'latent_pin_noise' must be a number in [0, 1]") else null;
+        },
+        else => bad("'latent_pin_noise' must be a number in [0, 1]"),
+    };
+}
+
+fn parsePinAdvancedFields(b: *const job.Body, steps: u32, refine_sigmas: ?[]const f64, prefix_frames: u32, suffix_frames: u32, chain_windows: u32) Verdict {
+    if (pinNoiseField(b)) |v| return v;
+    const latent_prefix_from_step = u32Field(b, "latent_prefix_from_step", 0);
+    const latent_suffix_from_step = u32Field(b, "latent_suffix_from_step", 0);
+    const latent_prefix_output = if (fieldSet(b, "latent_prefix_output")) b.flag("latent_prefix_output") else true;
+    const latent_suffix_output = if (fieldSet(b, "latent_suffix_output")) b.flag("latent_suffix_output") else true;
+    const latent_pin_noise: f32 = if (b.get("latent_pin_noise")) |v| switch (v) {
+        .float => |f| @floatCast(f),
+        .integer => |n| @floatFromInt(n),
+        else => unreachable,
+    } else 0;
+    const schedule_steps = if (refine_sigmas) |rs| @as(u32, @intCast(rs.len - 1)) else steps;
+    if (h3.latentPinAdvancedRequestError(latent_prefix_from_step, latent_suffix_from_step, latent_prefix_output, latent_suffix_output, latent_pin_noise, prefix_frames, suffix_frames, chain_windows, schedule_steps, steps)) |msg|
+        return Verdict.named(.unsupported, msg);
+    return .ok;
+}
+
 fn pm1Frame(bytes: []const u8, h: u32, w: u32, dt: mlx.mlx_dtype, s: mlx.mlx_stream) ?A {
     return frame_in.pm1(gpa, bytes, h, w, dt, s);
 }
@@ -502,6 +531,7 @@ fn upscaleOnly(e: *Engine, req: *const abi.Request, b: *const job.Body) Verdict 
     const has_schedule = fieldSet(b, "refine_sigmas") or fieldSet(b, "refine_start_sigma") or fieldSet(b, "refine_audio");
     const has_conditions = for ([_][]const u8{
         "latent_prefix_frames", "latent_suffix_frames", "latent_prefix_path", "latent_suffix_path",
+        "latent_prefix_from_step", "latent_suffix_from_step", "latent_prefix_output", "latent_suffix_output", "latent_pin_noise",
         "ref_images",           "ref_videos",           "ref_audios",         "ref_mod_paths",
         "first_frame_image",    "last_frame_image",     "chain_windows",
         "latent_mask_path",     "mask_hold",            "mask_feather",
@@ -737,6 +767,17 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     if (h3.latentPrefixRequestError(latent_prefix_frames, chain_windows, shape.frame_count, e.supports_fl2va, has_latent_prefix_path)) |msg| return Verdict.named(.unsupported, msg);
     if (h3.latentSuffixRequestError(latent_suffix_frames, chain_windows, shape.frame_count, e.supports_fl2va, has_latent_suffix_path)) |msg| return Verdict.named(.unsupported, msg);
     if (h3.latentPinWindowError(latent_prefix_frames, latent_suffix_frames, shape.frame_count)) |msg| return Verdict.named(.unsupported, msg);
+    const pin_adv = parsePinAdvancedFields(&b, steps, refine_sigmas, latent_prefix_frames, latent_suffix_frames, chain_windows);
+    if (!pin_adv.isOk()) return pin_adv;
+    const latent_prefix_from_step = u32Field(&b, "latent_prefix_from_step", 0);
+    const latent_suffix_from_step = u32Field(&b, "latent_suffix_from_step", 0);
+    const latent_prefix_output = if (fieldSet(&b, "latent_prefix_output")) b.flag("latent_prefix_output") else true;
+    const latent_suffix_output = if (fieldSet(&b, "latent_suffix_output")) b.flag("latent_suffix_output") else true;
+    const latent_pin_noise: f32 = if (b.get("latent_pin_noise")) |v| switch (v) {
+        .float => |f| @floatCast(f),
+        .integer => |n| @floatFromInt(n),
+        else => 0,
+    } else 0;
     if (has_latent_prefix_path and latent_prefix_frames == 0) return bad("latent_prefix_path requires latent_prefix_frames");
     if (has_latent_suffix_path and latent_suffix_frames == 0) return bad("latent_suffix_path requires latent_suffix_frames");
     if (has_latent_out and !e.supports_fl2va) return bad("latent_out is FL2VA only — load an FL2VA checkpoint");
@@ -1043,6 +1084,11 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         .latent_suffix_frames = latent_suffix_frames,
         .chain_suffix_video_latent = suffix_v,
         .chain_suffix_audio_latent = suffix_a,
+        .latent_prefix_from_step = latent_prefix_from_step,
+        .latent_suffix_from_step = latent_suffix_from_step,
+        .latent_prefix_output = latent_prefix_output,
+        .latent_suffix_output = latent_suffix_output,
+        .latent_pin_noise = latent_pin_noise,
         .init_video_latent = init_v,
         .init_audio_latent = init_a,
         .edit_mask = edit_mask_v,
@@ -1597,6 +1643,10 @@ test "minimax_h3 plugin: a seeded clip on the tiny pack is deterministic JSON me
         .{ "{\"prompt\":\"x\",\"steps\":0}", "'steps' must be in [1,100]" },
         .{ "{\"prompt\":\"x\",\"chain_windows\":7}", "chain_windows must be 1-6" },
         .{ "{\"prompt\":\"x\",\"latent_prefix_frames\":22,\"chain_windows\":1}", "latent_prefix_frames requires chain_windows > 1" },
+        .{ "{\"prompt\":\"x\",\"latent_pin_noise\":0.2}", "latent_pin_noise requires latent pins" },
+        .{ "{\"prompt\":\"x\",\"latent_suffix_output\":false}", "latent_suffix_output:false requires latent_suffix_frames" },
+        .{ "{\"prompt\":\"x\",\"latent_prefix_from_step\":1}", "latent_prefix_from_step and latent_suffix_from_step require latent pins" },
+        .{ "{\"prompt\":\"x\",\"latent_pin_noise\":1.2}", "'latent_pin_noise' must be a number in [0, 1]" },
         .{ "{\"prompt\":\"x\",\"latent_prefix_path\":\"/tmp/no_h3_sidecar.safetensors\"}", "latent_prefix_path requires latent_prefix_frames" },
         .{ "{\"prompt\":\"x\",\"latent_out\":\"latents.safetensors\"}", "'latent_out' must be an absolute path" },
         .{ "{\"prompt\":\"x\",\"refine_sigmas\":[0.9,0]}", "latent_init_path is required for refine / latent_upscale" },
