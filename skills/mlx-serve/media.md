@@ -265,6 +265,10 @@ Refs on a hybrid pack stay legal. Hermetic: `minimax_h3 plugin: audio_only Re-vo
 
 ### MiniMax H3: latent refine and upscale
 
+Comfy `MiniMaxH3AddGuide` is **not** `latent_init_path`: it adds `minimax_keyframes`
+cond rows at `frame_idx` while the sampler uses a separate latent. We only anchor
+`.first`/`.last` keyframes and ref2va `ref_videos` — no interior guide field yet.
+
 Low-res render → `latent_out` sidecar → optional 2D latent upscale → few-step
 refine at full size. `GET /health` `"latent_refine":true`; `"latent_upscale":true`
 when `--h3-upscaler` points at the 2D v1 weights (or set `MLX_SERVE_H3_UPSCALER`).

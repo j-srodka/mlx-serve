@@ -34,6 +34,7 @@ A two-time pack samples only its trained step counts (`two_time.sigma_grids`), d
 `cfg_scale`/`stg_scale`/`pipeline` are ignored, not refused (the app sends them for every video backend).
 
 ## Rules
+- Comfy `MiniMaxH3AddGuide` = conditioning (`minimax_keyframes` at `frame_idx`), not `latent_init_path`; we only place `.first`/`.last` keyframe cond rows (`KeyframeAnchor` in `h3.zig`).
 - Every unusable field is a NAMED refusal: a silently dropped reference generates while ignoring the user.
 - The condition stream is assembled in SEGMENT order by ONE resolver (`resolveRefs`): keyframe conds, then each
   reference block, then the target; request order lands a cond row on the wrong reference.
