@@ -3729,13 +3729,26 @@ fn blendOnePinRow(pin: mlx.mlx_array, noise: mlx.mlx_array, row: c_int, scale: f
     return addA(a, b, s);
 }
 
-fn blendPinRowsWithNoise(allocator: std.mem.Allocator, pin: mlx.mlx_array, noise: mlx.mlx_array, side: PinSide, span_t: u32, rows_per_t: u32, amount: f32, s: S) !mlx.mlx_array {
+/// Video pins group `rows_per_t` patch rows per latent frame; audio is channel-major `[L 0..T)(R 0..T)`.
+const PinNoiseLayout = enum { video_spatial, audio_packed };
+
+fn blendPinRowsWithNoise(
+    allocator: std.mem.Allocator,
+    pin: mlx.mlx_array,
+    noise: mlx.mlx_array,
+    side: PinSide,
+    span_t: u32,
+    rows_per_t: u32,
+    layout: PinNoiseLayout,
+    amount: f32,
+    s: S,
+) !mlx.mlx_array {
     if (amount <= 0) return contig(pin, s);
     std.debug.assert(span_t > 0);
     const row_n: u32 = @intCast(mlx.getShape(pin)[0]);
     std.debug.assert(row_n == span_t * rows_per_t);
-    // Audio pin rows are channel-major `[L 0..T)(R 0..T)`; video groups `rows_per_t` spatial rows per latent frame.
-    if (rows_per_t == 2 and row_n == span_t * 2) {
+    if (layout == .audio_packed) {
+        std.debug.assert(rows_per_t == 2 and row_n == span_t * 2);
         var parts = try allocator.alloc(mlx.mlx_array, row_n);
         defer allocator.free(parts);
         var n: usize = 0;
@@ -6086,25 +6099,25 @@ fn generateOne(
         if (pin_video_prefix_rows) |*p| {
             const n = try sliceRows(pin_noise_v, v_off, v_off + pin_v_prefix_row_n, s);
             defer _ = mlx.mlx_array_free(n);
-            p.* = try blendPinRowsWithNoise(allocator, p.*, n, .prefix, pin_v_prefix_t, frame_rows_u, req.latent_pin_noise, s);
+            p.* = try blendPinRowsWithNoise(allocator, p.*, n, .prefix, pin_v_prefix_t, frame_rows_u, .video_spatial, req.latent_pin_noise, s);
             v_off += pin_v_prefix_row_n;
         }
         if (pin_video_suffix_rows) |*p| {
             const n = try sliceRows(pin_noise_v, v_off, v_off + pin_v_suffix_row_n, s);
             defer _ = mlx.mlx_array_free(n);
-            p.* = try blendPinRowsWithNoise(allocator, p.*, n, .suffix, pin_v_suffix_t, frame_rows_u, req.latent_pin_noise, s);
+            p.* = try blendPinRowsWithNoise(allocator, p.*, n, .suffix, pin_v_suffix_t, frame_rows_u, .video_spatial, req.latent_pin_noise, s);
         }
         var a_off: c_int = 0;
         if (pin_audio_prefix_rows) |*p| {
             const n = try sliceRows(pin_noise_a, a_off, a_off + @as(c_int, @intCast(pin_a_prefix_t * 2)), s);
             defer _ = mlx.mlx_array_free(n);
-            p.* = try blendPinRowsWithNoise(allocator, p.*, n, .prefix, pin_a_prefix_t, 2, req.latent_pin_noise, s);
+            p.* = try blendPinRowsWithNoise(allocator, p.*, n, .prefix, pin_a_prefix_t, 2, .audio_packed, req.latent_pin_noise, s);
             a_off += @intCast(pin_a_prefix_t * 2);
         }
         if (pin_audio_suffix_rows) |*p| {
             const n = try sliceRows(pin_noise_a, a_off, a_off + @as(c_int, @intCast(pin_a_suffix_t * 2)), s);
             defer _ = mlx.mlx_array_free(n);
-            p.* = try blendPinRowsWithNoise(allocator, p.*, n, .suffix, pin_a_suffix_t, 2, req.latent_pin_noise, s);
+            p.* = try blendPinRowsWithNoise(allocator, p.*, n, .suffix, pin_a_suffix_t, 2, .audio_packed, req.latent_pin_noise, s);
         }
     }
     if (have_latent_prefix or have_latent_suffix) {
@@ -9640,7 +9653,7 @@ test "minimax h3: pin noise blend spans a 56-frame audio pin" {
     const pin = mlx.mlx_array_new_data(pin_buf.ptr, &[_]c_int{ rows, dim }, 2, mlx.mlx_dtype.float32);
     const noise = mlx.mlx_array_new_data(noise_buf.ptr, &[_]c_int{ rows, dim }, 2, mlx.mlx_dtype.float32);
     defer _ = mlx.mlx_array_free(noise);
-    const out = try blendPinRowsWithNoise(a, pin, noise, .prefix, pin_t, 2, 0.4, s);
+    const out = try blendPinRowsWithNoise(a, pin, noise, .prefix, pin_t, 2, .audio_packed, 0.4, s);
     defer _ = mlx.mlx_array_free(out);
     try testing.expectEqual(rows, mlx.getShape(out)[0]);
     const l_inner = try readRowAtF32(out, pin_t - 1, 0, s);
@@ -9650,6 +9663,71 @@ test "minimax h3: pin noise blend spans a 56-frame audio pin" {
     try testing.expect(l_scale < r_scale);
     try testing.expectApproxEqAbs(1.0, l_inner, 1e-5);
     try testing.expectApproxEqAbs(1.0 - r_scale, r_outer, 1e-5);
+}
+
+test "minimax h3: pin noise on 64x32 canvas groups spatial rows per frame" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const a = testing.allocator;
+    const lat_h: u32 = 64 / VAE_SPATIAL;
+    const lat_w: u32 = 32 / VAE_SPATIAL;
+    const frame_rows_u: u32 = (lat_h / PATCH_H) * (lat_w / PATCH_W);
+    try testing.expectEqual(@as(u32, 2), frame_rows_u);
+    const pin_t: u32 = 3;
+    const rows: c_int = @intCast(pin_t * frame_rows_u);
+    const dim: c_int = 8;
+    const pin_buf = try a.alloc(f32, @intCast(rows * dim));
+    defer a.free(pin_buf);
+    const noise_buf = try a.alloc(f32, @intCast(rows * dim));
+    defer a.free(noise_buf);
+    @memset(pin_buf, 1.0);
+    @memset(noise_buf, 0.0);
+    const pin = mlx.mlx_array_new_data(pin_buf.ptr, &[_]c_int{ rows, dim }, 2, mlx.mlx_dtype.float32);
+    const noise = mlx.mlx_array_new_data(noise_buf.ptr, &[_]c_int{ rows, dim }, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(noise);
+    const out = try blendPinRowsWithNoise(a, pin, noise, .prefix, pin_t, frame_rows_u, .video_spatial, 0.4, s);
+    defer _ = mlx.mlx_array_free(out);
+    try testing.expectEqual(rows, mlx.getShape(out)[0]);
+    const v_scale = pinNoiseScale(.prefix, 1, pin_t, 0.4);
+    try testing.expect(v_scale > 0);
+    try testing.expectApproxEqAbs(1.0 - v_scale, try readRowAtF32(out, 2, 0, s), 1e-5);
+    try testing.expectApproxEqAbs(1.0 - v_scale, try readRowAtF32(out, 3, 0, s), 1e-5);
+    const pin_audio = try a.alloc(f32, @intCast(rows * dim));
+    defer a.free(pin_audio);
+    const noise_audio = try a.alloc(f32, @intCast(rows * dim));
+    defer a.free(noise_audio);
+    @memset(pin_audio, 1.0);
+    @memset(noise_audio, 0.0);
+    const pin_a = mlx.mlx_array_new_data(pin_audio.ptr, &[_]c_int{ rows, dim }, 2, mlx.mlx_dtype.float32);
+    const noise_a = mlx.mlx_array_new_data(noise_audio.ptr, &[_]c_int{ rows, dim }, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(noise_a);
+    const out_a = try blendPinRowsWithNoise(a, pin_a, noise_a, .prefix, pin_t, frame_rows_u, .audio_packed, 0.4, s);
+    defer _ = mlx.mlx_array_free(out_a);
+    try testing.expectApproxEqAbs(1.0, try readRowAtF32(out_a, 2, 0, s), 1e-5);
+    try testing.expectApproxEqAbs(1.0 - pinNoiseScale(.prefix, 0, pin_t, 0.4), try readRowAtF32(out_a, 3, 0, s), 1e-5);
+}
+
+test "minimax h3: pin noise audio 5-frame overlap keeps per-channel ramp" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const a = testing.allocator;
+    const pin_t = overlapAudioLatentT(5);
+    try testing.expectEqual(@as(u32, 8), pin_t);
+    const rows: c_int = @intCast(pin_t * 2);
+    const dim: c_int = 4;
+    const pin_buf = try a.alloc(f32, @intCast(rows * dim));
+    defer a.free(pin_buf);
+    const noise_buf = try a.alloc(f32, @intCast(rows * dim));
+    defer a.free(noise_buf);
+    @memset(pin_buf, 1.0);
+    @memset(noise_buf, 0.0);
+    const pin = mlx.mlx_array_new_data(pin_buf.ptr, &[_]c_int{ rows, dim }, 2, mlx.mlx_dtype.float32);
+    const noise = mlx.mlx_array_new_data(noise_buf.ptr, &[_]c_int{ rows, dim }, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(noise);
+    const out = try blendPinRowsWithNoise(a, pin, noise, .prefix, pin_t, 2, .audio_packed, 0.4, s);
+    defer _ = mlx.mlx_array_free(out);
+    try testing.expectApproxEqAbs(1.0, try readRowAtF32(out, pin_t - 1, 0, s), 1e-5);
+    try testing.expectApproxEqAbs(1.0 - pinNoiseScale(.prefix, 0, pin_t, 0.4), try readRowAtF32(out, pin_t, 0, s), 1e-5);
 }
 
 test "minimax h3: staggered audio pin locks keep stereo channel order" {
