@@ -1013,10 +1013,12 @@ pub fn decode(dec: *const Decoder, z_norm: mlx.mlx_array, alloc: std.mem.Allocat
         dec_all = trimmed;
     }
 
+    // dec_all stays owned until both conversions are done: the errdefer above still holds it.
     const cl = try unitPixels(dec_all, &[_]c_int{ 1, 3, 1, 1, 1 }, s);
-    _ = mlx.mlx_array_free(dec_all);
     defer _ = mlx.mlx_array_free(cl);
-    return unitToPm1(cl, s);
+    const out = try unitToPm1(cl, s);
+    _ = mlx.mlx_array_free(dec_all);
+    return out;
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
