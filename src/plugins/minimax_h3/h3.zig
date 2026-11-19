@@ -3706,11 +3706,12 @@ fn appendPinnedRows(dst: mlx.mlx_array, pin_rows: mlx.mlx_array, pin_n: c_int, s
     return out;
 }
 
-fn blendPinRowsWithNoise(pin: mlx.mlx_array, noise: mlx.mlx_array, side: PinSide, span_t: u32, rows_per_t: u32, amount: f32, s: S) !mlx.mlx_array {
+fn blendPinRowsWithNoise(allocator: std.mem.Allocator, pin: mlx.mlx_array, noise: mlx.mlx_array, side: PinSide, span_t: u32, rows_per_t: u32, amount: f32, s: S) !mlx.mlx_array {
     if (amount <= 0) return contig(pin, s);
     std.debug.assert(span_t > 0);
     std.debug.assert(@as(u32, @intCast(mlx.getShape(pin)[0])) == span_t * rows_per_t);
-    var parts: [32]mlx.mlx_array = undefined;
+    var parts = try allocator.alloc(mlx.mlx_array, span_t);
+    defer allocator.free(parts);
     var n: usize = 0;
     for (0..span_t) |ti| {
         const scale = pinNoiseScale(side, @intCast(ti), span_t, amount);
@@ -3811,15 +3812,7 @@ fn restorePinnedLatentStep(
     if (lock_suf and vsuf != null and vsuf_n > 0) v = try appendPinnedRows(v, vsuf.?, vsuf_n, ss);
     var a = ax;
     if (apre_t > 0 or asuf_t > 0) {
-        a = try restorePackedAudioPins(
-            a,
-            if (lock_pre) apre else null,
-            if (lock_pre) apre_t else 0,
-            if (lock_suf) asuf else null,
-            if (lock_suf) asuf_t else 0,
-            audio_t,
-            ss,
-        );
+        a = try restorePackedAudioPins(a, apre, apre_t, asuf, asuf_t, audio_t, lock_pre, lock_suf, ss);
     }
     return .{ v, a };
 }
@@ -3895,14 +3888,20 @@ fn restorePackedAudioPins(
     pin_suf_rows: ?mlx.mlx_array,
     pin_suf_t: u32,
     audio_t: u32,
+    lock_pre: bool,
+    lock_suf: bool,
     s: S,
 ) !mlx.mlx_array {
     const pre: c_int = @intCast(pin_pre_t);
     const mid: c_int = @intCast(audio_t - pin_pre_t - pin_suf_t);
-    var parts: [4]mlx.mlx_array = undefined;
+    var parts: [5]mlx.mlx_array = undefined;
     var n: usize = 0;
     if (pin_pre_t > 0) {
-        parts[n] = pin_pre_rows.?;
+        if (lock_pre and pin_pre_rows != null) {
+            parts[n] = pin_pre_rows.?;
+        } else {
+            parts[n] = try sliceRows(rows, 0, pre * 2, s);
+        }
         n += 1;
     }
     if (mid > 0) {
@@ -3913,7 +3912,12 @@ fn restorePackedAudioPins(
         n += 1;
     }
     if (pin_suf_t > 0) {
-        parts[n] = pin_suf_rows.?;
+        if (lock_suf and pin_suf_rows != null) {
+            parts[n] = pin_suf_rows.?;
+        } else {
+            const tail: c_int = (pre + mid) * 2;
+            parts[n] = try sliceRows(rows, tail, tail + @as(c_int, @intCast(pin_suf_t * 2)), s);
+        }
         n += 1;
     }
     const out = try concat(parts[0..n], 0, s);
@@ -5016,6 +5020,18 @@ pub fn latentPinWindowError(
     return null;
 }
 
+fn audioRefineCarryOk(
+    step: u32,
+    have_latent_prefix: bool,
+    have_latent_suffix: bool,
+    prefix_from: u32,
+    suffix_from: u32,
+) bool {
+    if (have_latent_prefix and step < prefix_from) return false;
+    if (have_latent_suffix and step < suffix_from) return false;
+    return true;
+}
+
 pub fn latentPinAdvancedRequestError(
     prefix_from: u32,
     suffix_from: u32,
@@ -5026,7 +5042,6 @@ pub fn latentPinAdvancedRequestError(
     suffix_frames: u32,
     chain_windows: u32,
     schedule_steps: u32,
-    request_steps: u32,
 ) ?[]const u8 {
     const has_pin = prefix_frames > 0 or suffix_frames > 0;
     if (prefix_from == 0 and suffix_from == 0 and prefix_output and suffix_output and pin_noise == 0) return null;
@@ -5035,8 +5050,6 @@ pub fn latentPinAdvancedRequestError(
         if (chain_windows > 1) return "latent_prefix_from_step and latent_suffix_from_step cannot be used with chain_windows > 1";
         if (prefix_frames > 0 and prefix_from >= schedule_steps) return "latent_prefix_from_step must be less than the sampling schedule length";
         if (suffix_frames > 0 and suffix_from >= schedule_steps) return "latent_suffix_from_step must be less than the sampling schedule length";
-        if (prefix_frames > 0 and prefix_from >= request_steps) return "latent_prefix_from_step must be less than steps";
-        if (suffix_frames > 0 and suffix_from >= request_steps) return "latent_suffix_from_step must be less than steps";
     }
     if (!prefix_output and prefix_frames == 0) return "latent_prefix_output:false requires latent_prefix_frames";
     if (!suffix_output and suffix_frames == 0) return "latent_suffix_output:false requires latent_suffix_frames";
@@ -6032,25 +6045,25 @@ fn generateOne(
         if (pin_video_prefix_rows) |*p| {
             const n = try sliceRows(pin_noise_v, v_off, v_off + pin_v_prefix_row_n, s);
             defer _ = mlx.mlx_array_free(n);
-            p.* = try blendPinRowsWithNoise(p.*, n, .prefix, pin_v_prefix_t, frame_rows_u, req.latent_pin_noise, s);
+            p.* = try blendPinRowsWithNoise(allocator, p.*, n, .prefix, pin_v_prefix_t, frame_rows_u, req.latent_pin_noise, s);
             v_off += pin_v_prefix_row_n;
         }
         if (pin_video_suffix_rows) |*p| {
             const n = try sliceRows(pin_noise_v, v_off, v_off + pin_v_suffix_row_n, s);
             defer _ = mlx.mlx_array_free(n);
-            p.* = try blendPinRowsWithNoise(p.*, n, .suffix, pin_v_suffix_t, frame_rows_u, req.latent_pin_noise, s);
+            p.* = try blendPinRowsWithNoise(allocator, p.*, n, .suffix, pin_v_suffix_t, frame_rows_u, req.latent_pin_noise, s);
         }
         var a_off: c_int = 0;
         if (pin_audio_prefix_rows) |*p| {
             const n = try sliceRows(pin_noise_a, a_off, a_off + @as(c_int, @intCast(pin_a_prefix_t * 2)), s);
             defer _ = mlx.mlx_array_free(n);
-            p.* = try blendPinRowsWithNoise(p.*, n, .prefix, pin_a_prefix_t, 2, req.latent_pin_noise, s);
+            p.* = try blendPinRowsWithNoise(allocator, p.*, n, .prefix, pin_a_prefix_t, 2, req.latent_pin_noise, s);
             a_off += @intCast(pin_a_prefix_t * 2);
         }
         if (pin_audio_suffix_rows) |*p| {
             const n = try sliceRows(pin_noise_a, a_off, a_off + @as(c_int, @intCast(pin_a_suffix_t * 2)), s);
             defer _ = mlx.mlx_array_free(n);
-            p.* = try blendPinRowsWithNoise(p.*, n, .suffix, pin_a_suffix_t, 2, req.latent_pin_noise, s);
+            p.* = try blendPinRowsWithNoise(allocator, p.*, n, .suffix, pin_a_suffix_t, 2, req.latent_pin_noise, s);
         }
     }
     if (have_latent_prefix or have_latent_suffix) {
@@ -6276,9 +6289,10 @@ fn generateOne(
                 const nv = try addA(video_x, stepv, s);
                 _ = mlx.mlx_array_free(video_x);
                 video_x = nv;
-                if (carry_audio) |ca| {
+                const audio_carry_step = carry_audio != null and audioRefineCarryOk(@intCast(i), have_latent_prefix, have_latent_suffix, req.latent_prefix_from_step, req.latent_suffix_from_step);
+                if (audio_carry_step) {
                     _ = mlx.mlx_array_free(audio_x);
-                    audio_x = try contig(ca, s);
+                    audio_x = try contig(carry_audio.?, s);
                 } else {
                     const dsigma_a = sigmas[i + 1] - sigmas[i];
                     const askip = if (req.audio_only)
@@ -6335,11 +6349,10 @@ fn generateOne(
                 );
                 video_x = pinned[0];
                 audio_x = pinned[1];
-                if (carry_audio) |ca| {
-                    _ = mlx.mlx_array_free(audio_x);
-                    audio_x = try contig(ca, s);
-                } else if (audio_hold_init) |ah| {
-                    audio_x = try restoreAudioHoldRanges(audio_x, ah, req.audio_holds, shape.audio_t, s);
+                if (carry_audio == null) {
+                    if (audio_hold_init) |ah| {
+                        audio_x = try restoreAudioHoldRanges(audio_x, ah, req.audio_holds, shape.audio_t, s);
+                    }
                 }
                 try mlx.check(mlx.mlx_array_eval(video_x));
                 try mlx.check(mlx.mlx_array_eval(audio_x));
@@ -6410,9 +6423,10 @@ fn generateOne(
             _ = mlx.mlx_array_free(video_x);
             video_x = nv;
 
-            if (carry_audio) |ca| {
+            const audio_carry_step = carry_audio != null and audioRefineCarryOk(@intCast(i), have_latent_prefix, have_latent_suffix, req.latent_prefix_from_step, req.latent_suffix_from_step);
+            if (audio_carry_step) {
                 _ = mlx.mlx_array_free(audio_x);
-                audio_x = try contig(ca, s);
+                audio_x = try contig(carry_audio.?, s);
             } else {
                 const dsigma_a = sigmas[i + 1] - sigmas[i];
                 const da_mul = if (req.audio_only)
@@ -6469,11 +6483,10 @@ fn generateOne(
             );
             video_x = pinned[0];
             audio_x = pinned[1];
-            if (carry_audio) |ca| {
-                _ = mlx.mlx_array_free(audio_x);
-                audio_x = try contig(ca, s);
-            } else if (audio_hold_init) |ah| {
-                audio_x = try restoreAudioHoldRanges(audio_x, ah, req.audio_holds, shape.audio_t, s);
+            if (carry_audio == null) {
+                if (audio_hold_init) |ah| {
+                    audio_x = try restoreAudioHoldRanges(audio_x, ah, req.audio_holds, shape.audio_t, s);
+                }
             }
 
             if (sc_thresh > 0) {
@@ -9527,22 +9540,160 @@ fn readRow0F32(x: mlx.mlx_array, stream: mlx.mlx_stream) !f32 {
     return raw[0];
 }
 
+fn f32ArrayBytes(x: mlx.mlx_array) usize {
+    const shp = mlx.getShape(x);
+    var n: usize = 1;
+    for (shp) |d| n *= @intCast(d);
+    return n;
+}
+
+fn expectSameF32ArrayBytes(a: mlx.mlx_array, b: mlx.mlx_array, s: S) !void {
+    const ca = try contig(a, s);
+    defer _ = mlx.mlx_array_free(ca);
+    const cb = try contig(b, s);
+    defer _ = mlx.mlx_array_free(cb);
+    try mlx.check(mlx.mlx_array_eval(ca));
+    try mlx.check(mlx.mlx_array_eval(cb));
+    const da = mlx.mlx_array_data_float32(ca) orelse return error.NoData;
+    const db = mlx.mlx_array_data_float32(cb) orelse return error.NoData;
+    const na = f32ArrayBytes(ca);
+    const nb = f32ArrayBytes(cb);
+    try testing.expectEqual(na, nb);
+    try testing.expectEqualSlices(f32, da[0..na], db[0..nb]);
+}
+
 test "minimax h3: pin advanced defaults leave decode row selection unchanged" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const rows: c_int = 8;
     var buf: [64]f32 = undefined;
-    for (&buf, 0..) |*v, i| v.* = @floatFromInt(i);
+    for (&buf, 0..) |*v, i| v.* = @floatFromInt(1000 + i);
     const x = mlx.mlx_array_new_data(&buf, &[_]c_int{ rows, 8 }, 2, mlx.mlx_dtype.float32);
     defer _ = mlx.mlx_array_free(x);
     const same = try videoRowsForDecode(x, 0, 0, true, true, s);
     defer {
         if (same.ctx != x.ctx) _ = mlx.mlx_array_free(same);
     }
-    try testing.expectEqual(rows, mlx.getShape(same)[0]);
+    try testing.expect(same.ctx == x.ctx);
+    try expectSameF32ArrayBytes(x, same, s);
     const sliced = try videoRowsForDecode(x, 2, 2, false, false, s);
     defer _ = mlx.mlx_array_free(sliced);
     try testing.expectEqual(@as(c_int, 4), mlx.getShape(sliced)[0]);
+    try testing.expect(sliced.ctx != x.ctx);
+}
+
+test "minimax h3: pin noise blend spans a 56-frame audio pin" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const a = testing.allocator;
+    const pin_t = overlapAudioLatentT(56);
+    try testing.expect(pin_t > 32);
+    const rows: c_int = @intCast(pin_t * 2);
+    const dim: c_int = 4;
+    const pin_buf = try a.alloc(f32, @intCast(rows * dim));
+    defer a.free(pin_buf);
+    const noise_buf = try a.alloc(f32, @intCast(rows * dim));
+    defer a.free(noise_buf);
+    for (pin_buf, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) * 0.01;
+    for (noise_buf, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) * 0.02 + 1.0;
+    const pin = mlx.mlx_array_new_data(pin_buf.ptr, &[_]c_int{ rows, dim }, 2, mlx.mlx_dtype.float32);
+    const noise = mlx.mlx_array_new_data(noise_buf.ptr, &[_]c_int{ rows, dim }, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(noise);
+    const out = try blendPinRowsWithNoise(a, pin, noise, .prefix, pin_t, 2, 0.4, s);
+    defer _ = mlx.mlx_array_free(out);
+    try testing.expectEqual(rows, mlx.getShape(out)[0]);
+}
+
+test "minimax h3: staggered audio pin locks keep stereo channel order" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const audio_t: u32 = 8;
+    const pin_t: u32 = 2;
+    const row_n: c_int = @intCast(audio_t * 2);
+    const dim: c_int = 2;
+    var buf = [_]f32{
+        1, 1, 2, 2, 10, 10, 11, 11, 12, 12, 13, 13, 20, 20, 21, 21,
+        30, 30, 31, 31, 40, 40, 41, 41, 50, 50, 51, 51, 60, 60, 61, 61,
+    };
+  // packed [Lpre Rpre Lmid Rmid Lsuf Rsuf] each pin_t=2, mid=4
+    const ax = mlx.mlx_array_new_data(&buf, &[_]c_int{ row_n, dim }, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(ax);
+    var pin_pre_buf = [_]f32{ 100, 100, 101, 101 };
+    var pin_suf_buf = [_]f32{ 200, 200, 201, 201 };
+    const pin_pre = mlx.mlx_array_new_data(&pin_pre_buf, &[_]c_int{ 4, dim }, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(pin_pre);
+    const pin_suf = mlx.mlx_array_new_data(&pin_suf_buf, &[_]c_int{ 4, dim }, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(pin_suf);
+    const dummy_v1 = mlx.mlx_array_new_data(&[_]f32{0}, &[_]c_int{1, 1}, 2, mlx.mlx_dtype.float32);
+    const ax_mid = try contig(ax, s);
+    const mid = try restorePinnedLatentStep(dummy_v1, ax_mid, 1, null, null, 0, 0, pin_pre, pin_suf, pin_t, pin_t, audio_t, 2, 1, s);
+    defer _ = mlx.mlx_array_free(mid[0]);
+    defer _ = mlx.mlx_array_free(mid[1]);
+    try testing.expectEqual(@as(f32, 1), try readRow0F32(mid[1], s));
+    try testing.expectEqual(@as(f32, 2), try readRowAtF32(mid[1], 1, 0, s));
+    try testing.expectEqual(@as(f32, 12), try readRowAtF32(mid[1], 4, 0, s));
+    try testing.expectEqual(@as(f32, 200), try readRowAtF32(mid[1], 12, 0, s));
+    const dummy_v2 = mlx.mlx_array_new_data(&[_]f32{0}, &[_]c_int{1, 1}, 2, mlx.mlx_dtype.float32);
+    const ax_lock = try contig(ax, s);
+    const locked = try restorePinnedLatentStep(dummy_v2, ax_lock, 2, null, null, 0, 0, pin_pre, pin_suf, pin_t, pin_t, audio_t, 2, 1, s);
+    defer _ = mlx.mlx_array_free(locked[0]);
+    defer _ = mlx.mlx_array_free(locked[1]);
+    try testing.expectEqual(@as(f32, 100), try readRow0F32(locked[1], s));
+    try testing.expectEqual(@as(f32, 200), try readRowAtF32(locked[1], 12, 0, s));
+}
+
+fn readRowAtF32(x: mlx.mlx_array, row: usize, col: usize, stream: mlx.mlx_stream) !f32 {
+    const c = try contig(x, stream);
+    defer _ = mlx.mlx_array_free(c);
+    try mlx.check(mlx.mlx_array_eval(c));
+    const raw = mlx.mlx_array_data_float32(c) orelse return error.NoData;
+    const width: usize = @intCast(mlx.getShape(c)[1]);
+    return raw[row * width + col];
+}
+
+test "minimax h3: late audio pin is not overwritten by carried-audio refine" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    try testing.expect(!audioRefineCarryOk(1, true, false, 2, 0));
+    try testing.expect(audioRefineCarryOk(2, true, false, 2, 0));
+    const audio_t: u32 = 6;
+    const pin_t: u32 = 2;
+    var buf = [_]f32{ 9, 9, 9, 9, 50, 50, 51, 51, 52, 52, 53, 53, 70, 70, 71, 71, 72, 72, 73, 73, 74, 74, 75, 75 };
+    const ax = mlx.mlx_array_new_data(&buf, &[_]c_int{ @intCast(audio_t * 2), 1 }, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(ax);
+    const ax_copy = try contig(ax, s);
+    const pin_buf = [_]f32{ 3, 4 };
+    const pin_pre = mlx.mlx_array_new_data(&pin_buf, &[_]c_int{ 2, 1 }, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(pin_pre);
+    const dv = mlx.mlx_array_new_data(&[_]f32{0}, &[_]c_int{1, 1}, 2, mlx.mlx_dtype.float32);
+    const out = try restorePinnedLatentStep(dv, ax_copy, 2, null, null, 0, 0, pin_pre, null, pin_t, 0, audio_t, 2, 0, s);
+    defer _ = mlx.mlx_array_free(out[0]);
+    defer _ = mlx.mlx_array_free(out[1]);
+    try testing.expectEqual(@as(f32, 3), try readRow0F32(out[1], s));
+}
+
+test "minimax h3: video pin rows win when carry runs before pin restore" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const pin_n: c_int = 1;
+    var carry_buf = [_]f32{ 500, 500, 888, 888 };
+    var pin_buf = [_]f32{ 0, 0 };
+    const carry = mlx.mlx_array_new_data(&carry_buf, &[_]c_int{ 2, 2 }, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(carry);
+    const pin = mlx.mlx_array_new_data(&pin_buf, &[_]c_int{ pin_n, 2 }, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(pin);
+    const ax = try contig(carry, s);
+    defer _ = mlx.mlx_array_free(ax);
+    const vx = try contig(carry, s);
+    const good = try restorePinnedLatentStep(vx, ax, 0, pin, null, pin_n, 0, null, null, 0, 0, 0, 0, 0, s);
+    defer _ = mlx.mlx_array_free(good[0]);
+    try testing.expectEqual(@as(f32, 0), try readRow0F32(good[0], s));
+    var wrong_v = try prependPinnedRows(try contig(carry, s), pin, pin_n, s);
+    try testing.expectEqual(@as(f32, 0), try readRow0F32(wrong_v, s));
+    _ = mlx.mlx_array_free(wrong_v);
+    wrong_v = try contig(carry, s);
+    defer _ = mlx.mlx_array_free(wrong_v);
+    try testing.expectEqual(@as(f32, 500), try readRow0F32(wrong_v, s));
 }
 
 test "minimax h3: pin output false drops exactly the pin spans from latent T" {
@@ -9556,11 +9707,13 @@ test "minimax h3: pin output false drops exactly the pin spans from latent T" {
 }
 
 test "minimax h3: pin advanced request validators name the refusal" {
-    try testing.expectEqualStrings("latent_pin_noise requires latent pins", latentPinAdvancedRequestError(0, 0, true, true, 0.2, 0, 0, 1, 2, 30).?);
-    try testing.expectEqualStrings("latent_prefix_output:false requires latent_prefix_frames", latentPinAdvancedRequestError(0, 0, false, true, 0, 0, 22, 1, 2, 30).?);
-    try testing.expectEqualStrings("latent_suffix_from_step must be less than the sampling schedule length", latentPinAdvancedRequestError(0, 2, true, true, 0, 22, 22, 1, 2, 30).?);
-    try testing.expectEqualStrings("latent_prefix_from_step and latent_suffix_from_step cannot be used with chain_windows > 1", latentPinAdvancedRequestError(1, 0, true, true, 0, 22, 0, 2, 4, 4).?);
-    try testing.expect(latentPinAdvancedRequestError(0, 0, true, true, 0, 22, 0, 1, 4, 4) == null);
+    try testing.expectEqualStrings("latent_pin_noise requires latent pins", latentPinAdvancedRequestError(0, 0, true, true, 0.2, 0, 0, 1, 2).?);
+    try testing.expectEqualStrings("latent_prefix_output:false requires latent_prefix_frames", latentPinAdvancedRequestError(0, 0, false, true, 0, 0, 22, 1, 2).?);
+    try testing.expectEqualStrings("latent_suffix_from_step must be less than the sampling schedule length", latentPinAdvancedRequestError(0, 2, true, true, 0, 22, 22, 1, 2).?);
+    try testing.expectEqualStrings("latent_prefix_from_step and latent_suffix_from_step cannot be used with chain_windows > 1", latentPinAdvancedRequestError(1, 0, true, true, 0, 22, 0, 2, 4).?);
+    try testing.expect(latentPinAdvancedRequestError(0, 0, true, true, 0, 22, 0, 1, 4) == null);
+    try testing.expect(latentPinAdvancedRequestError(4, 0, true, true, 0, 22, 0, 1, 7) == null);
+    try testing.expectEqualStrings("latent_prefix_from_step must be less than the sampling schedule length", latentPinAdvancedRequestError(7, 0, true, true, 0, 22, 0, 1, 7).?);
     try testing.expectEqualStrings("latent_prefix_frames requires chain_windows > 1", latentPrefixRequestError(22, 1, 56, true, false).?);
     try testing.expectEqualStrings("latent_suffix_frames requires latent_suffix_path", latentSuffixRequestError(22, 1, 56, true, false).?);
     try testing.expectEqualStrings("latent prefix/suffix pins with references require an FL2VA+REF2VA hybrid pack", refCompatError(true, 1, 22, 0, false).?);

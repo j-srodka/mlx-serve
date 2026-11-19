@@ -190,7 +190,7 @@ fn parsePinAdvancedFields(b: *const job.Body, steps: u32, refine_sigmas: ?[]cons
         else => unreachable,
     } else 0;
     const schedule_steps = if (refine_sigmas) |rs| @as(u32, @intCast(rs.len - 1)) else steps;
-    if (h3.latentPinAdvancedRequestError(latent_prefix_from_step, latent_suffix_from_step, latent_prefix_output, latent_suffix_output, latent_pin_noise, prefix_frames, suffix_frames, chain_windows, schedule_steps, steps)) |msg|
+    if (h3.latentPinAdvancedRequestError(latent_prefix_from_step, latent_suffix_from_step, latent_prefix_output, latent_suffix_output, latent_pin_noise, prefix_frames, suffix_frames, chain_windows, schedule_steps)) |msg|
         return Verdict.named(.unsupported, msg);
     return .ok;
 }
