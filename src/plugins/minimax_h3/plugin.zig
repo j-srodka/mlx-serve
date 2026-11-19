@@ -687,7 +687,7 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     if (refs.items.len > h3.MAX_REF_TOTAL)
         return req.refuseFmt(.unsupported, "too many references", "too many references: at most {d} files across live refs and ref_mod_paths combined", .{h3.MAX_REF_TOTAL});
     const has_refs = has_refs_intent or refs.items.len > 0;
-    if (h3.refineRequestError(has_latent_init, has_latent_upscale, e.supports_fl2va, chain_windows, has_refs, ref_pins_ok, e.pdd != null)) |msg|
+    if (h3.refineRequestError(has_latent_init, has_latent_upscale, e.supports_fl2va, chain_windows, has_refs, ref_pins_ok, e.pdd != null, e.geometry.two_time != null)) |msg|
         return Verdict.named(.unsupported, msg);
     var kf_has_first = false;
     var kf_has_last = false;
