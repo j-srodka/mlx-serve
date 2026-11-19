@@ -903,15 +903,11 @@ pub const PackedLayout = struct {
         unreachable;
     }
 
-    /// The free (denoised) target audio segment; null on an image layout, which has no audio rows.
-    pub fn audioSegmentOrNull(self: *const PackedLayout) ?Segment {
-        for (self.segments) |seg| if (seg.kind == .audio) return seg;
-        return null;
-    }
-
-    /// The free (denoised) target audio segment. Pins sit beside it as `.audio_pin`.
+    /// The free (denoised) target audio segment. Pins sit beside it as `.audio_pin`; an image
+    /// layout has none, so only a caller that knows it has audio rows may ask.
     pub fn audioSegment(self: *const PackedLayout) Segment {
-        return self.audioSegmentOrNull() orelse unreachable;
+        for (self.segments) |seg| if (seg.kind == .audio) return seg;
+        unreachable;
     }
 
     /// The packed order as VSA reads it: one dense run per segment (keyframe rows as one run, as
@@ -2985,7 +2981,7 @@ pub const Model = struct {
         const video = try mulA(vout, negv, s);
         _ = mlx.mlx_array_free(vout);
         errdefer _ = mlx.mlx_array_free(video);
-        if (layout.audioSegmentOrNull() == null) return .{ .video = video, .audio = .{ .ctx = null } };
+        if (layout.audio_update.len == 0) return .{ .video = video, .audio = .{ .ctx = null } };
 
         const aout_raw = try concatTargetStreamHead(self, h, fmods, layout, plan, &.{ .audio_pin, .audio }, heads.audio_w, heads.audio_b, s);
         defer _ = mlx.mlx_array_free(aout_raw);
@@ -7708,6 +7704,28 @@ test "minimax h3: latent pin rows use conditioning timesteps, not generation noi
             else => {},
         }
     }
+}
+
+test "minimax h3: pins covering every audio row still leave the rows for the last layer" {
+    const a = testing.allocator;
+    const shape = temporalShape(5);
+    const p = shape.audio_t / 2;
+    // No free audio segment at all: prefix + suffix take every row, so `initFull`
+    // appends no `.audio` segment. The rows exist, so the forward must still emit
+    // the audio stream — only an image layout has none, and it is the layout whose
+    // `audio_update` is empty.
+    var full = try PackedLayout.initFull(a, 8, shape.latent_t, 4, 4, shape.audio_t, &.{}, 5, &.{}, 0, 0, p, shape.audio_t - p);
+    defer full.deinit();
+    var free_audio: u32 = 0;
+    for (full.segments) |seg| {
+        if (seg.kind == .audio) free_audio += 1;
+    }
+    try testing.expectEqual(@as(u32, 0), free_audio);
+    try testing.expectEqual(shape.audio_t * 2, @as(u32, @intCast(full.audio_update.len)));
+
+    var image = try PackedLayout.initFull(a, 8, 1, 4, 4, 0, &.{}, 1, &.{}, 0, 0, 0, 0);
+    defer image.deinit();
+    try testing.expectEqual(@as(usize, 0), image.audio_update.len);
 }
 
 test "minimax h3: a vision-carrying text span splits into tag runs" {
