@@ -8,6 +8,9 @@ const log = @import("../../sdk/util/log.zig");
 /// Conn-thread drain when `--shutdown-persist-secs` is off (0): bound from SIGTERM.
 pub const CONN_DRAIN_MS: i64 = 30_000;
 
+/// Flush must finish before the process deadline so `inference_done` can latch exit 0.
+pub const FLUSH_END_MARGIN_MS: i64 = 2_000;
+
 /// Process exit when the grace watchdog fires.
 pub const EXIT_GRACE_EXPIRED: u8 = 2;
 
@@ -18,12 +21,21 @@ pub var shutdown_deadline_ms = std.atomic.Value(i64).init(0);
 pub var shutdown_clean = std.atomic.Value(bool).init(false);
 
 var watchdog_started = std.atomic.Value(bool).init(false);
+/// When false, the serve conn drain enforces the process deadline (watchdog spawn failed).
+pub var watchdog_active = std.atomic.Value(bool).init(false);
 var watchdog_thread: ?std.Thread = null;
 
-/// Pure: one horizon from the SIGTERM instant — not recomputed from a later `now`.
+/// Pure: process grace end from the SIGTERM instant (watchdog / conn fallback).
 pub fn captureDeadlineMs(sigterm_now_ms: i64, persist_secs: u32) i64 {
     if (persist_secs > 0) return sigterm_now_ms + @as(i64, persist_secs) * 1000;
     return sigterm_now_ms + CONN_DRAIN_MS;
+}
+
+/// SSD `shutdownPersist` deadline; 0 when `--shutdown-persist-secs` is off. Ends before the process deadline.
+pub fn flushDeadlineMs(sigterm_now_ms: i64, persist_secs: u32, process_deadline_ms: i64) i64 {
+    if (persist_secs == 0) return 0;
+    if (process_deadline_ms <= sigterm_now_ms + FLUSH_END_MARGIN_MS) return sigterm_now_ms;
+    return process_deadline_ms - FLUSH_END_MARGIN_MS;
 }
 
 pub fn armDeadlineOnce(sigterm_now_ms: i64, persist_secs: u32) i64 {
@@ -45,7 +57,14 @@ pub fn resetForServe() void {
     shutdown_deadline_ms.store(0, .monotonic);
     shutdown_clean.store(false, .release);
     watchdog_started.store(false, .release);
+    watchdog_active.store(false, .release);
     watchdog_thread = null;
+}
+
+/// No libc atexit / C++ teardown — safe while the inference thread is still inside MLX.
+pub fn forceExitGraceExpired() noreturn {
+    log.err("shutdown: grace deadline reached; _exit {d}\n", .{EXIT_GRACE_EXPIRED});
+    std.c._exit(EXIT_GRACE_EXPIRED);
 }
 
 /// Capture the deadline and start the grace watchdog (idempotent).
@@ -53,10 +72,12 @@ pub fn beginShutdown(io: std.Io, sigterm_now_ms: i64, persist_secs: u32) i64 {
     const deadline = armDeadlineOnce(sigterm_now_ms, persist_secs);
     if (watchdog_started.swap(true, .acq_rel)) return deadline;
     watchdog_thread = std.Thread.spawn(.{}, watchdogLoop, .{io, deadline}) catch |err| {
-        log.err("shutdown: watchdog spawn failed ({s}); grace enforced only on the serve thread\n", .{@errorName(err)});
+        log.err("shutdown: watchdog spawn failed ({s}); conn drain will _exit at the grace deadline (inference wedged without watchdog is unbounded)\n", .{@errorName(err)});
         watchdog_started.store(false, .release);
+        watchdog_active.store(false, .release);
         return deadline;
     };
+    watchdog_active.store(true, .release);
     return deadline;
 }
 
@@ -68,8 +89,7 @@ fn watchdogLoop(io: std.Io, deadline_ms: i64) void {
         crt.sleepMs(20);
     }
     if (shutdown_clean.load(.acquire)) return;
-    log.err("shutdown: grace deadline {d}ms reached; exiting with status {d}\n", .{ deadline_ms, EXIT_GRACE_EXPIRED });
-    std.process.exit(EXIT_GRACE_EXPIRED);
+    forceExitGraceExpired();
 }
 
 pub fn markCleanShutdown() void {
@@ -99,6 +119,22 @@ pub fn runSteps(total: u32, steps_done: *u32, cancelled: *const fn () bool) erro
 test "shutdown grace: captureDeadline uses persist or conn drain from sigterm only" {
     try std.testing.expectEqual(@as(i64, 55_000), captureDeadlineMs(10_000, 45));
     try std.testing.expectEqual(@as(i64, 40_000), captureDeadlineMs(10_000, 0));
+}
+
+test "shutdown grace: persist 0 disables flush but keeps conn drain bound" {
+    const sigterm: i64 = 5_000;
+    const process = captureDeadlineMs(sigterm, 0);
+    try std.testing.expectEqual(@as(i64, 0), flushDeadlineMs(sigterm, 0, process));
+    try std.testing.expectEqual(sigterm + CONN_DRAIN_MS, process);
+}
+
+test "shutdown grace: flush deadline ends before the process deadline" {
+    const sigterm: i64 = 1_000;
+    const process = captureDeadlineMs(sigterm, 45);
+    const flush = flushDeadlineMs(sigterm, 45, process);
+    try std.testing.expect(flush > sigterm);
+    try std.testing.expect(flush < process);
+    try std.testing.expectEqual(process - FLUSH_END_MARGIN_MS, flush);
 }
 
 test "shutdown grace: deadline captured once is identical for all waiters" {

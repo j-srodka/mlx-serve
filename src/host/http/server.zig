@@ -691,13 +691,18 @@ pub fn serve(
     const sigterm_now = nowMsMonotonic(io);
     const deadline_ms = shutdown_grace.beginShutdown(io, sigterm_now, shutdown_persist_secs);
     if (launch().global_scheduler) |sch| {
-        shutdown_grace.syncFlushDeadline(&sch.shutdown_deadline_ms, deadline_ms);
+        const flush_deadline = shutdown_grace.flushDeadlineMs(sigterm_now, shutdown_persist_secs, deadline_ms);
+        shutdown_grace.syncFlushDeadline(&sch.shutdown_deadline_ms, flush_deadline);
         sch.cancelAllInFlight();
     }
     {
         const drain_start_ms = nowMsMonotonic(io);
         while (active_conn_threads.load(.acquire) > 0) {
             if (shutdown_grace.shutdown_clean.load(.acquire)) break;
+            if (!shutdown_grace.watchdog_active.load(.acquire)) {
+                const now_ms = nowMsMonotonic(io);
+                if (shutdown_grace.graceExpired(deadline_ms, now_ms)) shutdown_grace.forceExitGraceExpired();
+            }
             crt.sleepMs(20);
         }
         const remaining = active_conn_threads.load(.acquire);
