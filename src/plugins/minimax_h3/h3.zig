@@ -4128,6 +4128,9 @@ pub const GenRequest = struct {
     /// audio is carried (conditioning timestep) unless `refine_audio`.
     init_video_latent: ?mlx.mlx_array = null,
     init_audio_latent: ?mlx.mlx_array = null,
+    /// `[T_lat, H/32, W/32]` on the row grid; 1 = redraw, 0 = hold from init.
+    edit_mask: ?mlx.mlx_array = null,
+    mask_hold: MaskHold = .noisy,
     /// Explicit descending video-clock sigmas ending at 0 (already shifted).
     refine_sigmas: ?[]const f64 = null,
     /// Re-noise the init audio latent too (default: carry it clean).
@@ -4351,7 +4354,7 @@ pub fn unpatchifyVideoRows(video_x: mlx.mlx_array, latent_t: u32, lat_h: u32, la
     return reshape(vpc, &[_]c_int{ 1, c24, @intCast(latent_t), @intCast(lat_h), @intCast(lat_w) }, s);
 }
 
-fn copyArrayF32(allocator: std.mem.Allocator, x: mlx.mlx_array, s: S) ![]f32 {
+pub fn copyArrayF32(allocator: std.mem.Allocator, x: mlx.mlx_array, s: S) ![]f32 {
     const f = try astype(x, mlx.mlx_dtype.float32, s);
     defer _ = mlx.mlx_array_free(f);
     const c = try contig(f, s);
@@ -4472,6 +4475,17 @@ pub const ref_latent_out_supported = true;
 pub const ref_pins_supported = true;
 /// This binary accepts `latent_init_path` + `refine_sigmas` on FL2VA (`/health`).
 pub const latent_refine_supported = true;
+/// Spatial edit mask on refine (`latent_mask_path`, `mask_hold`, `mask_feather`).
+pub const edit_mask_supported = true;
+
+pub const LatentMaskKeys = struct {
+    pub const mask = "mask";
+};
+
+pub const MaskHold = enum {
+    noisy,
+    clean,
+};
 
 /// Video-latent tail length for a source-frame overlap.
 pub fn overlapVideoLatentT(overlap_src_frames: u32) u32 {
@@ -4737,6 +4751,175 @@ pub fn loadLatentSidecar(allocator: std.mem.Allocator, path_z: [*:0]const u8, s:
     try mlx.check(mlx.mlx_array_eval(a));
     _ = allocator;
     return .{ .video = v, .audio = a };
+}
+
+pub fn saveLatentMask(path_z: [*:0]const u8, mask: mlx.mlx_array, s: S) !void {
+    const mc = try contig(mask, s);
+    defer _ = mlx.mlx_array_free(mc);
+    try mlx.check(mlx.mlx_array_eval(mc));
+    const tmap = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(tmap);
+    _ = mlx.mlx_map_string_to_array_insert(tmap, LatentMaskKeys.mask, mc);
+    const mmap = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(mmap);
+    try mlx.check(mlx.mlx_save_safetensors(path_z, tmap, mmap));
+}
+
+pub fn loadLatentMask(path_z: [*:0]const u8, s: S) !mlx.mlx_array {
+    var tensor_map = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
+    var meta_map = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(meta_map);
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, path_z, cpu));
+    var raw = mlx.mlx_array_new();
+    if (mlx.mlx_map_string_to_array_get(&raw, tensor_map, LatentMaskKeys.mask) != 0) return error.MissingLatentMask;
+    try mlx.check(mlx.mlx_array_eval(raw));
+    const on_cpu = try contig(raw, cpu);
+    defer _ = mlx.mlx_array_free(raw);
+    const f32v = try astype(on_cpu, mlx.mlx_dtype.float32, cpu);
+    defer _ = mlx.mlx_array_free(on_cpu);
+    const on_s = try contig(f32v, s);
+    _ = mlx.mlx_array_free(f32v);
+    try mlx.check(mlx.mlx_array_eval(on_s));
+    return on_s;
+}
+
+/// Row-grid mask vs init latent (`null` = ok). The mask is `[T_lat, H/32, W/32]`.
+pub fn refineMaskGeometryError(
+    m_t: u32,
+    m_h: u32,
+    m_w: u32,
+    v_t: u32,
+    v_h: u32,
+    v_w: u32,
+) ?[]const u8 {
+    const want_h = v_h / PATCH_H;
+    const want_w = v_w / PATCH_W;
+    if (m_t != v_t) return "'latent_mask_path' frame count must match latent_init_path";
+    if (m_h != want_h or m_w != want_w)
+        return "'latent_mask_path' canvas must match latent_init_path (latent H×W × 16 = width×height)";
+    return null;
+}
+
+pub fn editMaskRequestError(has_mask: bool, has_init: bool, chain_windows: u32, hold_raw: ?[]const u8) ?[]const u8 {
+    if (!has_mask) return null;
+    if (!has_init) return "latent_mask_path requires latent_init_path";
+    if (chain_windows > 1) return "latent refine edit mask does not support chain_windows > 1";
+    if (hold_raw) |raw| {
+        if (!std.mem.eql(u8, raw, "clean") and !std.mem.eql(u8, raw, "noisy"))
+            return "'mask_hold' must be \"clean\" or \"noisy\"";
+    }
+    return null;
+}
+
+/// Values must be 0 or 1 when `feather_tokens == 0` (`null` = ok).
+pub fn latentMaskBinaryError(data: []const f32, feather_tokens: u32) ?[]const u8 {
+    if (feather_tokens > 0) return null;
+    for (data) |v| {
+        if (!std.math.isFinite(v)) return "'latent_mask_path' mask values must be 0 or 1 unless mask_feather is set";
+        if (v != 0 and v != 1) return "'latent_mask_path' mask values must be 0 or 1 unless mask_feather is set";
+    }
+    return null;
+}
+
+fn maskCellOpposite(a: f32, b: f32) bool {
+    return (a <= 0.5 and b > 0.5) or (a > 0.5 and b <= 0.5);
+}
+
+/// Linear edge ramp over `feather_tokens` row-cells on a binary mask (tests / caller-owned buffer).
+pub fn featherLatentMaskInPlace(allocator: std.mem.Allocator, data: []f32, t: u32, h: u32, w: u32, feather_tokens: u32) !void {
+    if (feather_tokens == 0) return;
+    const bin = try allocator.dupe(f32, data);
+    defer allocator.free(bin);
+    const idx = struct {
+        fn f(tt: u32, hh: u32, ww: u32, h_tot: u32, w_tot: u32) usize {
+            return (@as(usize, tt) * @as(usize, h_tot) + @as(usize, hh)) * @as(usize, w_tot) + @as(usize, ww);
+        }
+    }.f;
+    const wt = t;
+    const rad = feather_tokens;
+    for (0..wt) |tt| {
+        for (0..h) |hh| {
+            for (0..w) |ww| {
+                const i = idx(@intCast(tt), @intCast(hh), @intCast(ww), h, w);
+                const v = bin[i];
+                if (v != 0 and v != 1) continue;
+                var dist: u32 = rad + 1;
+                for (0..wt) |st| {
+                    for (0..h) |sh| {
+                        for (0..w) |sw| {
+                            const j = idx(@intCast(st), @intCast(sh), @intCast(sw), h, w);
+                            if (!maskCellOpposite(v, bin[j])) continue;
+                            const d = @max(@abs(@as(i32, @intCast(tt)) - @as(i32, @intCast(st))), @max(
+                                @abs(@as(i32, @intCast(hh)) - @as(i32, @intCast(sh))),
+                                @abs(@as(i32, @intCast(ww)) - @as(i32, @intCast(sw))),
+                            ));
+                            const du: u32 = @intCast(d);
+                            if (du < dist) dist = du;
+                        }
+                    }
+                }
+                if (dist > 0 and dist <= rad) {
+                    const t_blend = @as(f32, @floatFromInt(rad + 1 - dist)) / @as(f32, @floatFromInt(rad + 1));
+                    data[i] = if (v > 0.5) t_blend else 1.0 - t_blend;
+                }
+            }
+        }
+    }
+}
+
+fn restoreMaskedVideoRows(
+    video_x: mlx.mlx_array,
+    init_rows: mlx.mlx_array,
+    epsilon: mlx.mlx_array,
+    mask: mlx.mlx_array,
+    sigma: f64,
+    hold: MaskHold,
+    at_clean: bool,
+    latent_t: u32,
+    lat_h: u32,
+    lat_w: u32,
+    s: S,
+) !mlx.mlx_array {
+    const lh2: c_int = @intCast(lat_h / PATCH_H);
+    const lw2: c_int = @intCast(lat_w / PATCH_W);
+    const pd: c_int = @intCast(mlx.getShape(video_x)[1]);
+    const v4 = try reshape(video_x, &[_]c_int{ @intCast(latent_t), lh2, lw2, pd }, s);
+    defer _ = mlx.mlx_array_free(v4);
+    const z4 = try reshape(init_rows, &[_]c_int{ @intCast(latent_t), lh2, lw2, pd }, s);
+    defer _ = mlx.mlx_array_free(z4);
+    const e4 = try reshape(epsilon, &[_]c_int{ @intCast(latent_t), lh2, lw2, pd }, s);
+    defer _ = mlx.mlx_array_free(e4);
+    const m3 = try reshape(mask, &[_]c_int{ @intCast(latent_t), lh2, lw2 }, s);
+    defer _ = mlx.mlx_array_free(m3);
+    var hold_mixed: ?mlx.mlx_array = null;
+    defer {
+        if (hold_mixed) |x| _ = mlx.mlx_array_free(x);
+    }
+    const hold_src = if (hold == .clean or at_clean)
+        z4
+    else blk: {
+        hold_mixed = try mixInit(z4, e4, sigma, s);
+        break :blk hold_mixed.?;
+    };
+    const m4 = try reshape(m3, &[_]c_int{ @intCast(latent_t), lh2, lw2, 1 }, s);
+    defer _ = mlx.mlx_array_free(m4);
+    const one = try scalarLike(1.0, m4, s);
+    defer _ = mlx.mlx_array_free(one);
+    const hold_w = try subA(one, m4, s);
+    defer _ = mlx.mlx_array_free(hold_w);
+    const hold_part = try mulA(hold_w, hold_src, s);
+    defer _ = mlx.mlx_array_free(hold_part);
+    const draw_part = try mulA(m4, v4, s);
+    defer _ = mlx.mlx_array_free(draw_part);
+    const out4 = try addA(hold_part, draw_part, s);
+    const nrow: c_int = @as(c_int, @intCast(latent_t)) * lh2 * lw2;
+    const out = try reshape(out4, &[_]c_int{ nrow, pd }, s);
+    _ = mlx.mlx_array_free(out4);
+    _ = mlx.mlx_array_free(video_x);
+    return out;
 }
 
 /// Text-to-audio-video. Dispatches: `chain_windows > 1` runs N single-window
@@ -5195,10 +5378,22 @@ fn generateOne(
     defer if (carry_audio) |c| {
         _ = mlx.mlx_array_free(c);
     };
+    var init_video_rows: ?mlx.mlx_array = null;
+    defer if (init_video_rows) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    var video_epsilon: ?mlx.mlx_array = null;
+    defer if (video_epsilon) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
     if (req.init_video_latent) |iv| {
         const sigma0 = if (req.refine_sigmas) |rs| rs[0] else 1.0;
         const z = try patchifyVideo(iv, s);
         defer _ = mlx.mlx_array_free(z);
+        if (req.edit_mask != null) {
+            video_epsilon = try contig(video_x, s);
+            init_video_rows = try contig(z, s);
+        }
         const mixed = try mixInit(z, video_x, sigma0, s);
         _ = mlx.mlx_array_free(video_x);
         video_x = mixed;
@@ -5540,6 +5735,23 @@ fn generateOne(
                 );
                 video_x = pinned[0];
                 audio_x = pinned[1];
+                if (req.edit_mask != null and init_video_rows != null and video_epsilon != null) {
+                    const next_sigma = sigmas[i + 1];
+                    const at_clean = @abs(next_sigma) < 1e-6;
+                    video_x = try restoreMaskedVideoRows(
+                        video_x,
+                        init_video_rows.?,
+                        video_epsilon.?,
+                        req.edit_mask.?,
+                        next_sigma,
+                        req.mask_hold,
+                        at_clean,
+                        shape.latent_t,
+                        lat_h,
+                        lat_w,
+                        s,
+                    );
+                }
                 if (carry_audio) |ca| {
                     _ = mlx.mlx_array_free(audio_x);
                     audio_x = try contig(ca, s);
@@ -5642,6 +5854,23 @@ fn generateOne(
             );
             video_x = pinned[0];
             audio_x = pinned[1];
+            if (req.edit_mask != null and init_video_rows != null and video_epsilon != null) {
+                const next_sigma = sigmas[i + 1];
+                const at_clean = @abs(next_sigma) < 1e-6;
+                video_x = try restoreMaskedVideoRows(
+                    video_x,
+                    init_video_rows.?,
+                    video_epsilon.?,
+                    req.edit_mask.?,
+                    next_sigma,
+                    req.mask_hold,
+                    at_clean,
+                    shape.latent_t,
+                    lat_h,
+                    lat_w,
+                    s,
+                );
+            }
             if (carry_audio) |ca| {
                 _ = mlx.mlx_array_free(audio_x);
                 audio_x = try contig(ca, s);
@@ -8995,6 +9224,12 @@ test "minimax h3: refine sigma list and start-sigma map" {
     try testing.expectEqualStrings("'latent_suffix_path' holds fewer latent frames than its pin needs", refinePinGeometryError("latent_suffix_path", 4, 4, 1, 1, 22, 64, 64).?);
     try testing.expect(refineInitGeometryError(5, 24, temporalShape(5).latent_t, 4, 4, temporalShape(5).audio_t, 64, 64, 5) == null);
     try testing.expect(refineInitGeometryError(5, 24, 1, 8, 4, 1, 64, 64, 5) != null);
+    try testing.expectEqualStrings("latent_mask_path requires latent_init_path", editMaskRequestError(true, false, 1, null).?);
+    try testing.expectEqualStrings("latent refine edit mask does not support chain_windows > 1", editMaskRequestError(true, true, 2, null).?);
+    try testing.expectEqualStrings("'mask_hold' must be \"clean\" or \"noisy\"", editMaskRequestError(true, true, 1, "bad").?);
+    try testing.expect(refineMaskGeometryError(2, 2, 2, 2, 4, 4) == null);
+    try testing.expectEqualStrings("'latent_mask_path' frame count must match latent_init_path", refineMaskGeometryError(1, 2, 2, 2, 4, 4).?);
+    try testing.expectEqualStrings("'latent_mask_path' mask values must be 0 or 1 unless mask_feather is set", latentMaskBinaryError(&.{0.5}, 0).?);
 }
 
 test "minimax h3: start-sigma noise mix is (1-σ)·z + σ·noise" {

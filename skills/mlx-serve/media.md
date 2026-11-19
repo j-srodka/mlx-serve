@@ -252,6 +252,9 @@ Pack folder `{model}/latent_upscaler/*.safetensors` also works on the request.
 | `latent_init_path` | Absolute `.safetensors` written by `latent_out`. Required. Canvas = sidecar latent × 16; frame count must match. |
 | `refine_sigmas` | Descending video-clock list ending at 0, e.g. `[0.9035, 0.6316, 0.3158, 0]`. Already shifted (do not pass unit-clock values). Alt: `refine_start_sigma` + `steps`. |
 | `refine_audio` | Default false: keep the init soundtrack. true re-noises audio too. |
+| `latent_mask_path` | Absolute `.safetensors` with tensor `mask` shaped `[T_lat, H/32, W/32]` (row grid, **1 = redraw**). Needs `latent_init_path`. |
+| `mask_hold` | `noisy` (default): held rows follow `(1-σ)·z + σ·ε`. `clean`: held rows stay at the init. |
+| `mask_feather` | Token-wide linear edge blend (default 0 = hard 0/1 mask). |
 | `latent_upscale` | `{ "factor": 2.0, "tier": 1 }`; the target canvas is the request's `width`/`height`. Video latent only. Missing weights → named 400, never interpolate. |
 | `refine` | `false` = upscale only (below). Default true. |
 
