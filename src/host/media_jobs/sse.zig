@@ -82,6 +82,10 @@ pub const StreamCtx = struct {
     fn cancelledCb(ptr: *anyopaque) bool {
         const self: *StreamCtx = @ptrCast(@alignCast(ptr));
         if (self.cancelled) return true;
+        if (server_mod.shutdown_requested.load(.acquire)) {
+            self.cancelled = true;
+            return true;
+        }
         // A failed write is a LATE signal even when streaming: TCP send
         // buffers absorb hundreds of events after the client's FIN. The
         // socket probe is prompt, and for a non-streaming job it is the only
@@ -232,6 +236,15 @@ test "jsonEscapeMessage keeps an error body parseable (live: the mode:\"edit\" 4
     // A trailing escape is emitted whole or not at all.
     var tiny: [1]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 0), jsonEscapeMessage(&tiny, "\"").len);
+}
+
+test "shutdown Progress: SIGTERM latches cancel on the stream progress probe" {
+    server_mod.shutdown_requested.store(true, .release);
+    defer server_mod.shutdown_requested.store(false, .release);
+    var conn: Conn = undefined;
+    var sctx = StreamCtx{ .conn = &conn, .stream = false };
+    try std.testing.expect(StreamCtx.cancelledCb(&sctx));
+    try std.testing.expect(sctx.cancelled);
 }
 
 test "Progress.cancelled defaults false, reads the probe when set" {

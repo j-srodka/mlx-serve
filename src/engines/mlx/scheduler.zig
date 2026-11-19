@@ -340,20 +340,6 @@ pub fn init(
     return self;
 }
 
-/// The inference thread's current step gets this long past the shutdown flush's deadline.
-const JOIN_GRACE_MS: i64 = 30_000;
-
-/// When `deinit` stops waiting for the inference thread: the flush deadline (0 = unarmed) or now, plus the grace.
-fn joinDeadlineMs(flush_deadline_ms: i64, now_ms: i64) i64 {
-    return @max(flush_deadline_ms, now_ms) + JOIN_GRACE_MS;
-}
-
-test "scheduler: shutdown waits for the inference thread past the flush deadline, then a grace" {
-    try std.testing.expectEqual(@as(i64, 1_000 + JOIN_GRACE_MS), joinDeadlineMs(0, 1_000));
-    try std.testing.expectEqual(@as(i64, 46_000 + JOIN_GRACE_MS), joinDeadlineMs(46_000, 1_000));
-    try std.testing.expectEqual(@as(i64, 90_000 + JOIN_GRACE_MS), joinDeadlineMs(46_000, 90_000));
-}
-
 pub fn deinit(self: *Scheduler) void {
     self.shutdown.store(true, .release);
     // Wake inference thread if it's waiting on queue_cond.
@@ -363,15 +349,8 @@ pub fn deinit(self: *Scheduler) void {
     self.queue_mu.unlock(self.io);
 
     if (self.inference_thread) |t| {
-        // A step that never returns (a receive from a cluster worker that left) or runs for minutes (a streamed pass
-        // on a slow SSD) would hold the join forever: past the flush deadline and a grace, exit without it.
-        const start = io_util.nowMsMonotonic(self.io);
-        const until = joinDeadlineMs(self.shutdown_deadline_ms.load(.acquire), start);
+        // Bounded by the shutdown watchdog (`host/shutdown/grace.zig`), not here.
         while (!self.inference_done.load(.acquire)) {
-            if (io_util.nowMsMonotonic(self.io) >= until) {
-                log.err("[shutdown] the inference thread is still inside a step after {d} s; exiting without it\n", .{@divTrunc(until - start, 1000)});
-                std.process.exit(1);
-            }
             std.Io.sleep(self.io, .fromMilliseconds(20), .real) catch {};
         }
         t.join();
