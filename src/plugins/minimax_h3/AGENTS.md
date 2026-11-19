@@ -26,6 +26,7 @@ a student runs exactly its own), `seed`, `turbo` (needs `turbo_lora.safetensors`
 `.safetensors` packs; XOR with `ref_images`), `lora_paths`/`lora_scales`,
 `latent_init_path` + `refine_sigmas` / `refine_start_sigma` (FL2VA, one window; pins as a render, refs on hybrid),
 `latent_upscale` `{factor, tier}` (`--h3-upscaler` or pack `latent_upscaler/`), `refine: false` (upscale only, no DiT).
+`encode_only: true` + `video_frames` + `latent_out`: VAE-encode only; frames snap DOWN on the ladder; optional `audio`.
 A two-time pack samples only its trained step counts (`two_time.sigma_grids`), default `default_steps`; no `turbo`.
 `cfg_scale`/`stg_scale`/`pipeline` are ignored, not refused (the app sends them for every video backend).
 

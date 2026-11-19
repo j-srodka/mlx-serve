@@ -556,6 +556,27 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     const dir = req.dir orelse return Verdict.refuse(.failed, "minimax_h3: the host gave no pack dir");
     var b = job.Body.parse(gpa, req.body.slice()) orelse return bad("invalid JSON body");
     defer b.deinit();
+    if (b.flag("encode_only")) {
+        const frames = b.get("video_frames") orelse return req.refuseFmt(.unsupported, "missing 'video_frames'", "'encode_only' needs 'video_frames': base64 JPEG frames", .{});
+        const out = b.str("latent_out") orelse return bad("'latent_out' must be an absolute path");
+        if (!std.fs.path.isAbsolute(out)) return bad("'latent_out' must be an absolute path");
+        const width = u32Field(&b, "width", 256);
+        const height = u32Field(&b, "height", 256);
+        if (width % 32 != 0 or height % 32 != 0) return bad("width and height must be multiples of 32");
+        if (frames != .array) return bad("'video_frames' must be an array of base64 PNG/JPEG strings");
+        const n = std.math.cast(u32, frames.array.items.len) orelse return bad("too many 'video_frames'");
+        const snapped = h3.snapEncodeFrames(n) orelse return bad("'video_frames' needs at least 5 frames");
+        inline for (.{ "steps", "refine_sigmas", "latent_prefix_frames", "latent_suffix_frames", "ref_images", "first_frame_image", "last_frame_image", "turbo" }) |field| {
+            if (fieldSet(&b, field)) return bad("'" ++ field ++ "' is not supported with 'encode_only'");
+        }
+        if (u32Field(&b, "chain_windows", 1) > 1) return bad("'chain_windows' is not supported with 'encode_only'");
+        const vae_bytes = dir.fileBytes("video_vae.safetensors") + if (fieldSet(&b, "audio")) dir.fileBytes("audio_vae.safetensors") else @as(u64, 0);
+        const mem = memNow(req);
+        const bill = config.canvasBill(vae_bytes, config.REQUEST_BASE_BYTES, mem.host_avail, mem.gpu_limit, mem.gpu_active, mlx.cudaAvailable());
+        if (config.refuseStagedCanvasBill(vae_bytes, bill.need, bill.avail, abi.skipMemPreflight(req.machine orelse &abi.Machine{})))
+            return bad("the VAE encode does not fit in memory: use a smaller canvas or fewer frames");
+        return runEncodeOnly(e, req, &b, width, height, snapped, out, progress);
+    }
     if (b.get("refine")) |v| {
         if (v != .bool) return bad("'refine' must be true or false");
         if (!v.bool) return upscaleOnly(e, req, &b);
@@ -985,6 +1006,61 @@ fn refmodsCanvasError(has_voice: bool, width: u32, height: u32) ?[]const u8 {
     return null;
 }
 
+fn runEncodeOnly(e: *Engine, req: *const abi.Request, b: *const job.Body, width: u32, height: u32, n: u32, out: []const u8, progress: *const abi.Progress) Verdict {
+    _ = progress;
+    const s = e.stream;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const values = b.get("video_frames").?.array.items;
+    const frames = a.alloc([]u8, n) catch return Verdict.refuse(.busy, "out of memory");
+    for (values[0..n], frames) |f, *dst| {
+        if (f != .string) return bad("'video_frames' must be an array of base64 PNG/JPEG strings");
+        dst.* = job.imageUpload(a, f.string) catch return bad("a 'video_frames' entry is not valid base64");
+    }
+    const pixels = (videoFrames(frames, height, width, 1, 2, s) catch return Verdict.refuse(.busy, "out of memory")) orelse return bad("a 'video_frames' entry could not be decoded");
+    defer _ = mlx.mlx_array_free(pixels);
+    const path = e.path("video_vae.safetensors") catch return Verdict.refuse(.busy, "out of memory");
+    defer gpa.free(path);
+    var weights = model_mod.loadWeightsSingleFile(gpa, path) catch return job.failure(error.FileNotFound, "MiniMax-H3: video VAE missing");
+    defer weights.deinit();
+    var enc = vae_mod.Encoder.load(gpa, &weights, s) catch return job.failure(error.OutOfMemory, "MiniMax-H3: VAE load failed");
+    defer enc.deinit();
+    const video = enc.encodeVideo(pixels, gpa, s) catch return job.failure(error.OutOfMemory, "MiniMax-H3: VAE encode failed");
+    defer _ = mlx.mlx_array_free(video);
+    var audio = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(audio);
+    if (b.get("audio")) |v| {
+        if (v != .string) return bad("'audio' must be a base64 WAV string");
+        const pcm = wav32kStereo(v.string) catch return bad("'audio' must be a PCM16/PCM24/float32 WAV");
+        defer gpa.free(pcm);
+        const wf = planar(pcm) catch return Verdict.refuse(.busy, "out of memory");
+        defer _ = mlx.mlx_array_free(wf);
+        const apath = e.path("audio_vae.safetensors") catch return Verdict.refuse(.busy, "out of memory");
+        defer gpa.free(apath);
+        var aw = model_mod.loadWeightsSingleFile(gpa, apath) catch return bad("this pack has no audio_vae.safetensors");
+        defer aw.deinit();
+        _ = mlx.mlx_array_free(audio);
+        audio = mlx.mlx_array_new();
+        audio = audio_mod.encode(gpa, &aw, wf, s) catch return job.failure(error.OutOfMemory, "MiniMax-H3: audio encode failed");
+    } else {
+        mlx.check(mlx.mlx_zeros(&audio, &[_]c_int{ 1, 32, 2, 0 }, 4, .float32, s)) catch return Verdict.refuse(.busy, "out of memory");
+    }
+    const path_z = gpa.dupeSentinel(u8, out, 0) catch return Verdict.refuse(.busy, "out of memory");
+    defer gpa.free(path_z);
+    h3.saveLatentSidecar(path_z, video, audio, s) catch return Verdict.refuse(.failed, "MiniMax-H3 failed to write latent_out");
+    const latent_t = mlx.getShape(video)[2];
+    log.info("[minimax-h3] encode only: {d} frames, latent_t={d}\n", .{ n, latent_t });
+    var esc: std.ArrayList(u8) = .empty;
+    defer esc.deinit(gpa);
+    appendJsonEscaped(gpa, &esc, out) catch return Verdict.refuse(.busy, "out of memory");
+    const members = std.fmt.allocPrint(gpa, "\"encode_only\":true,\"num_frames\":{d},\"latent_t\":{d},\"path\":\"{s}\"", .{ n, latent_t, esc.items }) catch return Verdict.refuse(.busy, "out of memory");
+    gpa.free(e.result);
+    e.result = members;
+    _ = req;
+    return .ok;
+}
+
 fn runRefmodsExtract(e: *Engine, req: *const abi.Request) Verdict {
     if (e.refmods_result.len != 0) {
         gpa.free(e.refmods_result);
@@ -1308,6 +1384,14 @@ pub fn hybridConformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
 
 const testing = std.testing;
 
+test "minimax_h3 plugin: encode_only requires video_frames" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var pack = try MediaPack.open(arena.allocator());
+    defer pack.close();
+    try testing.expectEqualStrings("missing 'video_frames'", (try pack.run("{\"encode_only\":true}")).refused.why.slice());
+}
+
 test "minimax_h3 plugin: a seeded clip on the tiny pack is deterministic JSON members; bad fields are refused by name" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1318,6 +1402,11 @@ test "minimax_h3 plugin: a seeded clip on the tiny pack is deterministic JSON me
     try testing.expectEqualStrings(first, (try pack.run(pack.fx.body)).ok);
     inline for (.{
         .{ "{}", "missing 'prompt'" },
+        .{ "{\"encode_only\":true,\"video_frames\":[]}", "'latent_out' must be an absolute path" },
+        .{ "{\"encode_only\":true,\"video_frames\":[],\"latent_out\":\"rel\"}", "'latent_out' must be an absolute path" },
+        .{ "{\"encode_only\":true,\"video_frames\":[],\"latent_out\":\"/tmp/x\",\"width\":70}", "width and height must be multiples of 32" },
+        .{ "{\"encode_only\":true,\"video_frames\":[],\"latent_out\":\"/tmp/x\"}", "'video_frames' needs at least 5 frames" },
+
         .{ "{\"prompt\":\"x\",\"width\":70}", "width and height must be multiples of 32" },
         .{ "{\"prompt\":\"x\",\"steps\":0}", "'steps' must be in [1,100]" },
         .{ "{\"prompt\":\"x\",\"chain_windows\":7}", "chain_windows must be 1-6" },
@@ -1333,6 +1422,11 @@ test "minimax_h3 plugin: a seeded clip on the tiny pack is deterministic JSON me
         .{ "{\"prompt\":\"x\",\"turbo\":true}", "this pack has no turbo_lora.safetensors — download minimax_h3_turbo_4step_ema_ckpt850.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora (Apache-2.0) into the model folder as turbo_lora.safetensors" },
         .{ "{\"prompt\":\"x\",\"first_frame_image\":\"!!\"}", "keyframe image is not valid base64" },
     }) |c| try testing.expectEqualStrings(c[1], (try pack.run(c[0])).refused.why.slice());
+    inline for (.{ "steps", "refine_sigmas", "latent_prefix_frames", "latent_suffix_frames", "ref_images", "first_frame_image", "last_frame_image", "turbo", "chain_windows" }) |field| {
+        const body = try std.fmt.allocPrint(arena.allocator(), "{{\"encode_only\":true,\"video_frames\":[0,0,0,0,0],\"latent_out\":\"/tmp/x\",\"{s}\":2}}", .{field});
+        try testing.expectEqualStrings("'" ++ field ++ "' is not supported with 'encode_only'", (try pack.run(body)).refused.why.slice());
+    }
+
 }
 
 test "minimax_h3 plugin: a canvas past the live memory is refused before any stage loads, naming its numbers" {
@@ -1481,6 +1575,45 @@ fn expectSameArray(want: A, got: A) !void {
     var same = false;
     try mlx.check(mlx.mlx_array_item_bool(&same, eq));
     try testing.expect(same);
+}
+
+test "minimax_h3 plugin: latent sidecar round trips video and silent audio" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var pack = try MediaPack.open(aa);
+    defer pack.close();
+    const root_buf = try aa.alloc(u8, std.fs.max_path_bytes);
+    const root = root_buf[0..try pack.tmp.dir.realPath(testing.io, root_buf)];
+    const path = try std.fmt.allocPrintSentinel(aa, "{s}/roundtrip.safetensors", .{root}, 0);
+    const video = try rampArray(&.{ 1, 24, 12, 4, 4 }, 1.0);
+    defer _ = mlx.mlx_array_free(video);
+    var silent = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(silent);
+    try mlx.check(mlx.mlx_zeros(&silent, &[_]c_int{ 1, 32, 2, 0 }, 4, .float32, pack.stream));
+    try h3.saveLatentSidecar(path.ptr, video, silent, pack.stream);
+    const silent_loaded = try h3.loadLatentSidecar(aa, path.ptr, pack.stream);
+    defer _ = mlx.mlx_array_free(silent_loaded.video);
+    defer _ = mlx.mlx_array_free(silent_loaded.audio);
+    try expectSameArray(silent, silent_loaded.audio);
+    const audio_one = try rampArray(&.{ 1, 32, 2, 1 }, 0.5);
+    defer _ = mlx.mlx_array_free(audio_one);
+    try h3.saveLatentSidecar(path.ptr, video, audio_one, pack.stream);
+    const once = try h3.loadLatentSidecar(aa, path.ptr, pack.stream);
+    defer _ = mlx.mlx_array_free(once.video);
+    defer _ = mlx.mlx_array_free(once.audio);
+    try expectSameArray(video, once.video);
+    try expectSameArray(audio_one, once.audio);
+    for ([_]f32{ 0.0, 0.5 }) |scale| {
+        const audio = try rampArray(&.{ 1, 32, 2, 65 }, scale);
+        defer _ = mlx.mlx_array_free(audio);
+        try h3.saveLatentSidecar(path.ptr, video, audio, pack.stream);
+        const loaded = try h3.loadLatentSidecar(aa, path.ptr, pack.stream);
+        defer _ = mlx.mlx_array_free(loaded.video);
+        defer _ = mlx.mlx_array_free(loaded.audio);
+        try expectSameArray(video, loaded.video);
+        try expectSameArray(audio, loaded.audio);
+    }
 }
 
 test "minimax_h3 plugin: refine:false upscales any latent T to latent_out, carries the audio, and never needs the DiT" {
