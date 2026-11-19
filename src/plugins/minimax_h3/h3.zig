@@ -3706,10 +3706,51 @@ fn appendPinnedRows(dst: mlx.mlx_array, pin_rows: mlx.mlx_array, pin_n: c_int, s
     return out;
 }
 
+fn blendOnePinRow(pin: mlx.mlx_array, noise: mlx.mlx_array, row: c_int, scale: f32, s: S) !mlx.mlx_array {
+    const prow = try sliceRows(pin, row, row + 1, s);
+    defer _ = mlx.mlx_array_free(prow);
+    const nrow = try sliceRows(noise, row, row + 1, s);
+    defer _ = mlx.mlx_array_free(nrow);
+    if (scale <= 0) {
+        return contig(prow, s);
+    } else if (scale >= 1) {
+        return contig(nrow, s);
+    }
+    const one_s = try scalarLike(1.0, prow, s);
+    defer _ = mlx.mlx_array_free(one_s);
+    const sc = try scalarLike(scale, prow, s);
+    defer _ = mlx.mlx_array_free(sc);
+    const inv = try subA(one_s, sc, s);
+    defer _ = mlx.mlx_array_free(inv);
+    const a = try mulA(prow, inv, s);
+    defer _ = mlx.mlx_array_free(a);
+    const b = try mulA(nrow, sc, s);
+    defer _ = mlx.mlx_array_free(b);
+    return addA(a, b, s);
+}
+
 fn blendPinRowsWithNoise(allocator: std.mem.Allocator, pin: mlx.mlx_array, noise: mlx.mlx_array, side: PinSide, span_t: u32, rows_per_t: u32, amount: f32, s: S) !mlx.mlx_array {
     if (amount <= 0) return contig(pin, s);
     std.debug.assert(span_t > 0);
-    std.debug.assert(@as(u32, @intCast(mlx.getShape(pin)[0])) == span_t * rows_per_t);
+    const row_n: u32 = @intCast(mlx.getShape(pin)[0]);
+    std.debug.assert(row_n == span_t * rows_per_t);
+    // Audio pin rows are channel-major `[L 0..T)(R 0..T)`; video groups `rows_per_t` spatial rows per latent frame.
+    if (rows_per_t == 2 and row_n == span_t * 2) {
+        var parts = try allocator.alloc(mlx.mlx_array, row_n);
+        defer allocator.free(parts);
+        var n: usize = 0;
+        for (0..2) |ch| {
+            for (0..span_t) |ti| {
+                const scale = pinNoiseScale(side, @intCast(ti), span_t, amount);
+                const row: c_int = @intCast(ch * span_t + ti);
+                parts[n] = try blendOnePinRow(pin, noise, row, scale, s);
+                n += 1;
+            }
+        }
+        const out = try concat(parts[0..n], 0, s);
+        _ = mlx.mlx_array_free(pin);
+        return out;
+    }
     var parts = try allocator.alloc(mlx.mlx_array, span_t);
     defer allocator.free(parts);
     var n: usize = 0;
@@ -9594,52 +9635,84 @@ test "minimax h3: pin noise blend spans a 56-frame audio pin" {
     defer a.free(pin_buf);
     const noise_buf = try a.alloc(f32, @intCast(rows * dim));
     defer a.free(noise_buf);
-    for (pin_buf, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) * 0.01;
-    for (noise_buf, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) * 0.02 + 1.0;
+    @memset(pin_buf, 1.0);
+    @memset(noise_buf, 0.0);
     const pin = mlx.mlx_array_new_data(pin_buf.ptr, &[_]c_int{ rows, dim }, 2, mlx.mlx_dtype.float32);
     const noise = mlx.mlx_array_new_data(noise_buf.ptr, &[_]c_int{ rows, dim }, 2, mlx.mlx_dtype.float32);
     defer _ = mlx.mlx_array_free(noise);
     const out = try blendPinRowsWithNoise(a, pin, noise, .prefix, pin_t, 2, 0.4, s);
     defer _ = mlx.mlx_array_free(out);
     try testing.expectEqual(rows, mlx.getShape(out)[0]);
+    const l_inner = try readRowAtF32(out, pin_t - 1, 0, s);
+    const r_outer = try readRowAtF32(out, pin_t, 0, s);
+    const l_scale = pinNoiseScale(.prefix, pin_t - 1, pin_t, 0.4);
+    const r_scale = pinNoiseScale(.prefix, 0, pin_t, 0.4);
+    try testing.expect(l_scale < r_scale);
+    try testing.expectApproxEqAbs(1.0, l_inner, 1e-5);
+    try testing.expectApproxEqAbs(1.0 - r_scale, r_outer, 1e-5);
 }
 
 test "minimax h3: staggered audio pin locks keep stereo channel order" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
-    const audio_t: u32 = 8;
-    const pin_t: u32 = 2;
+    const a = testing.allocator;
+    const audio_t: u32 = 10;
+    const pin_t: u32 = 3;
+    const mid_t: u32 = audio_t - pin_t - pin_t;
+    try testing.expect(mid_t > 2);
     const row_n: c_int = @intCast(audio_t * 2);
-    const dim: c_int = 2;
-    var buf = [_]f32{
-        1, 1, 2, 2, 10, 10, 11, 11, 12, 12, 13, 13, 20, 20, 21, 21,
-        30, 30, 31, 31, 40, 40, 41, 41, 50, 50, 51, 51, 60, 60, 61, 61,
-    };
-  // packed [Lpre Rpre Lmid Rmid Lsuf Rsuf] each pin_t=2, mid=4
-    const ax = mlx.mlx_array_new_data(&buf, &[_]c_int{ row_n, dim }, 2, mlx.mlx_dtype.float32);
+    const dim: c_int = 4;
+    const buf = try a.alloc(f32, @intCast(row_n * dim));
+    defer a.free(buf);
+    const row_n_u: usize = @intCast(row_n);
+    const dim_u: usize = @intCast(dim);
+    for (0..row_n_u) |row| {
+        for (0..dim_u) |col| buf[row * dim_u + col] = @as(f32, @floatFromInt(row)) * 10 + @as(f32, @floatFromInt(col));
+    }
+    const pin_row_n: c_int = @intCast(pin_t * 2);
+    const pre_buf = try a.alloc(f32, @intCast(pin_row_n * dim));
+    defer a.free(pre_buf);
+    const suf_buf = try a.alloc(f32, @intCast(pin_row_n * dim));
+    defer a.free(suf_buf);
+    const pin_row_n_u: usize = @intCast(pin_row_n);
+    for (0..pin_row_n_u) |row| {
+        for (0..dim_u) |col| {
+            pre_buf[row * dim_u + col] = 5000 + @as(f32, @floatFromInt(row)) * 10 + @as(f32, @floatFromInt(col));
+            suf_buf[row * dim_u + col] = 6000 + @as(f32, @floatFromInt(row)) * 10 + @as(f32, @floatFromInt(col));
+        }
+    }
+    const ax = mlx.mlx_array_new_data(buf.ptr, &[_]c_int{ row_n, dim }, 2, mlx.mlx_dtype.float32);
     defer _ = mlx.mlx_array_free(ax);
-    var pin_pre_buf = [_]f32{ 100, 100, 101, 101 };
-    var pin_suf_buf = [_]f32{ 200, 200, 201, 201 };
-    const pin_pre = mlx.mlx_array_new_data(&pin_pre_buf, &[_]c_int{ 4, dim }, 2, mlx.mlx_dtype.float32);
+    const pin_pre = mlx.mlx_array_new_data(pre_buf.ptr, &[_]c_int{ pin_row_n, dim }, 2, mlx.mlx_dtype.float32);
     defer _ = mlx.mlx_array_free(pin_pre);
-    const pin_suf = mlx.mlx_array_new_data(&pin_suf_buf, &[_]c_int{ 4, dim }, 2, mlx.mlx_dtype.float32);
+    const pin_suf = mlx.mlx_array_new_data(suf_buf.ptr, &[_]c_int{ pin_row_n, dim }, 2, mlx.mlx_dtype.float32);
     defer _ = mlx.mlx_array_free(pin_suf);
+    const mid_l_base: usize = pin_t * 2;
+    const mid_r_base: usize = mid_l_base + mid_t;
+    const suf_base: usize = (pin_t + mid_t) * 2;
     const dummy_v1 = mlx.mlx_array_new_data(&[_]f32{0}, &[_]c_int{1, 1}, 2, mlx.mlx_dtype.float32);
-    const ax_mid = try contig(ax, s);
-    const mid = try restorePinnedLatentStep(dummy_v1, ax_mid, 1, null, null, 0, 0, pin_pre, pin_suf, pin_t, pin_t, audio_t, 2, 1, s);
-    defer _ = mlx.mlx_array_free(mid[0]);
-    defer _ = mlx.mlx_array_free(mid[1]);
-    try testing.expectEqual(@as(f32, 1), try readRow0F32(mid[1], s));
-    try testing.expectEqual(@as(f32, 2), try readRowAtF32(mid[1], 1, 0, s));
-    try testing.expectEqual(@as(f32, 12), try readRowAtF32(mid[1], 4, 0, s));
-    try testing.expectEqual(@as(f32, 200), try readRowAtF32(mid[1], 12, 0, s));
+    const ax_s1 = try contig(ax, s);
+    const at_s1 = try restorePinnedLatentStep(dummy_v1, ax_s1, 1, null, null, 0, 0, pin_pre, pin_suf, pin_t, pin_t, audio_t, 2, 1, s);
+    defer _ = mlx.mlx_array_free(at_s1[0]);
+    defer _ = mlx.mlx_array_free(at_s1[1]);
+    try testing.expectEqual(@as(f32, 0), try readRowAtF32(at_s1[1], 0, 0, s));
+    try testing.expectEqual(@as(f32, @floatFromInt(@as(usize, pin_t - 1) * 10)), try readRowAtF32(at_s1[1], pin_t - 1, 0, s));
+    try testing.expectEqual(@as(f32, @floatFromInt((pin_t * 2 - 1) * 10)), try readRowAtF32(at_s1[1], pin_t * 2 - 1, 0, s));
+    try testing.expect(try readRowAtF32(at_s1[1], 0, 0, s) != 5000);
+    try testing.expectEqual(@as(f32, @floatFromInt(mid_l_base * 10)), try readRowAtF32(at_s1[1], mid_l_base, 0, s));
+    try testing.expectEqual(@as(f32, @floatFromInt(mid_r_base * 10)), try readRowAtF32(at_s1[1], mid_r_base, 0, s));
+    try testing.expectEqual(@as(f32, 6000), try readRowAtF32(at_s1[1], suf_base, 0, s));
     const dummy_v2 = mlx.mlx_array_new_data(&[_]f32{0}, &[_]c_int{1, 1}, 2, mlx.mlx_dtype.float32);
-    const ax_lock = try contig(ax, s);
-    const locked = try restorePinnedLatentStep(dummy_v2, ax_lock, 2, null, null, 0, 0, pin_pre, pin_suf, pin_t, pin_t, audio_t, 2, 1, s);
-    defer _ = mlx.mlx_array_free(locked[0]);
-    defer _ = mlx.mlx_array_free(locked[1]);
-    try testing.expectEqual(@as(f32, 100), try readRow0F32(locked[1], s));
-    try testing.expectEqual(@as(f32, 200), try readRowAtF32(locked[1], 12, 0, s));
+    const ax_s2 = try contig(ax, s);
+    const at_s2 = try restorePinnedLatentStep(dummy_v2, ax_s2, 2, null, null, 0, 0, pin_pre, pin_suf, pin_t, pin_t, audio_t, 2, 1, s);
+    defer _ = mlx.mlx_array_free(at_s2[0]);
+    defer _ = mlx.mlx_array_free(at_s2[1]);
+    try testing.expectEqual(@as(f32, 5000), try readRowAtF32(at_s2[1], 0, 0, s));
+    try testing.expectEqual(@as(f32, 5000 + @as(f32, @floatFromInt(@as(usize, pin_t - 1) * 10))), try readRowAtF32(at_s2[1], pin_t - 1, 0, s));
+    try testing.expectEqual(@as(f32, 5000 + @as(f32, @floatFromInt((pin_t * 2 - 1) * 10))), try readRowAtF32(at_s2[1], pin_t * 2 - 1, 0, s));
+    try testing.expectEqual(@as(f32, @floatFromInt(mid_l_base * 10)), try readRowAtF32(at_s2[1], mid_l_base, 0, s));
+    try testing.expectEqual(@as(f32, 6000), try readRowAtF32(at_s2[1], suf_base, 0, s));
+    try testing.expectEqual(@as(f32, 6000 + @as(f32, @floatFromInt((pin_t * 2 - 1) * 10))), try readRowAtF32(at_s2[1], suf_base + pin_t * 2 - 1, 0, s));
 }
 
 fn readRowAtF32(x: mlx.mlx_array, row: usize, col: usize, stream: mlx.mlx_stream) !f32 {

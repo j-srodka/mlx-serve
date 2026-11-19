@@ -1169,11 +1169,13 @@ fn alignAudioLatentToLayout(z: mlx.mlx_array, frames: u32, s: mlx.mlx_stream) !m
     const want_t = h3.temporalShape(frames).audio_t;
     const cur_t: u32 = @intCast(mlx.getShape(z)[3]);
     if (cur_t > want_t) {
+        errdefer _ = mlx.mlx_array_free(z);
         const out = try mlxSliceAudioLatentT(z, want_t, s);
         _ = mlx.mlx_array_free(z);
         return out;
     }
     if (cur_t < want_t) {
+        errdefer _ = mlx.mlx_array_free(z);
         var pad = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(pad);
         try mlx.check(mlx.mlx_zeros(&pad, &[_]c_int{ 1, 32, 2, @intCast(want_t - cur_t) }, 4, .float32, s));
