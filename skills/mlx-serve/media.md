@@ -257,7 +257,7 @@ audio schedule (`steps` in the body snaps to 9). `GET /health` `"audio_only":tru
 | field | notes |
 |---|---|
 | `audio_only` | `true` with `latent_init_path`. Video latent byte-identical to the init; audio re-denoised from σ 1.0. |
-| `audio_hold` | Optional `[[start,end],…]` source-frame ranges whose audio stays from the init (seams / carried tails). |
+| `audio_hold` | Optional `[[start,end],…]` inclusive audio latent T indices kept from the init (seams / carried tails). |
 | `latent_out` | Unchanged `video_latent` plus new `audio_latent`. |
 
 FL2VA, `chain_windows` 1. `refine_sigmas` / pins refused — use `audio_hold` instead.

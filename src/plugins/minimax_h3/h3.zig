@@ -2024,11 +2024,15 @@ pub fn buildTimestepPlan(
     shift_v: f64,
     shift_a: f64,
     aug: StepClock,
+    direct_audio_sigma: ?f64,
 ) !TimestepPlan {
     const t_v = 1.0 - sigma_v;
-    const t_a = 1.0 - aug.max_t * timeShiftSigma(sigma_v / aug.max_t, shift_v, shift_a);
+  const t_a = if (direct_audio_sigma) |sa| 1.0 - sa else 1.0 - aug.max_t * timeShiftSigma(sigma_v / aug.max_t, shift_v, shift_a);
     const video: TimePair = if (aug.endpoint) |e| .{ .t = t_v, .r = 1.0 - e } else .same(t_v);
-    const audio: TimePair = if (aug.endpoint) |e| .{ .t = t_a, .r = 1.0 - aug.max_t * timeShiftSigma(e / aug.max_t, shift_v, shift_a) } else .same(t_a);
+    const audio: TimePair = if (aug.endpoint) |e| .{
+        .t = t_a,
+        .r = if (direct_audio_sigma != null) 1.0 - e else 1.0 - aug.max_t * timeShiftSigma(e / aug.max_t, shift_v, shift_a),
+    } else .same(t_a);
     const vis_cond = TimePair.same(@max(t_v, aug.visual));
     const aud_cond = TimePair.same(@max(t_a, aug.audio));
 
@@ -2202,8 +2206,9 @@ pub fn buildTimestepPlanGlobal(
     shift_a: f64,
     aug: StepClock,
     global_ts: []const TimePair,
+    direct_audio_sigma: ?f64,
 ) !TimestepPlan {
-    var p = try buildTimestepPlan(allocator, layout, sigma_v, shift_v, shift_a, aug);
+    var p = try buildTimestepPlan(allocator, layout, sigma_v, shift_v, shift_a, aug, direct_audio_sigma);
     errdefer p.deinit();
     for (p.runs) |*r| {
         const t = p.unique_t[r.mod_row / 3];
@@ -2228,13 +2233,23 @@ pub fn collectScheduleTs(
     shift_a: f64,
     aug: StepClock,
     two_time: bool,
+    audio_only: bool,
 ) ![]TimePair {
     var list: std.ArrayList(TimePair) = .empty;
     errdefer list.deinit(allocator);
+    const sigma_v_hold = 1.0 - VISUAL_COND_TIMESTEP;
     for (sigmas[0 .. sigmas.len - 1], sigmas[1..]) |sig, next| {
         var clock = aug;
         clock.endpoint = if (two_time) next else null;
-        var p = try buildTimestepPlan(allocator, layout, sig, shift_v, shift_a, clock);
+        var p = try buildTimestepPlan(
+            allocator,
+            layout,
+            if (audio_only) sigma_v_hold else sig,
+            shift_v,
+            shift_a,
+            clock,
+            if (audio_only) sig else null,
+        );
         defer p.deinit();
         for (p.unique_t[0..p.n_unique]) |t| {
             const seen = for (list.items) |e| {
@@ -3774,7 +3789,7 @@ pub fn restoreAudioHoldRanges(
     var cur = rows;
     for (holds) |h| {
         const span = audioHoldLatentTRange(h.start, h.end);
-        if (span.lo >= span.hi or span.hi > audio_t) continue;
+        if (span.lo >= span.hi or span.hi > audio_t) return error.AudioHoldRangeEmpty;
         const lo: c_int = @intCast(span.lo);
         const hi: c_int = @intCast(span.hi);
         const l_hold = try sliceRows(init_rows, lo, hi, s);
@@ -4001,7 +4016,7 @@ pub fn audioOnlyRequestError(
     latent_suffix_frames: u32,
     has_refine_schedule: bool,
     holds: []const AudioHoldRange,
-    num_frames: u32,
+    audio_latent_t: u32,
 ) ?[]const u8 {
     if (!audio_only) return null;
     if (!has_init) return "audio_only requires latent_init_path";
@@ -4011,8 +4026,11 @@ pub fn audioOnlyRequestError(
     if (has_refine_schedule)
         return "audio_only takes a fixed 9-point audio schedule — omit refine_sigmas, refine_start_sigma and refine_audio";
     for (holds) |h| {
-        if (h.start >= h.end) return "audio_hold ranges need start < end";
-        if (h.end > num_frames) return "audio_hold range extends past the init's num_frames";
+        if (h.start > h.end) return "audio_hold ranges need start <= end (inclusive audio latent T indices)";
+        if (h.end >= audio_latent_t)
+            return "audio_hold range extends past the init's audio_latent T — indices are inclusive latent-frame slots 0..T-1";
+        const span = audioHoldLatentTRange(h.start, h.end);
+        if (span.lo >= span.hi) return "audio_hold range is empty after conversion";
     }
     return null;
 }
@@ -4022,12 +4040,9 @@ pub fn audioOnlySigmas(allocator: std.mem.Allocator) ![]f64 {
     return sigmaSchedule(allocator, AUDIO_ONLY_STEPS, SIGMA_SHIFT_AUDIO);
 }
 
-/// Source-frame span → half-open audio-latent T indices for `audio_hold`.
-pub fn audioHoldLatentTRange(start_src: u32, end_src: u32) struct { lo: u32, hi: u32 } {
-    return .{
-        .lo = if (start_src == 0) 0 else audioLatentTHiExclusiveForKeepEnd(start_src),
-        .hi = audioLatentTHiExclusiveForKeepEnd(end_src),
-    };
+/// Inclusive audio-latent T indices in the request → half-open row slice bounds.
+pub fn audioHoldLatentTRange(start_t: u32, end_inclusive: u32) struct { lo: u32, hi: u32 } {
+    return .{ .lo = start_t, .hi = end_inclusive + 1 };
 }
 
 /// A FastH3 PDD student (FastVideo `fastvideo/layers/pdd.py`): its output heads
@@ -5807,12 +5822,12 @@ fn generateOne(
         );
     }
     // Captured AFTER the pin splice: every step restores it whole, so it carries the packed pin layout.
-    if (req.init_audio_latent != null and !req.refine_audio) carry_audio = try contig(audio_x, s);
+    if (req.init_audio_latent != null and !req.refine_audio and !req.audio_only) carry_audio = try contig(audio_x, s);
 
     const max_t: f64 = if (req.pdd) |p| p.max_t else 1.0;
     const two_time = req.geometry.two_time != null;
     // Few-step samplers integrate the audio stream on its exact mapped clock (`audioStepFactor`).
-    const distilled = req.turbo or req.pdd != null or two_time;
+    const distilled = (req.turbo or req.pdd != null or two_time) and !req.audio_only;
     const sigmas = if (req.audio_only)
         try audioOnlySigmas(allocator)
     else if (req.refine_sigmas) |rs|
@@ -5885,7 +5900,7 @@ fn generateOne(
         // precomputeAdaln. Default ON: it is what keeps the DiT residency at
         // ~22 GB instead of ~35 on the 8-bit pack.
         if (req.resident == null) {
-            const ts = try collectScheduleTs(allocator, &layout, sigmas, req.shift_video, req.shift_audio, .{ .max_t = max_t }, two_time);
+            const ts = try collectScheduleTs(allocator, &layout, sigmas, req.shift_video, req.shift_audio, .{ .max_t = max_t }, two_time, req.audio_only);
             defer allocator.free(ts);
             try model.precomputeAdaln(ts, s);
             log.info("[minimax-h3] adaln precomputed for {d} timesteps; 13B modulation weights released\n", .{ts.len});
@@ -6001,6 +6016,7 @@ fn generateOne(
             }
         }
 
+        const audio_only_hold_v = 1.0 - VISUAL_COND_TIMESTEP;
         for (0..n_steps) |i| {
             model.ablate = switch (abl_mode) {
                 .off => .none,
@@ -6010,6 +6026,12 @@ fn generateOne(
             var step_timer = LapClock.init(io);
             const sigma = sigmas[i];
             const dsigma = sigmas[i + 1] - sigmas[i];
+            const sigma_v_plan = if (req.audio_only) audio_only_hold_v else sigma;
+            const direct_audio = if (req.audio_only) sigma else null;
+            const unit_v = if (req.audio_only)
+                timeShiftSigma(sigma, SIGMA_SHIFT_AUDIO, SIGMA_SHIFT_VIDEO) / max_t
+            else
+                sigma / max_t;
 
             // Step-cache gate: the relative input move this step would make
             // with the CACHED velocity is known without any forward.
@@ -6039,7 +6061,11 @@ fn generateOne(
                     _ = mlx.mlx_array_free(audio_x);
                     audio_x = try contig(ca, s);
                 } else {
-                    const askip = cachedAudioAdvance(distilled, sc_a_slope, sigma, sigmas[i + 1], max_t, req.shift_video, req.shift_audio);
+                    const dsigma_a = sigmas[i + 1] - sigmas[i];
+                    const askip = if (req.audio_only)
+                        dsigma_a / timeShiftSlope(unit_v, req.shift_video, req.shift_audio)
+                    else
+                        cachedAudioAdvance(distilled, sc_a_slope, sigma, sigmas[i + 1], max_t, req.shift_video, req.shift_audio);
                     const da = try scalarLike(@floatCast(askip), sc_a.?, s);
                     defer _ = mlx.mlx_array_free(da);
                     const stepa = try mulA(sc_a.?, da, s);
@@ -6106,9 +6132,9 @@ fn generateOne(
             }
             const clock: StepClock = .{ .max_t = max_t, .endpoint = if (two_time) sigmas[i + 1] else null };
             var plan = if (model.adaln_tables) |tt|
-                try buildTimestepPlanGlobal(allocator, &layout, sigma, req.shift_video, req.shift_audio, clock, tt.ts)
+                try buildTimestepPlanGlobal(allocator, &layout, sigma_v_plan, req.shift_video, req.shift_audio, clock, tt.ts, direct_audio)
             else
-                try buildTimestepPlan(allocator, &layout, sigma, req.shift_video, req.shift_audio, clock);
+                try buildTimestepPlan(allocator, &layout, sigma_v_plan, req.shift_video, req.shift_audio, clock, direct_audio);
             defer plan.deinit();
 
             // The forward consumes EVERY video-stream row in packed order:
@@ -6137,8 +6163,7 @@ fn generateOne(
             var fused: ?Model.Heads = if (req.pdd) |*p| try model.pddHeads(p, @intCast(i), req.shift_video, req.shift_audio, s) else null;
             defer if (fused) |*f| f.deinit();
             // The shift maps read the unit clock; max_t scales the noise levels.
-            const unit = sigma / max_t;
-            var out = try model.forward(&layout, &plan, refined, video_in, audio_in, rope, fused orelse model.ownHeads(), timeShiftSlope(unit, req.shift_video, req.shift_audio), if (attn_bcast) |*ab| ab else null, refresh, s);
+            var out = try model.forward(&layout, &plan, refined, video_in, audio_in, rope, fused orelse model.ownHeads(), timeShiftSlope(unit_v, req.shift_video, req.shift_audio), if (attn_bcast) |*ab| ab else null, refresh, s);
             defer out.deinit();
 
             // Per-step JPEG from predicted clean x0 = x - σ·v, using the
@@ -6171,7 +6196,12 @@ fn generateOne(
                 _ = mlx.mlx_array_free(audio_x);
                 audio_x = try contig(ca, s);
             } else {
-                const da = try scalarLike(@floatCast(max_t * audioStepFactor(distilled, unit, sigmas[i + 1] / max_t, req.shift_video, req.shift_audio)), out.audio, s);
+                const dsigma_a = sigmas[i + 1] - sigmas[i];
+                const da_mul = if (req.audio_only)
+                    dsigma_a / timeShiftSlope(unit_v, req.shift_video, req.shift_audio)
+                else
+                    max_t * audioStepFactor(distilled, unit_v, sigmas[i + 1] / max_t, req.shift_video, req.shift_audio);
+                const da = try scalarLike(@floatCast(da_mul), out.audio, s);
                 defer _ = mlx.mlx_array_free(da);
                 const stepa = try mulA(out.audio, da, s);
                 defer _ = mlx.mlx_array_free(stepa);
@@ -7095,14 +7125,13 @@ test "minimax h3: timestep plan can index a GLOBAL schedule table" {
     defer layout.deinit();
 
     const sigma = 0.5;
-    var local = try buildTimestepPlan(a, &layout, sigma, 12.0, 3.0, .{});
-    defer local.deinit();
+    var local = try buildTimestepPlan(a, &layout, sigma, 12.0, 3.0, .{}, null);    defer local.deinit();
 
     // A global table containing the step's ts plus others, sorted.
     const t_v = 1.0 - sigma;
     const t_a = 1.0 - timeShiftSigma(sigma, 12.0, 3.0);
     const global = [_]TimePair{ .same(0.1), .same(t_a), .same(0.3), .same(t_v), .same(0.9) };
-    var g = try buildTimestepPlanGlobal(a, &layout, sigma, 12.0, 3.0, .{}, &global);
+    var g = try buildTimestepPlanGlobal(a, &layout, sigma, 12.0, 3.0, .{}, &global, null);
     defer g.deinit();
 
     // Same runs, but rows resolve into the GLOBAL table: t_a sits at global
@@ -7124,7 +7153,7 @@ test "minimax h3: schedule t-set collects every step's unique timesteps" {
     defer layout.deinit();
     const sigmas = try sigmaSchedule(a, 4, 12.0);
     defer a.free(sigmas);
-    const ts = try collectScheduleTs(a, &layout, sigmas, 12.0, 3.0, .{}, false);
+    const ts = try collectScheduleTs(a, &layout, sigmas, 12.0, 3.0, .{}, false, false);
     defer a.free(ts);
     // 4 steps x 2 timesteps (video, audio) minus the sigma=1 step, where both
     // schedules coincide at t=0: 7 distinct values, sorted ascending.
@@ -7132,7 +7161,7 @@ test "minimax h3: schedule t-set collects every step's unique timesteps" {
     for (1..ts.len) |i| try testing.expect(ts[i].t > ts[i - 1].t);
     // Every step's plan resolves inside the collected set.
     for (0..4) |i| {
-        var p = try buildTimestepPlanGlobal(a, &layout, sigmas[i], 12.0, 3.0, .{}, ts);
+        var p = try buildTimestepPlanGlobal(a, &layout, sigmas[i], 12.0, 3.0, .{}, ts, null);
         defer p.deinit();
         for (p.runs) |r| try testing.expect(r.mod_row / 3 < ts.len);
     }
@@ -7368,8 +7397,7 @@ test "minimax h3: an image layout is text, one t slot per reference, then the ta
     for (0..4) |r| try testing.expectEqualSlices(f64, &.{ 5, tw[r / 2], tw[r % 2] }, pos[(10 + r) * 3 ..][0..3]);
 
     // No audio rows: no audio run, no audio timestep, and the references held at 0.999.
-    var p = try buildTimestepPlan(a, &l, 0.75, 1.0, 1.0, .{});
-    defer p.deinit();
+    var p = try buildTimestepPlan(a, &l, 0.75, 1.0, 1.0, .{}, null);    defer p.deinit();
     try testing.expectEqual(@as(usize, 2), p.n_unique);
     try testing.expectEqual(@as(usize, 3), p.runs.len);
     try testing.expectEqual(ModRun{ .start = 0, .end = 4, .mod_row = 1 }, p.runs[0]);
@@ -7384,8 +7412,7 @@ test "minimax h3: the final layer reads the target's own timestep when the text 
     defer l.deinit();
     const tags = [_]u8{ 1, 1, 0, 0, 0, 1 };
     l.text_tags = &tags;
-    var p = try buildTimestepPlan(a, &l, 0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{});
-    defer p.deinit();
+    var p = try buildTimestepPlan(a, &l, 0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{}, null);    defer p.deinit();
     const t_v = 0.5;
     const t_a = 1.0 - timeShiftSigma(0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO);
     try testing.expectEqual(t_v, p.unique_t[p.timestepRow(l.videoSegment())].t);
@@ -7400,8 +7427,7 @@ test "minimax h3: the timestep plan reads a PDD student's 0.999 clock" {
     var l = try PackedLayout.init(a, 8, 2, 4, 4, 8, &.{}, 5);
     defer l.deinit();
     const k: u32 = 3;
-    var plan = try buildTimestepPlan(a, &l, p.sigmaAt(p.nodes[k], SIGMA_SHIFT_VIDEO), SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{ .max_t = p.max_t });
-    defer plan.deinit();
+    var plan = try buildTimestepPlan(a, &l, p.sigmaAt(p.nodes[k], SIGMA_SHIFT_VIDEO), SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{ .max_t = p.max_t }, null);    defer plan.deinit();
     const t_a = 1.0 - p.sigmaAt(p.nodes[k], SIGMA_SHIFT_AUDIO);
     const found = for (plan.unique_t[0..plan.n_unique]) |t| {
         if (@abs(t.t - t_a) < 1e-12) break true;
@@ -8152,8 +8178,7 @@ test "minimax h3: timestep plan assigns modulation rows" {
     // must not allocate rows for condition classes that are absent.
     var l1 = try PackedLayout.init(a, 512, 17, 30, 54, 93, &.{}, 56);
     defer l1.deinit();
-    var p1 = try buildTimestepPlan(a, &l1, 0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{});
-    defer p1.deinit();
+    var p1 = try buildTimestepPlan(a, &l1, 0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{}, null);    defer p1.deinit();
     try testing.expectEqual(@as(usize, 2), p1.n_unique);
     try testing.expectEqual(l1.segments.len, p1.runs.len);
     // unique_t is sorted ascending, and the audio schedule runs AHEAD of the
@@ -8171,8 +8196,7 @@ test "minimax h3: timestep plan assigns modulation rows" {
     // distinct timestep — the row the AdaLN reshape must have space for.
     var l2 = try PackedLayout.init(a, 512, 17, 30, 54, 93, &.{.first}, 56);
     defer l2.deinit();
-    var p2 = try buildTimestepPlan(a, &l2, 0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{});
-    defer p2.deinit();
+    var p2 = try buildTimestepPlan(a, &l2, 0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{}, null);    defer p2.deinit();
     try testing.expectEqual(@as(usize, 3), p2.n_unique);
     try testing.expectApproxEqAbs(VISUAL_COND_TIMESTEP, p2.unique_t[2].t, 1e-12);
     // The cond segment carries the VIDEO modality tag but the condition
@@ -8230,8 +8254,7 @@ test "minimax h3: refs with prefix and suffix pins — layout, overlap, cond tim
     }
     try testing.expectEqual(layout.seq_len, layout.segments[layout.segments.len - 1].end);
 
-    var plan = try buildTimestepPlan(a, &layout, 0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{});
-    defer plan.deinit();
+    var plan = try buildTimestepPlan(a, &layout, 0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{}, null);    defer plan.deinit();
     var vis_cond_i: ?usize = null;
     var aud_cond_i: ?usize = null;
     for (plan.unique_t, 0..) |t, i| {
@@ -8268,8 +8291,7 @@ test "minimax h3: latent pin rows use conditioning timesteps, not generation noi
     const pin_a = overlapAudioLatentT(22);
     var layout = try PackedLayout.initFull(a, 8, shape.latent_t, 4, 4, shape.audio_t, &.{}, 56, &.{}, k, 0, pin_a, 0);
     defer layout.deinit();
-    var plan = try buildTimestepPlan(a, &layout, 0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{});
-    defer plan.deinit();
+    var plan = try buildTimestepPlan(a, &layout, 0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{}, null);    defer plan.deinit();
     try testing.expect(plan.n_unique >= 3);
     var vis_cond_i: ?usize = null;
     var aud_cond_i: ?usize = null;
@@ -8337,8 +8359,7 @@ test "minimax h3: a vision-carrying text span splits into tag runs" {
 
     // Uniform text: exactly one run per segment, the pre-vision behaviour.
     {
-        var p = try buildTimestepPlan(a, &l, 0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{});
-        defer p.deinit();
+        var p = try buildTimestepPlan(a, &l, 0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{}, null);        defer p.deinit();
         try testing.expectEqual(l.segments.len, p.runs.len);
         try testing.expectEqual(@as(u32, 0 * 3 + 1), p.runs[0].mod_row);
     }
@@ -8348,8 +8369,7 @@ test "minimax h3: a vision-carrying text span splits into tag runs" {
     // this wrong and the pads are modulated with text statistics — silent.
     const tags = [_]u8{ 1, 1, 0, 0, 0, 0, 1, 1, 1, 1 };
     l.text_tags = &tags;
-    var p = try buildTimestepPlan(a, &l, 0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{});
-    defer p.deinit();
+    var p = try buildTimestepPlan(a, &l, 0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{}, null);    defer p.deinit();
 
     // 3 text runs + audio + video.
     try testing.expectEqual(@as(usize, 5), p.runs.len);
@@ -8371,8 +8391,7 @@ test "minimax h3: a vision-carrying text span splits into tag runs" {
     // trusted: a mismatched split would silently mis-modulate every later row.
     const short = [_]u8{ 1, 0 };
     l.text_tags = &short;
-    var p2 = try buildTimestepPlan(a, &l, 0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{});
-    defer p2.deinit();
+    var p2 = try buildTimestepPlan(a, &l, 0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{}, null);    defer p2.deinit();
     try testing.expectEqual(l.segments.len, p2.runs.len);
 }
 
@@ -9583,10 +9602,14 @@ test "minimax h3: refine sigma list and start-sigma map" {
     defer a.free(ao_sig);
     try testing.expectEqual(@as(usize, 10), ao_sig.len);
     try testing.expectEqual(@as(f64, 0), ao_sig[ao_sig.len - 1]);
-    try testing.expectEqualStrings("audio_only requires latent_init_path", audioOnlyRequestError(true, false, 1, 0, 0, false, &.{}, 39).?);
-    try testing.expectEqualStrings("audio_only does not support chain_windows > 1", audioOnlyRequestError(true, true, 2, 0, 0, false, &.{}, 39).?);
-    try testing.expectEqualStrings("audio_only does not support latent_prefix_frames or latent_suffix_frames — use audio_hold for held audio tails", audioOnlyRequestError(true, true, 1, 5, 0, false, &.{}, 39).?);
-    try testing.expectEqualStrings("audio_hold range extends past the init's num_frames", audioOnlyRequestError(true, true, 1, 0, 0, false, &.{.{ .start = 0, .end = 40 }}, 39).?);
+    const ao_shape = temporalShape(39);
+    try testing.expectEqualStrings("audio_only requires latent_init_path", audioOnlyRequestError(true, false, 1, 0, 0, false, &.{}, ao_shape.audio_t).?);
+    try testing.expectEqualStrings("audio_only does not support chain_windows > 1", audioOnlyRequestError(true, true, 2, 0, 0, false, &.{}, ao_shape.audio_t).?);
+    try testing.expectEqualStrings("audio_only does not support latent_prefix_frames or latent_suffix_frames — use audio_hold for held audio tails", audioOnlyRequestError(true, true, 1, 5, 0, false, &.{}, ao_shape.audio_t).?);
+    try testing.expectEqualStrings("audio_hold range extends past the init's audio_latent T — indices are inclusive latent-frame slots 0..T-1", audioOnlyRequestError(true, true, 1, 0, 0, false, &.{.{ .start = 0, .end = ao_shape.audio_t }}, ao_shape.audio_t).?);
+    const hold = audioHoldLatentTRange(0, 10);
+    try testing.expectEqual(@as(u32, 0), hold.lo);
+    try testing.expectEqual(@as(u32, 11), hold.hi);
 }
 
 test "minimax h3: mask-held target rows ride the visual conditioning timestep" {
@@ -9789,8 +9812,7 @@ test "minimax h3: a two-time plan keys rows by (t, r), so video and audio stay a
     defer l.deinit();
     // Step 0: both clocks start at t = 0 but aim at different endpoints; the keyframe stays put (r == t).
     const next = 0.98265594;
-    var p = try buildTimestepPlan(a, &l, 1.0, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{ .endpoint = next });
-    defer p.deinit();
+    var p = try buildTimestepPlan(a, &l, 1.0, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{ .endpoint = next }, null);    defer p.deinit();
     try testing.expectEqual(@as(usize, 3), p.n_unique);
     const video = p.unique_t[p.timestepRow(l.videoSegment())];
     const audio = p.unique_t[p.timestepRow(l.audioSegment())];
@@ -9801,8 +9823,7 @@ test "minimax h3: a two-time plan keys rows by (t, r), so video and audio stay a
     try testing.expectApproxEqAbs(1.0 - timeShiftSigma(next, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO), audio.r, 1e-12);
     try testing.expectEqual(cond.t, cond.r);
     // Without an endpoint the same step has one row fewer: the base model's two streams share t = 0.
-    var q = try buildTimestepPlan(a, &l, 1.0, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{});
-    defer q.deinit();
+    var q = try buildTimestepPlan(a, &l, 1.0, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{}, null);    defer q.deinit();
     try testing.expectEqual(@as(usize, 2), q.n_unique);
 }
 
@@ -9814,8 +9835,7 @@ test "minimax h3: a two-time FL2VA plan holds both keyframes at r == t over the 
     const sigmas = try gridSchedule(a, &grid, 12.0);
     defer a.free(sigmas);
     for (0..grid.len - 1) |i| {
-        var p = try buildTimestepPlan(a, &l, sigmas[i], 12.0, 3.0, .{ .endpoint = sigmas[i + 1] });
-        defer p.deinit();
+        var p = try buildTimestepPlan(a, &l, sigmas[i], 12.0, 3.0, .{ .endpoint = sigmas[i + 1] }, null);        defer p.deinit();
         const video = p.unique_t[p.timestepRow(l.videoSegment())];
         try testing.expectApproxEqAbs(1.0 - sigmas[i + 1], video.r, 1e-12);
         for (l.segments, p.runs) |seg, run| if (seg.kind == .cond) {
@@ -9834,14 +9854,14 @@ test "minimax h3: a two-time schedule table holds every step's pairs and each st
     const sigmas = try gridSchedule(a, &grid, 12.0);
     defer a.free(sigmas);
     try testing.expectApproxEqAbs(@as(f64, 0.98265594), sigmas[1], 1e-6);
-    const ts = try collectScheduleTs(a, &l, sigmas, 12.0, 3.0, .{}, true);
+    const ts = try collectScheduleTs(a, &l, sigmas, 12.0, 3.0, .{}, true, false);
     defer a.free(ts);
     try testing.expectEqual(@as(usize, 12), ts.len);
     for (0..6) |i| {
         const clock: StepClock = .{ .endpoint = sigmas[i + 1] };
-        var local = try buildTimestepPlan(a, &l, sigmas[i], 12.0, 3.0, clock);
+        var local = try buildTimestepPlan(a, &l, sigmas[i], 12.0, 3.0, clock, null);
         defer local.deinit();
-        var g = try buildTimestepPlanGlobal(a, &l, sigmas[i], 12.0, 3.0, clock, ts);
+        var g = try buildTimestepPlanGlobal(a, &l, sigmas[i], 12.0, 3.0, clock, ts, null);
         defer g.deinit();
         for (local.runs, g.runs) |lr, gr| try testing.expect(local.unique_t[lr.mod_row / 3].eql(ts[gr.mod_row / 3]));
     }
@@ -10038,8 +10058,7 @@ test "minimax h3 flash parity: one DiT forward matches the stable-diffusion.cpp 
         for (t32, tags) |x, *t| t.* = @intFromFloat(x);
         layout.text_tags = tags;
     }
-    var plan = try buildTimestepPlan(a, &layout, sigma, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{ .endpoint = next });
-    defer plan.deinit();
+    var plan = try buildTimestepPlan(a, &layout, sigma, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{ .endpoint = next }, null);    defer plan.deinit();
     const refined = try model.refineText(ctx, s);
     defer _ = mlx.mlx_array_free(refined);
     var rope = try buildRope(a, &layout, model.inv_freq, .bfloat16, s);

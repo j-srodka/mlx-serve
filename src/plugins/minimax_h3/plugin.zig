@@ -631,7 +631,7 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     const audio_only = b.flag("audio_only");
     var audio_hold_buf: [8]h3.AudioHoldRange = undefined;
     const audio_holds = parseAudioHolds(&b, &audio_hold_buf) catch |msg| return switch (msg) {
-        error.BadAudioHold => bad("'audio_hold' must be an array of [start, end] source-frame ranges"),
+        error.BadAudioHold => bad("'audio_hold' must be an array of [start, end] inclusive audio latent T indices"),
         error.TooManyAudioHolds => bad("too many audio_hold ranges (max 8)"),
     };
     var audio_only_steps_snap_from: ?u32 = null;
@@ -2255,7 +2255,7 @@ test "minimax_h3 plugin: audio_only Re-voice holds video latents exact, snaps st
     defer _ = mlx.mlx_array_free(out.video);
     defer _ = mlx.mlx_array_free(out.audio);
     try expectSameArray(v, out.video);
-    const hold_hi: c_int = 11;
+    const hold_hi: c_int = 11; // inclusive latent T index 10 → half-open [0, 11)
     try expectSameSlices(au, 3, 0, out.audio, 0, hold_hi);
     const mid_lo = hold_hi;
     const mid_n: c_int = @as(c_int, @intCast(shape.audio_t)) - mid_lo;
