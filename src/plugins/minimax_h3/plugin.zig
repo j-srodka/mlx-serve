@@ -861,12 +861,18 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         const as = mlx.getShape(init_a.?);
         if (h3.refineInitGeometryError(vs.len, @intCast(vs[1]), @intCast(vs[2]), @intCast(vs[3]), @intCast(vs[4]), @intCast(as[3]), width, height, shape.frame_count)) |msg|
             return Verdict.named(.unsupported, msg);
-        inline for (.{ .{ "latent_prefix_path", prefix_v, prefix_a, latent_prefix_frames }, .{ "latent_suffix_path", suffix_v, suffix_a, latent_suffix_frames } }) |p| {
-            if (p[1]) |pv| {
-                const ps = mlx.getShape(pv);
-                if (h3.refinePinGeometryError(p[0], @intCast(ps[3]), @intCast(ps[4]), @intCast(ps[2]), @intCast(mlx.getShape(p[2].?)[3]), p[3], width, height)) |msg|
-                    return Verdict.named(.unsupported, msg);
-            }
+    }
+    inline for (.{ .{ "latent_prefix_path", prefix_v, prefix_a, latent_prefix_frames }, .{ "latent_suffix_path", suffix_v, suffix_a, latent_suffix_frames } }) |p| {
+        if (p[1]) |pv| {
+            const ps = mlx.getShape(pv);
+            const audio_t: u32 = @intCast(mlx.getShape(p[2].?)[3]);
+            const video_t: u32 = @intCast(ps[2]);
+            const need_v = h3.overlapVideoLatentT(p[3]);
+            const need_a = h3.overlapAudioLatentT(p[3]);
+            if (!has_latent_init and (video_t < need_v or audio_t < need_a))
+                return req.refuseFmt(.unsupported, "'" ++ p[0] ++ "' holds fewer latent frames than its pin needs", "'" ++ p[0] ++ "' has {d} video and {d} audio latent frames; '" ++ (if (std.mem.eql(u8, p[0], "latent_prefix_path")) "latent_prefix_frames" else "latent_suffix_frames") ++ "' of {d} needs at least {d} video and {d} audio latent frames", .{ video_t, audio_t, p[3], need_v, need_a });
+            if (h3.refinePinGeometryError(p[0], @intCast(ps[3]), @intCast(ps[4]), @intCast(ps[2]), @intCast(mlx.getShape(p[2].?)[3]), p[3], width, height)) |msg|
+                return Verdict.named(.unsupported, msg);
         }
     }
 
@@ -1333,6 +1339,26 @@ test "minimax_h3 plugin: a seeded clip on the tiny pack is deterministic JSON me
         .{ "{\"prompt\":\"x\",\"turbo\":true}", "this pack has no turbo_lora.safetensors — download minimax_h3_turbo_4step_ema_ckpt850.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora (Apache-2.0) into the model folder as turbo_lora.safetensors" },
         .{ "{\"prompt\":\"x\",\"first_frame_image\":\"!!\"}", "keyframe image is not valid base64" },
     }) |c| try testing.expectEqualStrings(c[1], (try pack.run(c[0])).refused.why.slice());
+}
+
+test "minimax_h3 plugin: short sidecar pins without refine are refused before weights load" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var pack = try MediaPack.open(aa);
+    defer pack.close();
+    const p = try sidecarPaths(aa, &pack.tmp);
+    const v = try rampArray(&.{ 1, 24, 1, 4, 4 }, 1);
+    defer _ = mlx.mlx_array_free(v);
+    const a = try rampArray(&.{ 1, 32, 2, 1 }, 1);
+    defer _ = mlx.mlx_array_free(a);
+    try h3.saveLatentSidecar(p.a.ptr, v, a, pack.stream);
+    try pack.tmp.dir.deleteFile(testing.io, "text_encoder.safetensors");
+    inline for (.{ "prefix", "suffix" }) |side| {
+        const body = try std.fmt.allocPrint(aa, "{{\"prompt\":\"x\",\"width\":64,\"height\":64,\"num_frames\":39,\"latent_{s}_frames\":22,\"latent_{s}_path\":\"{s}\"}}", .{ side, side, p.a });
+        const expected = "'latent_" ++ side ++ "_path' holds fewer latent frames than its pin needs";
+        try testing.expectEqualStrings(expected, (try pack.run(body)).refused.why.slice());
+    }
 }
 
 test "minimax_h3 plugin: a canvas past the live memory is refused before any stage loads, naming its numbers" {
