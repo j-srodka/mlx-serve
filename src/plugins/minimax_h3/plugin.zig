@@ -865,13 +865,18 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     inline for (.{ .{ "latent_prefix_path", prefix_v, prefix_a, latent_prefix_frames }, .{ "latent_suffix_path", suffix_v, suffix_a, latent_suffix_frames } }) |p| {
         if (p[1]) |pv| {
             const ps = mlx.getShape(pv);
-            const audio_t: u32 = @intCast(mlx.getShape(p[2].?)[3]);
+            const as = mlx.getShape(p[2].?);
+            if (ps.len != 5)
+                return req.refuseFmt(.unsupported, "'" ++ p[0] ++ "' video_latent must be [1, 24, T, H, W]", "'" ++ p[0] ++ "' video_latent has rank {d}; expected [1, 24, T, H, W] (rank 5)", .{ps.len});
+            if (as.len != 4)
+                return req.refuseFmt(.unsupported, "'" ++ p[0] ++ "' audio_latent must be [1, 32, 2, Ta]", "'" ++ p[0] ++ "' audio_latent has rank {d}; expected [1, 32, 2, Ta] (rank 4)", .{as.len});
+            const audio_t: u32 = @intCast(as[3]);
             const video_t: u32 = @intCast(ps[2]);
             const need_v = h3.overlapVideoLatentT(p[3]);
             const need_a = h3.overlapAudioLatentT(p[3]);
             if (!has_latent_init and (video_t < need_v or audio_t < need_a))
                 return req.refuseFmt(.unsupported, "'" ++ p[0] ++ "' holds fewer latent frames than its pin needs", "'" ++ p[0] ++ "' has {d} video and {d} audio latent frames; '" ++ (if (std.mem.eql(u8, p[0], "latent_prefix_path")) "latent_prefix_frames" else "latent_suffix_frames") ++ "' of {d} needs at least {d} video and {d} audio latent frames", .{ video_t, audio_t, p[3], need_v, need_a });
-            if (h3.refinePinGeometryError(p[0], @intCast(ps[3]), @intCast(ps[4]), @intCast(ps[2]), @intCast(mlx.getShape(p[2].?)[3]), p[3], width, height)) |msg|
+            if (h3.refinePinGeometryError(p[0], @intCast(ps[3]), @intCast(ps[4]), video_t, audio_t, p[3], width, height)) |msg|
                 return Verdict.named(.unsupported, msg);
         }
     }
@@ -1358,6 +1363,19 @@ test "minimax_h3 plugin: short sidecar pins without refine are refused before we
         const body = try std.fmt.allocPrint(aa, "{{\"prompt\":\"x\",\"width\":64,\"height\":64,\"num_frames\":39,\"latent_{s}_frames\":22,\"latent_{s}_path\":\"{s}\"}}", .{ side, side, p.a });
         const expected = "'latent_" ++ side ++ "_path' holds fewer latent frames than its pin needs";
         try testing.expectEqualStrings(expected, (try pack.run(body)).refused.why.slice());
+    }
+    const bad_audio = try rampArray(&.{1}, 1);
+    defer _ = mlx.mlx_array_free(bad_audio);
+    const bad_video = try rampArray(&.{ 1, 24 }, 1);
+    defer _ = mlx.mlx_array_free(bad_video);
+    try h3.saveLatentSidecar(p.b.ptr, v, bad_audio, pack.stream);
+    try h3.saveLatentSidecar(p.c.ptr, bad_video, a, pack.stream);
+    inline for (.{ "prefix", "suffix" }) |side| {
+        inline for (.{ .{ p.b, "audio_latent", "[1, 32, 2, Ta]" }, .{ p.c, "video_latent", "[1, 24, T, H, W]" } }) |case| {
+            const body = try std.fmt.allocPrint(aa, "{{\"prompt\":\"x\",\"width\":64,\"height\":64,\"num_frames\":39,\"latent_{s}_frames\":22,\"latent_{s}_path\":\"{s}\"}}", .{ side, side, case[0] });
+            const expected = "'latent_" ++ side ++ "_path' " ++ case[1] ++ " must be " ++ case[2];
+            try testing.expectEqualStrings(expected, (try pack.run(body)).refused.why.slice());
+        }
     }
 }
 
