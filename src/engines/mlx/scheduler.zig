@@ -340,8 +340,6 @@ pub fn init(
     return self;
 }
 
-const shutdown_grace = @import("../../host/shutdown/grace.zig");
-
 pub fn deinit(self: *Scheduler) void {
     self.shutdown.store(true, .release);
     // Wake inference thread if it's waiting on queue_cond.
@@ -351,20 +349,11 @@ pub fn deinit(self: *Scheduler) void {
     self.queue_mu.unlock(self.io);
 
     if (self.inference_thread) |t| {
-        // Same `drainDeadlineMs` as the serve conn drain; latch timeout and let `shutdownExitIfNeeded` exit.
-        const start = io_util.nowMsMonotonic(self.io);
-        const armed = self.shutdown_deadline_ms.load(.acquire);
+        // Bounded by the shutdown watchdog (`host/shutdown/grace.zig`), not here.
         while (!self.inference_done.load(.acquire)) {
-            const now = io_util.nowMsMonotonic(self.io);
-            const deadline = shutdown_grace.drainDeadlineMs(start, armed, true);
-            if (shutdown_grace.graceExpired(deadline, now)) {
-                shutdown_grace.shutdown_timed_out.store(true, .release);
-                log.err("[shutdown] inference thread still inside a step at grace deadline; caller will exit {d}\n", .{shutdown_grace.EXIT_GRACE_EXPIRED});
-                break;
-            }
             std.Io.sleep(self.io, .fromMilliseconds(20), .real) catch {};
         }
-        if (self.inference_done.load(.acquire)) t.join();
+        t.join();
     }
     // Past the join: the cluster's last message is this process's last MLX call on the link.
     @import("cluster/distributed.zig").shutdown();

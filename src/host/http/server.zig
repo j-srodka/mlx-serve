@@ -168,12 +168,6 @@ fn signalHandler(_: std.posix.SIG) callconv(.c) void {
     shutdown_requested.store(true, .release);
 }
 
-fn shutdownExitIfNeeded() void {
-    if (!shutdown_grace.shutdown_timed_out.load(.acquire)) return;
-    log.err("shutdown: exiting with status {d} (grace window expired)\n", .{shutdown_grace.EXIT_GRACE_EXPIRED});
-    std.process.exit(shutdown_grace.EXIT_GRACE_EXPIRED);
-}
-
 pub const ServerConfig = struct {
     /// Maximum context size (0 = unlimited). `--ctx-size N`.
     max_context_size: u32 = 0,
@@ -417,8 +411,7 @@ pub fn serve(
     defer startup.stop();
 
     var scheduler = try mlx_engine.start(allocator, io, load_params, max_concurrent);
-    // LIFO: register shutdownExitIfNeeded first so it runs after scheduler.deinit returns.
-    defer shutdownExitIfNeeded();
+    defer shutdown_grace.markCleanShutdown();
     defer scheduler.deinit();
     startup.stop();
     launch().global_scheduler = scheduler;
@@ -525,7 +518,7 @@ pub fn serve(
     mlx_engine.api().set_gen_yield(gen_yield);
     if (!gen_yield)
         log.info("chat does not interleave with media jobs on CUDA: a chat waits for the running image/audio job\n", .{});
-    shutdown_grace.shutdown_timed_out.store(false, .release);
+    shutdown_grace.resetForServe();
     // Install signal handlers for graceful shutdown (POSIX; on Windows Ctrl+C ends the process).
     if (comptime builtin.os.tag != .windows) {
         const sigact = std.posix.Sigaction{
@@ -694,38 +687,22 @@ pub fn serve(
     }
 
     // Shutdown ordering (prevents a SIGSEGV in Scheduler.complete): the accept
-    // loop has exited. Cancel every in-flight slot so its connection thread
-    // unblocks from waitNext and runs its `defer complete(...)`, then WAIT for
-    // all connection threads to finish before returning — `serve`'s caller runs
-    // `scheduler.deinit` on return, which frees the slot queues that an
-    // in-flight `complete()` is still touching. The inference thread is still
-    // alive here (deinit joins it only after we return), so cancelled slots
-    // settle promptly. Bounded so a wedged thread can't hang shutdown forever.
-    // The SSD flush's deadline starts here, once. The drain keeps its own bound: cutting it short
-    // saves nothing (the join below waits out the inference thread's current chunk anyway) and
-    // lets a late `complete()` race the queues `deinit` frees.
+    // loop has exited. One grace deadline is captured here; a watchdog enforces it.
+    const sigterm_now = nowMsMonotonic(io);
+    const deadline_ms = shutdown_grace.beginShutdown(io, sigterm_now, shutdown_persist_secs);
     if (launch().global_scheduler) |sch| {
-        armShutdownDeadline(&sch.shutdown_deadline_ms, nowMsMonotonic(io), shutdown_persist_secs);
+        shutdown_grace.syncFlushDeadline(&sch.shutdown_deadline_ms, deadline_ms);
         sch.cancelAllInFlight();
     }
     {
-        const start_ms = nowMsMonotonic(io);
-        const armed = if (launch().global_scheduler) |sch| sch.shutdown_deadline_ms.load(.acquire) else @as(i64, 0);
-        const in_flight = active_conn_threads.load(.acquire) > 0;
-        const deadline_ms = shutdown_grace.drainDeadlineMs(start_ms, armed, in_flight);
+        const drain_start_ms = nowMsMonotonic(io);
         while (active_conn_threads.load(.acquire) > 0) {
-            const now_ms = nowMsMonotonic(io);
-            if (shutdown_grace.graceExpired(deadline_ms, now_ms)) {
-                const remaining = active_conn_threads.load(.acquire);
-                shutdown_grace.shutdown_timed_out.store(true, .release);
-                log.err("shutdown: grace window expired with {d} connection thread(s) still active\n", .{remaining});
-                break;
-            }
+            if (shutdown_grace.shutdown_clean.load(.acquire)) break;
             crt.sleepMs(20);
         }
         const remaining = active_conn_threads.load(.acquire);
-        if (remaining > 0 and !shutdown_grace.shutdown_timed_out.load(.acquire))
-            log.warn("shutdown: {d} connection thread(s) still active after {d}ms — proceeding\n", .{ remaining, nowMsMonotonic(io) - start_ms });
+        if (remaining > 0)
+            log.warn("shutdown: {d} connection thread(s) still active after {d}ms; watchdog holds exit {d}\n", .{ remaining, nowMsMonotonic(io) - drain_start_ms, shutdown_grace.EXIT_GRACE_EXPIRED });
     }
 
     deinitGlobalResponseStore();

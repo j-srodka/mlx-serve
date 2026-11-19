@@ -456,14 +456,15 @@ test "shutdown fake: SIGTERM cancels cooperative in-flight step render" {
     try std.testing.expectEqual(@as(u32, 3), steps);
 }
 
-test "shutdown fake: wedged render hits graceExpired before more steps" {
-    const deadline = shutdown_grace.drainDeadlineMs(10_000, 10_050, true);
-    try std.testing.expect(shutdown_grace.graceExpired(deadline, 10_050));
-    try std.testing.expectEqual(shutdown_grace.EXIT_GRACE_EXPIRED, @as(u8, 2));
+test "shutdown fake: wedged path yields watchdog exit 2 after captured deadline" {
+    const deadline = shutdown_grace.captureDeadlineMs(10_000, 0);
+    try std.testing.expect(shutdown_grace.graceExpired(deadline, deadline));
+    try std.testing.expectEqual(shutdown_grace.EXIT_GRACE_EXPIRED, shutdown_grace.cleanShutdownExitCode(false, true));
 }
 
-test "shutdown fake: idle shutdown does not arm a conn drain wait" {
-    try std.testing.expectEqual(@as(i64, 42), shutdown_grace.drainDeadlineMs(42, 42 + 45_000, false));
+test "shutdown fake: clean latch before deadline is exit 0" {
+    try std.testing.expectEqual(@as(u8, 0), shutdown_grace.cleanShutdownExitCode(true, true));
+    try std.testing.expectEqual(shutdown_grace.EXIT_GRACE_EXPIRED, shutdown_grace.cleanShutdownExitCode(false, true));
 }
 
 test "shutdown fake: interrupt between steps stops at k plus one" {
