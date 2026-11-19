@@ -24,7 +24,9 @@ a student runs exactly its own), `seed`, `turbo` (needs `turbo_lora.safetensors`
 `chain_windows` 1-6 (FL2VA only; `num_frames` per window), FL2VA pins (`latent_prefix_frames`/`latent_suffix_frames` 5/22/39/56 + sidecar paths, `latent_out`), `first_frame_image` / `last_frame_image`, `ref_images` /
 `ref_videos` (`{frames, audio}`) / `ref_audios` + `ref_image_size` (REF2VA only), `ref_mod_paths` (absolute
 `.safetensors` packs; XOR with `ref_images`), `lora_paths`/`lora_scales`,
-`latent_init_path` + `refine_sigmas` / `refine_start_sigma` (FL2VA, one window; pins as a render, refs on hybrid),
+`latent_init_path` + `refine_sigmas` / `refine_start_sigma` (FL2VA, one window; pins as a render, refs on hybrid);
+`latent_mask_path` on the row grid (`[T_lat, H/32, W/32]`, 1 = redraw), `mask_hold` (`noisy`|`clean`), `mask_feather`;
+mask blends the refine window only — prefix/suffix pins restore after the mask each step;
 `latent_upscale` `{factor, tier}` (`--h3-upscaler` or pack `latent_upscaler/`), `refine: false` (upscale only, no DiT).
 `encode_only: true` + `video_frames` + `latent_out`: VAE-encode only; frames snap DOWN on the ladder; optional `audio`.
 A two-time pack samples only its trained step counts (`two_time.sigma_grids`), default `default_steps`; no `turbo`.

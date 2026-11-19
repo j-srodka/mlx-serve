@@ -471,6 +471,7 @@ fn upscaleOnly(e: *Engine, req: *const abi.Request, b: *const job.Body) Verdict 
         "latent_prefix_frames", "latent_suffix_frames", "latent_prefix_path", "latent_suffix_path",
         "ref_images",           "ref_videos",           "ref_audios",         "ref_mod_paths",
         "first_frame_image",    "last_frame_image",     "chain_windows",
+        "latent_mask_path",     "mask_hold",            "mask_feather",
     }) |k| {
         if (fieldSet(b, k)) break true;
     } else false;
@@ -625,6 +626,10 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     const latent_prefix_path_raw = b.str("latent_prefix_path");
     const latent_suffix_path_raw = b.str("latent_suffix_path");
     const latent_init_raw = b.str("latent_init_path");
+    const latent_mask_raw = b.str("latent_mask_path");
+    const has_latent_mask = latent_mask_raw != null and latent_mask_raw.?.len > 0;
+    const mask_feather = u32Field(&b, "mask_feather", 0);
+    const mask_hold_raw = b.str("mask_hold");
     const has_latent_init = latent_init_raw != null and latent_init_raw.?.len > 0;
     const has_latent_upscale = fieldSet(&b, "latent_upscale");
     const refine_audio = b.flag("refine_audio");
@@ -651,7 +656,9 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         refine_sigmas = refine_sigmas_buf[0..mapped.len];
         if (h3.refineSigmasError(refine_sigmas.?)) |msg| return Verdict.named(.unsupported, msg);
     }
-    if ((refine_sigmas != null or refine_audio or has_latent_upscale) and !has_latent_init)
+    if (h3.editMaskRequestError(has_latent_mask, has_latent_init, chain_windows, mask_hold_raw)) |msg|
+        return Verdict.named(.unsupported, msg);
+    if ((refine_sigmas != null or refine_audio or has_latent_upscale or has_latent_mask) and !has_latent_init)
         return bad("latent_init_path is required for refine / latent_upscale");
     var up: UpscaleSpec = .{};
     if (has_latent_upscale) if (parseUpscale(&b, &up)) |v| return v;
@@ -787,19 +794,33 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     if (has_latent_prefix_path) {
         const raw = latent_prefix_path_raw.?;
         if (!std.fs.path.isAbsolute(raw)) return bad("'latent_prefix_path' must be an absolute path");
-        const f = std.Io.Dir.openFileAbsolute(io, raw, .{}) catch return bad("'latent_prefix_path' file not found or not readable");
-        f.close(io);
     }
     if (has_latent_suffix_path) {
         const raw = latent_suffix_path_raw.?;
         if (!std.fs.path.isAbsolute(raw)) return bad("'latent_suffix_path' must be an absolute path");
-        const f = std.Io.Dir.openFileAbsolute(io, raw, .{}) catch return bad("'latent_suffix_path' file not found or not readable");
-        f.close(io);
     }
     if (has_latent_init) {
         const raw = latent_init_raw.?;
         if (!std.fs.path.isAbsolute(raw)) return bad("'latent_init_path' must be an absolute path");
-        const f = std.Io.Dir.openFileAbsolute(io, raw, .{}) catch return bad("'latent_init_path' file not found or not readable");
+    }
+    if (has_latent_mask) {
+        const raw = latent_mask_raw.?;
+        if (!std.fs.path.isAbsolute(raw)) return bad("'latent_mask_path' must be an absolute path");
+    }
+    if (has_latent_prefix_path) {
+        const f = std.Io.Dir.openFileAbsolute(io, latent_prefix_path_raw.?, .{}) catch return bad("'latent_prefix_path' file not found or not readable");
+        f.close(io);
+    }
+    if (has_latent_suffix_path) {
+        const f = std.Io.Dir.openFileAbsolute(io, latent_suffix_path_raw.?, .{}) catch return bad("'latent_suffix_path' file not found or not readable");
+        f.close(io);
+    }
+    if (has_latent_init) {
+        const f = std.Io.Dir.openFileAbsolute(io, latent_init_raw.?, .{}) catch return bad("'latent_init_path' file not found or not readable");
+        f.close(io);
+    }
+    if (has_latent_mask) {
+        const f = std.Io.Dir.openFileAbsolute(io, latent_mask_raw.?, .{}) catch return bad("'latent_mask_path' file not found or not readable");
         f.close(io);
     }
 
@@ -852,6 +873,14 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     defer if (init_a) |x| {
         _ = mlx.mlx_array_free(x);
     };
+    var edit_mask_v: ?mlx.mlx_array = null;
+    defer if (edit_mask_v) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    var mask_hold: h3.MaskHold = .noisy;
+    if (mask_hold_raw) |raw| {
+        mask_hold = if (std.mem.eql(u8, raw, "clean")) .clean else .noisy;
+    }
     if (has_latent_init) {
         const pathz = gpa.dupeSentinel(u8, latent_init_raw.?, 0) catch return job.failure(error.OutOfMemory, "out of memory");
         defer gpa.free(pathz);
@@ -888,6 +917,25 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         const as = mlx.getShape(init_a.?);
         if (h3.refineInitGeometryError(vs.len, @intCast(vs[1]), @intCast(vs[2]), @intCast(vs[3]), @intCast(vs[4]), @intCast(as[3]), width, height, shape.frame_count)) |msg|
             return Verdict.named(.unsupported, msg);
+        if (has_latent_mask) {
+            const mask_pathz = gpa.dupeSentinel(u8, latent_mask_raw.?, 0) catch return job.failure(error.OutOfMemory, "out of memory");
+            defer gpa.free(mask_pathz);
+            const mask_arr = h3.loadLatentMask(mask_pathz.ptr, s) catch return bad("'latent_mask_path' could not be loaded");
+            defer _ = mlx.mlx_array_free(mask_arr);
+            const ms = mlx.getShape(mask_arr);
+            if (ms.len != 3) return bad("'latent_mask_path' mask must be [T_lat, H/32, W/32]");
+            if (h3.refineMaskGeometryError(@intCast(ms[0]), @intCast(ms[1]), @intCast(ms[2]), @intCast(vs[2]), @intCast(vs[3]), @intCast(vs[4]))) |msg|
+                return Verdict.named(.unsupported, msg);
+            const host = h3.copyArrayF32(gpa, mask_arr, s) catch return bad("'latent_mask_path' could not be read");
+            defer gpa.free(host);
+            if (h3.latentMaskBinaryError(host, mask_feather)) |msg| return Verdict.named(.unsupported, msg);
+            if (mask_feather > 0)
+                h3.featherLatentMaskInPlace(gpa, host, @intCast(ms[0]), @intCast(ms[1]), @intCast(ms[2]), mask_feather) catch
+                    return bad("'latent_mask_path' could not be read");
+            const shape3 = [_]c_int{ ms[0], ms[1], ms[2] };
+            edit_mask_v = mlx.mlx_array_new_data(host.ptr, &shape3, 3, .float32);
+            mlx.check(mlx.mlx_array_eval(edit_mask_v.?)) catch return job.failure(error.MlxError, "MiniMax-H3 mask eval failed");
+        }
     }
     inline for (.{ .{ "latent_prefix_path", prefix_v, prefix_a, latent_prefix_frames }, .{ "latent_suffix_path", suffix_v, suffix_a, latent_suffix_frames } }) |p| {
         if (p[1]) |pv| {
@@ -933,6 +981,8 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         .chain_suffix_audio_latent = suffix_a,
         .init_video_latent = init_v,
         .init_audio_latent = init_a,
+        .edit_mask = edit_mask_v,
+        .mask_hold = mask_hold,
         .refine_sigmas = refine_sigmas,
         .refine_audio = refine_audio,
         .keyframes = kfs.buf[0..kfs.n],
@@ -1487,6 +1537,10 @@ test "minimax_h3 plugin: a seeded clip on the tiny pack is deterministic JSON me
         .{ "{\"prompt\":\"x\",\"latent_init_path\":\"latents.safetensors\"}", "'latent_init_path' must be an absolute path" },
         .{ "{\"prompt\":\"x\",\"latent_init_path\":\"/tmp/no_h3_init.safetensors\",\"chain_windows\":2}", "latent refine does not support chain_windows > 1" },
         .{ "{\"prompt\":\"x\",\"latent_init_path\":\"/tmp/no_h3_init.safetensors\",\"refine_sigmas\":[0.5,0.9,0]}", "refine_sigmas must be strictly descending" },
+        .{ "{\"prompt\":\"x\",\"latent_mask_path\":\"/tmp/m.safetensors\"}", "latent_mask_path requires latent_init_path" },
+        .{ "{\"prompt\":\"x\",\"latent_init_path\":\"/tmp/no_h3_init.safetensors\",\"latent_mask_path\":\"m.safetensors\"}", "'latent_mask_path' must be an absolute path" },
+        .{ "{\"prompt\":\"x\",\"latent_init_path\":\"/tmp/no_h3_init.safetensors\",\"latent_mask_path\":\"/tmp/m.safetensors\",\"chain_windows\":2}", "latent refine edit mask does not support chain_windows > 1" },
+        .{ "{\"prompt\":\"x\",\"latent_init_path\":\"/tmp/no_h3_init.safetensors\",\"latent_mask_path\":\"/tmp/m.safetensors\",\"mask_hold\":\"frozen\"}", "'mask_hold' must be \"clean\" or \"noisy\"" },
         .{ "{\"prompt\":\"x\",\"ref_images\":[\"AAAA\"]}", "this MiniMax-H3 pack does not support references (it declares no 'ref2va' task) — load a REF2VA checkpoint" },
         .{ "{\"prompt\":\"x\",\"turbo\":true}", "this pack has no turbo_lora.safetensors — download minimax_h3_turbo_4step_ema_ckpt850.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora (Apache-2.0) into the model folder as turbo_lora.safetensors" },
         .{ "{\"prompt\":\"x\",\"first_frame_image\":\"!!\"}", "keyframe image is not valid base64" },
@@ -1881,7 +1935,7 @@ fn expectSameSlices(a: A, axis: usize, a_lo: c_int, b: A, b_lo: c_int, n: c_int)
     try expectSameArray(x, y);
 }
 
-const SidecarPaths = struct { a: [:0]u8, b: [:0]u8, c: [:0]u8 };
+const SidecarPaths = struct { a: [:0]u8, b: [:0]u8, c: [:0]u8, d: [:0]u8 };
 
 fn sidecarPaths(aa: std.mem.Allocator, tmp: *testing.TmpDir) !SidecarPaths {
     const buf = try aa.alloc(u8, std.fs.max_path_bytes);
@@ -1890,6 +1944,7 @@ fn sidecarPaths(aa: std.mem.Allocator, tmp: *testing.TmpDir) !SidecarPaths {
         .a = try std.fmt.allocPrintSentinel(aa, "{s}/a.safetensors", .{root}, 0),
         .b = try std.fmt.allocPrintSentinel(aa, "{s}/b.safetensors", .{root}, 0),
         .c = try std.fmt.allocPrintSentinel(aa, "{s}/c.safetensors", .{root}, 0),
+        .d = try std.fmt.allocPrintSentinel(aa, "{s}/d.safetensors", .{root}, 0),
     };
 }
 
@@ -1968,6 +2023,135 @@ const Hybrid = struct {
     pub const conformanceFixture = hybridConformanceFixture;
 };
 const HybridPack = @import("../../sdk/testing/media_pack.zig").MediaPack(Hybrid);
+
+/// Row mask with `1` on `redraw_w < w/2` (left redraw, right hold).
+fn writeSpatialMask(path: [:0]u8, t: u32, h: u32, w: u32, redraw_w: u32, s: mlx.mlx_stream) !void {
+    const n = @as(usize, t) * @as(usize, h) * @as(usize, w);
+    var buf = try testing.allocator.alloc(f32, n);
+    defer testing.allocator.free(buf);
+    for (0..t) |tt| {
+        for (0..h) |hh| {
+            for (0..w) |ww| {
+                const left = ww < redraw_w;
+                buf[(tt * h + hh) * w + ww] = if (left) 1 else 0;
+            }
+        }
+    }
+    const shape = [_]c_int{ @intCast(t), @intCast(h), @intCast(w) };
+    const m = mlx.mlx_array_new_data(buf.ptr, &shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(m);
+    try h3.saveLatentMask(path.ptr, m, s);
+}
+
+test "minimax_h3 plugin: edit mask refines the redraw region and holds the init elsewhere byte-exact" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var pack = try MediaPack.open(aa);
+    defer pack.close();
+    const p = try sidecarPaths(aa, &pack.tmp);
+    const shape = h3.temporalShape(5);
+    const v = try rampArray(&.{ 1, 24, @intCast(shape.latent_t), 4, 4 }, 1.0);
+    defer _ = mlx.mlx_array_free(v);
+    const au = try rampArray(&.{ 1, 32, 2, @intCast(shape.audio_t) }, 0.5);
+    defer _ = mlx.mlx_array_free(au);
+    try h3.saveLatentSidecar(p.a.ptr, v, au, pack.stream);
+    const root = p.a[0..std.mem.lastIndexOf(u8, p.a, "/").?];
+    const mask_z = try std.fmt.allocPrintSentinel(aa, "{s}/mask.safetensors", .{root}, 0);
+    try writeSpatialMask(mask_z, shape.latent_t, 2, 2, 1, pack.stream);
+    const plain = try std.fmt.allocPrint(aa, "{{{s},\"num_frames\":5,\"latent_init_path\":\"{s}\",\"latent_out\":\"{s}\"}}", .{ refine_window, p.a, p.b });
+    _ = (try pack.run(plain)).ok;
+    const masked = try std.fmt.allocPrint(aa, "{{{s},\"num_frames\":5,\"latent_init_path\":\"{s}\",\"latent_mask_path\":\"{s}\",\"latent_out\":\"{s}\"}}", .{ refine_window, p.a, mask_z, p.c });
+    _ = (try pack.run(masked)).ok;
+    const ones_buf = try aa.alloc(f32, @as(usize, shape.latent_t) * 2 * 2);
+    @memset(ones_buf, 1);
+    const mshape = [_]c_int{ @intCast(shape.latent_t), 2, 2 };
+    const mall = mlx.mlx_array_new_data(ones_buf.ptr, &mshape, 3, .float32);
+    defer _ = mlx.mlx_array_free(mall);
+    try h3.saveLatentMask(mask_z, mall, pack.stream);
+    const identity = try std.fmt.allocPrint(aa, "{{{s},\"num_frames\":5,\"latent_init_path\":\"{s}\",\"latent_mask_path\":\"{s}\",\"latent_out\":\"{s}\"}}", .{ refine_window, p.a, mask_z, p.d });
+    _ = (try pack.run(identity)).ok;
+    const init_s = try h3.loadLatentSidecar(aa, p.a.ptr, pack.stream);
+    defer _ = mlx.mlx_array_free(init_s.video);
+    const plain_s = try h3.loadLatentSidecar(aa, p.b.ptr, pack.stream);
+    defer _ = mlx.mlx_array_free(plain_s.video);
+    const half_s = try h3.loadLatentSidecar(aa, p.c.ptr, pack.stream);
+    defer _ = mlx.mlx_array_free(half_s.video);
+    const all_s = try h3.loadLatentSidecar(aa, p.d.ptr, pack.stream);
+    defer _ = mlx.mlx_array_free(all_s.video);
+    try expectSameArray(plain_s.video, all_s.video);
+    try expectSameSlices(init_s.video, 4, 2, half_s.video, 2, 2);
+    try writeSpatialMask(mask_z, shape.latent_t, 2, 2, 1, pack.stream);
+    const clean = try std.fmt.allocPrint(aa, "{{{s},\"num_frames\":5,\"latent_init_path\":\"{s}\",\"latent_mask_path\":\"{s}\",\"mask_hold\":\"clean\",\"latent_out\":\"{s}\"}}", .{ refine_window, p.a, mask_z, p.b });
+    _ = (try pack.run(clean)).ok;
+    const noisy = try std.fmt.allocPrint(aa, "{{{s},\"num_frames\":5,\"latent_init_path\":\"{s}\",\"latent_mask_path\":\"{s}\",\"mask_hold\":\"noisy\",\"latent_out\":\"{s}\"}}", .{ refine_window, p.a, mask_z, p.c });
+    _ = (try pack.run(noisy)).ok;
+    const clean_s = try h3.loadLatentSidecar(aa, p.b.ptr, pack.stream);
+    defer _ = mlx.mlx_array_free(clean_s.video);
+    const noisy_s = try h3.loadLatentSidecar(aa, p.c.ptr, pack.stream);
+    defer _ = mlx.mlx_array_free(noisy_s.video);
+    try expectSameSlices(init_s.video, 4, 2, clean_s.video, 2, 2);
+    try expectSameSlices(init_s.video, 4, 2, noisy_s.video, 2, 2);
+    const left_c = try sliceAt(clean_s.video, 4, 0, 2);
+    defer _ = mlx.mlx_array_free(left_c);
+    const left_n = try sliceAt(noisy_s.video, 4, 0, 2);
+    defer _ = mlx.mlx_array_free(left_n);
+    var same = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(same);
+    try mlx.check(mlx.mlx_array_equal(&same, left_c, left_n, false, pack.stream));
+    try mlx.check(mlx.mlx_array_eval(same));
+    var eq = false;
+    try mlx.check(mlx.mlx_array_item_bool(&eq, same));
+    try testing.expect(!eq);
+    const bad_n = @as(usize, shape.latent_t) * 2 * 2;
+    const bad_buf = try aa.alloc(f32, bad_n);
+    defer aa.free(bad_buf);
+    @memset(bad_buf, 0.3);
+    const bad_shape = [_]c_int{ @intCast(shape.latent_t), 2, 2 };
+    const bad_mask = mlx.mlx_array_new_data(bad_buf.ptr, &bad_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(bad_mask);
+    try h3.saveLatentMask(mask_z, bad_mask, pack.stream);
+    try testing.expectEqualStrings("'latent_mask_path' mask values must be 0 or 1 unless mask_feather is set", (try pack.run(masked)).refused.why.slice());
+}
+
+test "minimax_h3 plugin: edit mask on a refine window leaves prefix pins exact" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var pack = try MediaPack.open(aa);
+    defer pack.close();
+    const p = try sidecarPaths(aa, &pack.tmp);
+    const shape = h3.temporalShape(39);
+    const v = try rampArray(&.{ 1, 24, @intCast(shape.latent_t), 4, 4 }, 1.0);
+    defer _ = mlx.mlx_array_free(v);
+    const au = try rampArray(&.{ 1, 32, 2, @intCast(shape.audio_t) }, 0.5);
+    defer _ = mlx.mlx_array_free(au);
+    try h3.saveLatentSidecar(p.a.ptr, v, au, pack.stream);
+    const root = p.a[0..std.mem.lastIndexOf(u8, p.a, "/").?];
+    const mask_z = try std.fmt.allocPrintSentinel(aa, "{s}/mask_pins.safetensors", .{root}, 0);
+    try writeSpatialMask(mask_z, shape.latent_t, 2, 2, 1, pack.stream);
+    const body = try std.fmt.allocPrint(aa, "{{{s},\"num_frames\":39,\"latent_init_path\":\"{s}\",\"latent_prefix_frames\":5,\"latent_prefix_path\":\"{s}\",\"latent_mask_path\":\"{s}\",\"mask_hold\":\"clean\",\"latent_out\":\"{s}\"}}", .{ refine_window, p.a, p.a, mask_z, p.b });
+    _ = (try pack.run(body)).ok;
+    const a = try h3.loadLatentSidecar(aa, p.a.ptr, pack.stream);
+    defer _ = mlx.mlx_array_free(a.video);
+    const b = try h3.loadLatentSidecar(aa, p.b.ptr, pack.stream);
+    defer _ = mlx.mlx_array_free(b.video);
+    const t: c_int = mlx.getShape(a.video)[2];
+    const pv: c_int = @intCast(h3.overlapVideoLatentT(5));
+    try expectSameSlices(a.video, 2, t - pv, b.video, 0, pv);
+}
+
+test "minimax h3: mask feather applies only at the boundary" {
+    var data: [9]f32 = .{
+        1, 1, 1,
+        1, 1, 1,
+        0, 0, 0,
+    };
+    try h3.featherLatentMaskInPlace(testing.allocator, &data, 1, 3, 3, 1);
+    try testing.expect(data[6] > 0 and data[6] < 1);
+    try testing.expect(data[8] > 0 and data[8] < 1);
+    try testing.expect(data[0] == 1);
+}
 
 test "minimax_h3 plugin: references ride a pinned refine window on a hybrid pack, billed like a render of that grid" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
