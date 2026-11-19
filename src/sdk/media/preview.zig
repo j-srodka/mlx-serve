@@ -101,6 +101,9 @@ pub fn jpegFromLatent(
     return jpegFromLatentProfiled(allocator, map, latent, t, h, w, opts, first_frame, null, null);
 }
 
+// Test-only snapshot of the exact native plane passed to resizing and JPEG.
+threadlocal var test_native_plane: ?[]u8 = null;
+
 pub fn jpegFromLatentProfiled(
     allocator: std.mem.Allocator,
     map: Map,
@@ -128,7 +131,11 @@ pub fn jpegFromLatentProfiled(
     const rgb_native = try allocator.alloc(u8, @as(usize, idx.len) * @as(usize, h) * @as(usize, w) * 3);
     defer allocator.free(rgb_native);
     for (idx, 0..) |ti, fi| {
-        latentSliceToRgb(map, latent, t, h, w, ti, rgb_native[fi * @as(usize, h) * @as(usize, w) * 3 ..][0 .. @as(usize, h) * @as(usize, w) * 3]);
+        latentSliceToStrip(map, latent, t, h, w, ti, rgb_native, fi, idx.len);
+    }
+
+    if (@import("builtin").is_test) {
+        if (test_native_plane) |plane| @memcpy(plane, rgb_native);
     }
 
     if (timings) |tm| {
@@ -208,6 +215,14 @@ fn jsonEscape(out: []u8, msg: []const u8) []const u8 {
 /// One temporal slice of a `[C,T,H,W]` latent through the map, into RGB8.
 /// Byte-for-byte the reference's `Latent2RGBPreviewer` + `preview_to_image`.
 pub fn latentSliceToRgb(map: Map, latent: []const f32, t: u32, h: u32, w: u32, ti: u32, rgb: []u8) void {
+    latentSliceToStrip(map, latent, t, h, w, ti, rgb, 0, 1);
+}
+
+fn stripOffset(frame: usize, pixel: usize, width: usize, frames: usize) usize {
+    return ((pixel / width) * frames * width + frame * width + pixel % width) * 3;
+}
+
+fn latentSliceToStrip(map: Map, latent: []const f32, t: u32, h: u32, w: u32, ti: u32, rgb: []u8, frame: usize, frames: usize) void {
     const hw: usize = @as(usize, h) * @as(usize, w);
     const thw: usize = @as(usize, t) * hw;
     var pix: usize = 0;
@@ -219,9 +234,10 @@ pub fn latentSliceToRgb(map: Map, latent: []const f32, t: u32, h: u32, w: u32, t
             acc[1] += v * f[1];
             acc[2] += v * f[2];
         }
-        rgb[pix * 3 + 0] = toU8(acc[0]);
-        rgb[pix * 3 + 1] = toU8(acc[1]);
-        rgb[pix * 3 + 2] = toU8(acc[2]);
+        const offset = stripOffset(frame, pix, w, frames);
+        rgb[offset + 0] = toU8(acc[0]);
+        rgb[offset + 1] = toU8(acc[1]);
+        rgb[offset + 2] = toU8(acc[2]);
     }
 }
 
@@ -615,6 +631,61 @@ test "latentSliceToRgb: the temporal index selects its own frame" {
         if (prev) |pv| try std.testing.expect(!std.mem.eql(u8, &pv, rgb[0..3]));
         prev = .{ rgb[0], rgb[1], rgb[2] };
     }
+}
+
+test "jpegFromLatent: production strip has ordered rectangular frames and pixels" {
+    const a = std.testing.allocator;
+    const h = 2;
+    const w = 3;
+    const frames = 3;
+    const map: Map = .{ .name = "fixture", .factors = &.{.{ 1, 1, 1 }}, .bias = .{ 0, 0, 0 } };
+    var lat: [frames * h * w]f32 = undefined;
+    for (0..frames) |f| for (0..h * w) |p| {
+        lat[f * h * w + p] = @as(f32, @floatFromInt(f * 10 + p)) / 40.0 - 0.5;
+    };
+    var plane: [frames * h * w * 3]u8 = undefined;
+    test_native_plane = &plane;
+    defer test_native_plane = null;
+    const enc = try jpegFromLatent(a, map, &lat, frames, h, w, .{ .frames = frames, .max_side = 0 }, false);
+    defer a.free(enc.jpeg);
+    try std.testing.expectEqual(@as(u32, frames * w), enc.w);
+    try std.testing.expectEqual(@as(u32, h), enc.h);
+    for (0..h) |y| for (0..frames) |f| for (0..w) |x| {
+        const value = @as(f32, @floatFromInt(f * 10 + y * w + x)) / 40.0 - 0.5;
+        const expected: u8 = @intFromFloat((value + 1.0) * 0.5 * 255.0);
+        const offset = (y * frames * w + f * w + x) * 3;
+        try std.testing.expectEqualSlices(u8, &.{ expected, expected, expected }, plane[offset..][0..3]);
+    };
+}
+
+test "minimax_h3: assembled preview strip preserves frame order on every row" {
+    const a = std.testing.allocator;
+    const h: usize = 2;
+    const w: usize = 2;
+    const frames: usize = 3;
+    const lat = try a.alloc(f32, minimax_h3.channels() * frames * h * w);
+    defer a.free(lat);
+    for (0..minimax_h3.channels()) |c| for (0..frames) |f| for (0..h * w) |p| {
+        lat[c * frames * h * w + f * h * w + p] = @as(f32, @floatFromInt(f)) * 0.3;
+    };
+    var strip: [frames * h * w * 3]u8 = undefined;
+    for (0..frames) |f| {
+        latentSliceToStrip(minimax_h3, lat, frames, h, w, @intCast(f), &strip, f, frames);
+    }
+    var expected: [h * w * 3]u8 = undefined;
+    for (0..frames) |f| {
+        latentSliceToRgb(minimax_h3, lat, frames, h, w, @intCast(f), &expected);
+        for (0..h) |y| {
+            const offset = stripOffset(f, y * w, w, frames);
+            try std.testing.expectEqual((y * frames * w + f * w) * 3, offset);
+            try std.testing.expectEqualSlices(u8, expected[y * w * 3 ..][0 .. w * 3], strip[offset..][0 .. w * 3]);
+        }
+    }
+    var single: [h * w * 3]u8 = undefined;
+    latentSliceToStrip(minimax_h3, lat, frames, h, w, 1, &single, 0, 1);
+    latentSliceToRgb(minimax_h3, lat, frames, h, w, 1, &expected);
+    try std.testing.expectEqualSlices(u8, &expected, &single);
+    for (0..h * w) |p| try std.testing.expectEqual(p * 3, stripOffset(0, p, w, 1));
 }
 
 test "jpegFromLatent: preview_frames>1 is a filmstrip in temporal order" {
