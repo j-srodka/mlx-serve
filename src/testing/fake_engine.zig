@@ -431,6 +431,48 @@ test "fake engine: a reply echoes the prompt, then counts" {
     try std.testing.expectEqual(@as(u32, 1001), tokenAt(&.{ 5, 6 }, 3));
 }
 
+const shutdown_grace = @import("../host/shutdown/grace.zig");
+
+var fake_shutdown_stop = std.atomic.Value(bool).init(false);
+
+fn fakeShutdownStop() bool {
+    return fake_shutdown_stop.load(.acquire);
+}
+
+var fake_shutdown_steps: u32 = 0;
+
+fn fakeShutdownStepsDone() bool {
+    return fake_shutdown_steps >= 6;
+}
+
+test "shutdown fake: SIGTERM cancels cooperative in-flight step render" {
+    var steps: u32 = 0;
+    fake_shutdown_stop.store(true, .release);
+    try std.testing.expectError(error.Cancelled, shutdown_grace.runSteps(100, &steps, fakeShutdownStop));
+    try std.testing.expectEqual(@as(u32, 0), steps);
+    steps = 0;
+    fake_shutdown_stop.store(false, .release);
+    try shutdown_grace.runSteps(3, &steps, fakeShutdownStop);
+    try std.testing.expectEqual(@as(u32, 3), steps);
+}
+
+test "shutdown fake: wedged render hits graceExpired before more steps" {
+    const deadline = shutdown_grace.drainDeadlineMs(10_000, 10_050, true);
+    try std.testing.expect(shutdown_grace.graceExpired(deadline, 10_050));
+    try std.testing.expectEqual(shutdown_grace.EXIT_GRACE_EXPIRED, @as(u8, 2));
+}
+
+test "shutdown fake: idle shutdown does not arm a conn drain wait" {
+    try std.testing.expectEqual(@as(i64, 42), shutdown_grace.drainDeadlineMs(42, 42 + 45_000, false));
+}
+
+test "shutdown fake: interrupt between steps stops at k plus one" {
+    const k: u32 = 5;
+    fake_shutdown_steps = 0;
+    try std.testing.expectError(error.Cancelled, shutdown_grace.runSteps(100, &fake_shutdown_steps, fakeShutdownStepsDone));
+    try std.testing.expectEqual(k + 1, fake_shutdown_steps);
+}
+
 test {
     _ = abi;
     _ = contract;
