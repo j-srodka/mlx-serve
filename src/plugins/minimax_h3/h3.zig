@@ -601,6 +601,9 @@ pub const PackedLayout = struct {
     /// vision blocks into the prompt, which is the one case where the text
     /// segment is NOT uniform in modality.
     text_tags: []const u8 = &.{},
+    /// Per-row tag on the `.video` target segment: 0 = denoise, 1 = mask-held.
+    /// Owned when non-empty; freed in `deinit`.
+    video_hold_tags: ?[]u8 = null,
     text_len: u32,
     latent_t: u32,
     latent_h: u32,
@@ -894,6 +897,7 @@ pub const PackedLayout = struct {
         self.allocator.free(self.position_ids);
         self.allocator.free(self.img_update);
         self.allocator.free(self.audio_update);
+        if (self.video_hold_tags) |t| self.allocator.free(t);
         self.* = undefined;
     }
 
@@ -2040,6 +2044,14 @@ pub fn buildTimestepPlan(
         .ref_audio, .audio_pin => has_aud_cond = true,
         else => {},
     };
+    if (layout.video_hold_tags) |tags| {
+        for (tags) |t| {
+            if (t != 0) {
+                has_vis_cond = true;
+                break;
+            }
+        }
+    }
     add(&uniq, &n, video);
     if (layout.audio_update.len > 0) add(&uniq, &n, audio);
     if (has_vis_cond) add(&uniq, &n, vis_cond);
@@ -2055,8 +2067,8 @@ pub fn buildTimestepPlan(
 
     // One run per segment, EXCEPT a text segment carrying vision blocks: those
     // rows mix modalities, so the reference resolves them into tag runs here.
-    // Sized for the worst case (every text row its own run) and trimmed.
-    const cap = layout.segments.len + layout.text_tags.len;
+    // Sized for the worst case (every text/mask-hold row its own run) and trimmed.
+    const cap = layout.segments.len + layout.text_tags.len + (if (layout.video_hold_tags) |t| t.len else 0);
     var runs = try allocator.alloc(ModRun, cap);
     errdefer allocator.free(runs);
     var nr: usize = 0;
@@ -2087,6 +2099,30 @@ pub fn buildTimestepPlan(
                 }
             }
             continue;
+        }
+        if (seg.kind == .video) {
+            if (layout.video_hold_tags) |tags| {
+                const span = seg.end - seg.start;
+                if (tags.len == span) {
+                    var run_start: u32 = 0;
+                    var i: u32 = 1;
+                    while (i <= span) : (i += 1) {
+                        if (i == span or tags[i] != tags[run_start]) {
+                            const hold = tags[run_start] != 0;
+                            const tp = if (hold) vis_cond else video;
+                            const rb = rowOf(uniq[0..n], tp) * 3;
+                            runs[nr] = .{
+                                .start = seg.start + run_start,
+                                .end = seg.start + i,
+                                .mod_row = rb + seg.kind.modalityTag(),
+                            };
+                            nr += 1;
+                            run_start = i;
+                        }
+                    }
+                    continue;
+                }
+            }
         }
         runs[nr] = .{ .start = seg.start, .end = seg.end, .mod_row = row_base + seg.kind.modalityTag() };
         nr += 1;
@@ -3038,6 +3074,20 @@ pub const Model = struct {
                 }
             }
             if (!hit) continue;
+            if (seg.kind == .video) {
+                if (layout.video_hold_tags) |tags| {
+                    const span = seg.end - seg.start;
+                    if (tags.len == span) {
+                        for (plan.runs) |r| {
+                            if (r.start < seg.start or r.end > seg.end) continue;
+                            const sub: Segment = .{ .start = r.start, .end = r.end, .kind = seg.kind, .grid = seg.grid };
+                            const head = try self.finalHead(h, fmods[0], fmods[1], sub, r.mod_row / 3, w, b, s);
+                            try parts.append(self.allocator, head);
+                        }
+                        continue;
+                    }
+                }
+            }
             const head = try self.finalHead(h, fmods[0], fmods[1], seg, modRowForSegment(plan, seg), w, b, s);
             try parts.append(self.allocator, head);
         }
@@ -4870,6 +4920,37 @@ pub fn featherLatentMaskInPlace(allocator: std.mem.Allocator, data: []f32, t: u3
     }
 }
 
+/// Row tags for `PackedLayout.video_hold_tags`: mask **1 = redraw** → tag 0;
+/// held rows → tag 1 (conditioning timestep).
+pub fn maskHoldTagsFromData(allocator: std.mem.Allocator, mask: []const f32) ![]u8 {
+    const out = try allocator.alloc(u8, mask.len);
+    for (mask, 0..) |v, i| out[i] = if (v > 0.5) 0 else 1;
+    return out;
+}
+
+pub fn maskHoldTagsFromMask(allocator: std.mem.Allocator, mask: mlx.mlx_array, s: S) ![]u8 {
+    const host = try copyArrayF32(allocator, mask, s);
+    defer allocator.free(host);
+    return maskHoldTagsFromData(allocator, host);
+}
+
+fn videoFrameRows(lat_h: u32, lat_w: u32) u32 {
+    return (lat_h / PATCH_H) * (lat_w / PATCH_W);
+}
+
+fn slicePackedVideoRowsT(rows: mlx.mlx_array, t0: u32, t_len: u32, lat_h: u32, lat_w: u32, s: S) !mlx.mlx_array {
+    const fr = videoFrameRows(lat_h, lat_w);
+    const lo: c_int = @intCast(t0 * fr);
+    const hi: c_int = @intCast((t0 + t_len) * fr);
+    return sliceRows(rows, lo, hi, s);
+}
+
+fn sliceMaskT(mask: mlx.mlx_array, t0: u32, t_len: u32, s: S) !mlx.mlx_array {
+    const lo: c_int = @intCast(t0);
+    const hi: c_int = @intCast(t0 + t_len);
+    return sliceAxis0(mask, lo, hi, s);
+}
+
 fn restoreMaskedVideoRows(
     video_x: mlx.mlx_array,
     init_rows: mlx.mlx_array,
@@ -4920,6 +5001,70 @@ fn restoreMaskedVideoRows(
     _ = mlx.mlx_array_free(out4);
     _ = mlx.mlx_array_free(video_x);
     return out;
+}
+
+/// Blend mask rows on the refine window inside a longer packed video tensor (pins sit outside).
+fn restoreMaskedVideoWindow(
+    video_x: mlx.mlx_array,
+    row_off: c_int,
+    row_n: c_int,
+    init_rows: mlx.mlx_array,
+    epsilon: mlx.mlx_array,
+    mask: mlx.mlx_array,
+    sigma: f64,
+    hold: MaskHold,
+    at_clean: bool,
+    latent_t: u32,
+    lat_h: u32,
+    lat_w: u32,
+    s: S,
+) !mlx.mlx_array {
+    const total: c_int = @intCast(mlx.getShape(video_x)[0]);
+    if (row_off == 0 and row_n == total)
+        return restoreMaskedVideoRows(video_x, init_rows, epsilon, mask, sigma, hold, at_clean, latent_t, lat_h, lat_w, s);
+    var head: ?mlx.mlx_array = null;
+    defer {
+        if (head) |x| _ = mlx.mlx_array_free(x);
+    }
+    if (row_off > 0) head = try sliceRows(video_x, 0, row_off, s);
+    const mid = try sliceRows(video_x, row_off, row_off + row_n, s);
+    const mid2 = try restoreMaskedVideoRows(mid, init_rows, epsilon, mask, sigma, hold, at_clean, latent_t, lat_h, lat_w, s);
+    var tail: ?mlx.mlx_array = null;
+    defer {
+        if (tail) |x| _ = mlx.mlx_array_free(x);
+    }
+    if (row_off + row_n < total) tail = try sliceRows(video_x, row_off + row_n, total, s);
+    _ = mlx.mlx_array_free(video_x);
+    if (head) |h| {
+        if (tail) |t| {
+            head = null;
+            tail = null;
+            return concat(&[_]mlx.mlx_array{ h, mid2, t }, 0, s);
+        }
+        head = null;
+        return concat(&[_]mlx.mlx_array{ h, mid2 }, 0, s);
+    }
+    if (tail) |t| {
+        tail = null;
+        return concat(&[_]mlx.mlx_array{ mid2, t }, 0, s);
+    }
+    return mid2;
+}
+
+/// Start state for a masked refine: held rows follow `mask_hold` at `sigma0` before step 0.
+pub fn maskedRefineVideoInit(
+    init_rows: mlx.mlx_array,
+    epsilon: mlx.mlx_array,
+    mask: mlx.mlx_array,
+    sigma0: f64,
+    hold: MaskHold,
+    latent_t: u32,
+    lat_h: u32,
+    lat_w: u32,
+    s: S,
+) !mlx.mlx_array {
+    const mixed = try mixInit(init_rows, epsilon, sigma0, s);
+    return restoreMaskedVideoRows(mixed, init_rows, epsilon, mask, sigma0, hold, false, latent_t, lat_h, lat_w, s);
 }
 
 /// Text-to-audio-video. Dispatches: `chain_windows > 1` runs N single-window
@@ -5365,6 +5510,19 @@ fn generateOne(
     // BORROWED from `enc`, which outlives the layout. Empty for a pure t2va
     // prompt; non-empty makes the text segment split into modality runs.
     layout.text_tags = enc.tags;
+    const mid_v_t: u32 = shape.latent_t - pin_v_prefix_t - pin_v_suffix_t;
+    const frame_rows_v: u32 = videoFrameRows(lat_h, lat_w);
+    if (req.edit_mask) |m| {
+        const all = try maskHoldTagsFromMask(allocator, m, s);
+        if (pin_v_prefix_t > 0 or pin_v_suffix_t > 0) {
+            const n_mid = mid_v_t * frame_rows_v;
+            layout.video_hold_tags = try allocator.alloc(u8, n_mid);
+            @memcpy(layout.video_hold_tags.?[0..n_mid], all[pin_v_prefix_t * frame_rows_v ..][0..n_mid]);
+            allocator.free(all);
+        } else {
+            layout.video_hold_tags = all;
+        }
+    }
 
     const n_video_rows: c_int = @intCast(shape.latent_t * (lat_h / PATCH_H) * (lat_w / PATCH_W));
     const n_audio_rows: c_int = @intCast(shape.audio_t * 2);
@@ -5390,13 +5548,16 @@ fn generateOne(
         const sigma0 = if (req.refine_sigmas) |rs| rs[0] else 1.0;
         const z = try patchifyVideo(iv, s);
         defer _ = mlx.mlx_array_free(z);
-        if (req.edit_mask != null) {
+        if (req.edit_mask) |m| {
             video_epsilon = try contig(video_x, s);
             init_video_rows = try contig(z, s);
+            _ = mlx.mlx_array_free(video_x);
+            video_x = try maskedRefineVideoInit(init_video_rows.?, video_epsilon.?, m, sigma0, req.mask_hold, shape.latent_t, lat_h, lat_w, s);
+        } else {
+            const mixed = try mixInit(z, video_x, sigma0, s);
+            _ = mlx.mlx_array_free(video_x);
+            video_x = mixed;
         }
-        const mixed = try mixInit(z, video_x, sigma0, s);
-        _ = mlx.mlx_array_free(video_x);
-        video_x = mixed;
         if (req.init_audio_latent) |ia| {
             const arows = try audioLatentToRows(ia, s);
             if (req.refine_audio) {
@@ -5431,8 +5592,41 @@ fn generateOne(
     defer if (pin_audio_suffix_rows) |p| {
         _ = mlx.mlx_array_free(p);
     };
-    const pin_v_prefix_row_n: c_int = if (have_latent_prefix) @intCast(pin_v_prefix_t * (lat_h / PATCH_H) * (lat_w / PATCH_W)) else 0;
-    const pin_v_suffix_row_n: c_int = if (have_latent_suffix) @intCast(pin_v_suffix_t * (lat_h / PATCH_H) * (lat_w / PATCH_W)) else 0;
+    const pin_v_prefix_row_n: c_int = if (have_latent_prefix) @intCast(pin_v_prefix_t * frame_rows_v) else 0;
+    const pin_v_suffix_row_n: c_int = if (have_latent_suffix) @intCast(pin_v_suffix_t * frame_rows_v) else 0;
+    const mask_row_off: c_int = pin_v_prefix_row_n;
+    const mask_row_n: c_int = n_video_rows - pin_v_prefix_row_n - pin_v_suffix_row_n;
+    var mask_step: ?mlx.mlx_array = null;
+    var init_step: ?mlx.mlx_array = null;
+    var eps_step: ?mlx.mlx_array = null;
+    var mask_step_owned: bool = false;
+    var init_step_owned: bool = false;
+    var eps_step_owned: bool = false;
+    defer {
+        if (mask_step_owned) {
+            if (mask_step) |x| _ = mlx.mlx_array_free(x);
+        }
+        if (init_step_owned) {
+            if (init_step) |x| _ = mlx.mlx_array_free(x);
+        }
+        if (eps_step_owned) {
+            if (eps_step) |x| _ = mlx.mlx_array_free(x);
+        }
+    }
+    if (req.edit_mask != null and init_video_rows != null and video_epsilon != null) {
+        if (pin_v_prefix_t > 0 or pin_v_suffix_t > 0) {
+            mask_step = try sliceMaskT(req.edit_mask.?, pin_v_prefix_t, mid_v_t, s);
+            init_step = try slicePackedVideoRowsT(init_video_rows.?, pin_v_prefix_t, mid_v_t, lat_h, lat_w, s);
+            eps_step = try slicePackedVideoRowsT(video_epsilon.?, pin_v_prefix_t, mid_v_t, lat_h, lat_w, s);
+            mask_step_owned = true;
+            init_step_owned = true;
+            eps_step_owned = true;
+        } else {
+            mask_step = req.edit_mask;
+            init_step = init_video_rows;
+            eps_step = video_epsilon;
+        }
+    }
     if (have_latent_prefix) {
         const pv = req.chain_prefix_video_latent.?;
         const pv_t: c_int = @intCast(mlx.getShape(pv)[2]);
@@ -5719,6 +5913,25 @@ fn generateOne(
                     _ = mlx.mlx_array_free(audio_x);
                     audio_x = na;
                 }
+                if (mask_step != null and init_step != null and eps_step != null) {
+                    const next_sigma = sigmas[i + 1];
+                    const at_clean = @abs(next_sigma) < 1e-6;
+                    video_x = try restoreMaskedVideoWindow(
+                        video_x,
+                        mask_row_off,
+                        mask_row_n,
+                        init_step.?,
+                        eps_step.?,
+                        mask_step.?,
+                        next_sigma,
+                        req.mask_hold,
+                        at_clean,
+                        mid_v_t,
+                        lat_h,
+                        lat_w,
+                        s,
+                    );
+                }
                 const pinned = try restorePinnedLatent(
                     video_x,
                     audio_x,
@@ -5735,23 +5948,6 @@ fn generateOne(
                 );
                 video_x = pinned[0];
                 audio_x = pinned[1];
-                if (req.edit_mask != null and init_video_rows != null and video_epsilon != null) {
-                    const next_sigma = sigmas[i + 1];
-                    const at_clean = @abs(next_sigma) < 1e-6;
-                    video_x = try restoreMaskedVideoRows(
-                        video_x,
-                        init_video_rows.?,
-                        video_epsilon.?,
-                        req.edit_mask.?,
-                        next_sigma,
-                        req.mask_hold,
-                        at_clean,
-                        shape.latent_t,
-                        lat_h,
-                        lat_w,
-                        s,
-                    );
-                }
                 if (carry_audio) |ca| {
                     _ = mlx.mlx_array_free(audio_x);
                     audio_x = try contig(ca, s);
@@ -5838,6 +6034,25 @@ fn generateOne(
                 _ = mlx.mlx_array_free(audio_x);
                 audio_x = na;
             }
+            if (mask_step != null and init_step != null and eps_step != null) {
+                const next_sigma = sigmas[i + 1];
+                const at_clean = @abs(next_sigma) < 1e-6;
+                video_x = try restoreMaskedVideoWindow(
+                    video_x,
+                    mask_row_off,
+                    mask_row_n,
+                    init_step.?,
+                    eps_step.?,
+                    mask_step.?,
+                    next_sigma,
+                    req.mask_hold,
+                    at_clean,
+                    mid_v_t,
+                    lat_h,
+                    lat_w,
+                    s,
+                );
+            }
             const pinned = try restorePinnedLatent(
                 video_x,
                 audio_x,
@@ -5854,23 +6069,6 @@ fn generateOne(
             );
             video_x = pinned[0];
             audio_x = pinned[1];
-            if (req.edit_mask != null and init_video_rows != null and video_epsilon != null) {
-                const next_sigma = sigmas[i + 1];
-                const at_clean = @abs(next_sigma) < 1e-6;
-                video_x = try restoreMaskedVideoRows(
-                    video_x,
-                    init_video_rows.?,
-                    video_epsilon.?,
-                    req.edit_mask.?,
-                    next_sigma,
-                    req.mask_hold,
-                    at_clean,
-                    shape.latent_t,
-                    lat_h,
-                    lat_w,
-                    s,
-                );
-            }
             if (carry_audio) |ca| {
                 _ = mlx.mlx_array_free(audio_x);
                 audio_x = try contig(ca, s);
@@ -9230,6 +9428,62 @@ test "minimax h3: refine sigma list and start-sigma map" {
     try testing.expect(refineMaskGeometryError(2, 2, 2, 2, 4, 4) == null);
     try testing.expectEqualStrings("'latent_mask_path' frame count must match latent_init_path", refineMaskGeometryError(1, 2, 2, 2, 4, 4).?);
     try testing.expectEqualStrings("'latent_mask_path' mask values must be 0 or 1 unless mask_feather is set", latentMaskBinaryError(&.{0.5}, 0).?);
+}
+
+test "minimax h3: mask-held target rows ride the visual conditioning timestep" {
+    const a = testing.allocator;
+    var l = try PackedLayout.init(a, 4, 1, 4, 4, 0, &.{}, 5);
+    defer l.deinit();
+    const tags = try maskHoldTagsFromData(a, &.{ 1, 1, 0, 0 });
+    l.video_hold_tags = tags;
+    var p = try buildTimestepPlan(a, &l, 0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{});
+    defer p.deinit();
+    const vseg = l.videoSegment();
+    for (p.runs) |r| {
+        if (r.start < vseg.start or r.end > vseg.end) continue;
+        const t = p.unique_t[r.mod_row / 3].t;
+        var hold = true;
+        for (r.start..r.end) |row| {
+            if (tags[row - vseg.start] == 0) {
+                hold = false;
+                break;
+            }
+        }
+        if (hold) try testing.expectEqual(VISUAL_COND_TIMESTEP, t) else try testing.expectEqual(@as(f64, 0.5), t);
+    }
+}
+
+test "minimax h3: clean mask hold matches the init on held rows before step 0" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var buf: [384]f32 = undefined;
+    for (&buf, 0..) |*v, i| v.* = @floatFromInt(i);
+    const vshape = [_]c_int{ 1, 24, 1, 4, 4 };
+    const init = mlx.mlx_array_new_data(&buf, &vshape, 5, .float32);
+    defer _ = mlx.mlx_array_free(init);
+    const z = try patchifyVideo(init, s);
+    defer _ = mlx.mlx_array_free(z);
+    const pd: c_int = @intCast(mlx.getShape(z)[1]);
+    const eps = try randomNormal(&[_]c_int{ 4, pd }, 7, .float32, s);
+    defer _ = mlx.mlx_array_free(eps);
+    const mbuf = [_]f32{ 0, 0, 1, 1 };
+    const mshape = [_]c_int{ 1, 2, 2 };
+    const mask = mlx.mlx_array_new_data(@constCast(&mbuf), &mshape, 3, .float32);
+    defer _ = mlx.mlx_array_free(mask);
+    const x = try maskedRefineVideoInit(z, eps, mask, 0.5, .clean, 1, 4, 4, s);
+    defer _ = mlx.mlx_array_free(x);
+    const z_hold = try sliceRows(z, 0, 2, s);
+    defer _ = mlx.mlx_array_free(z_hold);
+    const x_hold = try sliceRows(x, 0, 2, s);
+    defer _ = mlx.mlx_array_free(x_hold);
+    var same = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(same);
+    try mlx.check(mlx.mlx_array_equal(&same, z_hold, x_hold, false, s));
+    try mlx.check(mlx.mlx_array_eval(same));
+    var eq = false;
+    try mlx.check(mlx.mlx_array_item_bool(&eq, same));
+    try testing.expect(eq);
 }
 
 test "minimax h3: start-sigma noise mix is (1-σ)·z + σ·noise" {

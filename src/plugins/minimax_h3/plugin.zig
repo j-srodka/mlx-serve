@@ -1831,6 +1831,33 @@ test "minimax_h3 plugin: edit mask refines the redraw region and holds the init 
     try testing.expectEqualStrings("'latent_mask_path' mask values must be 0 or 1 unless mask_feather is set", (try pack.run(masked)).refused.why.slice());
 }
 
+test "minimax_h3 plugin: edit mask on a refine window leaves prefix pins exact" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var pack = try MediaPack.open(aa);
+    defer pack.close();
+    const p = try sidecarPaths(aa, &pack.tmp);
+    const shape = h3.temporalShape(39);
+    const v = try rampArray(&.{ 1, 24, @intCast(shape.latent_t), 4, 4 }, 1.0);
+    defer _ = mlx.mlx_array_free(v);
+    const au = try rampArray(&.{ 1, 32, 2, @intCast(shape.audio_t) }, 0.5);
+    defer _ = mlx.mlx_array_free(au);
+    try h3.saveLatentSidecar(p.a.ptr, v, au, pack.stream);
+    const root = p.a[0..std.mem.lastIndexOf(u8, p.a, "/").?];
+    const mask_z = try std.fmt.allocPrintSentinel(aa, "{s}/mask_pins.safetensors", .{root}, 0);
+    try writeSpatialMask(mask_z, shape.latent_t, 2, 2, 1, pack.stream);
+    const body = try std.fmt.allocPrint(aa, "{{{s},\"num_frames\":39,\"latent_init_path\":\"{s}\",\"latent_prefix_frames\":5,\"latent_prefix_path\":\"{s}\",\"latent_mask_path\":\"{s}\",\"mask_hold\":\"clean\",\"latent_out\":\"{s}\"}}", .{ refine_window, p.a, p.a, mask_z, p.b });
+    _ = (try pack.run(body)).ok;
+    const a = try h3.loadLatentSidecar(aa, p.a.ptr, pack.stream);
+    defer _ = mlx.mlx_array_free(a.video);
+    const b = try h3.loadLatentSidecar(aa, p.b.ptr, pack.stream);
+    defer _ = mlx.mlx_array_free(b.video);
+    const t: c_int = mlx.getShape(a.video)[2];
+    const pv: c_int = @intCast(h3.overlapVideoLatentT(5));
+    try expectSameSlices(a.video, 2, t - pv, b.video, 0, pv);
+}
+
 test "minimax h3: mask feather applies only at the boundary" {
     var data: [9]f32 = .{
         1, 1, 1,
