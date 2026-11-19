@@ -53,6 +53,11 @@ const rope_blk = @import("../../sdk/blocks/dit/rope.zig");
 const timestep_blk = @import("../../sdk/blocks/dit/timestep.zig");
 pub const geometry = @import("geometry.zig");
 pub const alignFrameCount = geometry.alignFrameCount;
+
+pub fn snapEncodeFrames(n: u32) ?u32 {
+    if (n < 5) return null;
+    return 5 + ((n - 5) / 17) * 17;
+}
 pub const videoLatentT = geometry.videoLatentT;
 pub const TemporalShape = geometry.TemporalShape;
 pub const temporalShape = geometry.temporalShape;
@@ -9432,4 +9437,9 @@ test "minimax h3 flash parity: one DiT forward matches the stable-diffusion.cpp 
         std.debug.print("[flash-parity] {s}: max abs {d:.5} mean abs {d:.5} ref rms {d:.5} cos {d:.6} ({d} values)\n", .{ c.name, max_err, sum_err / n, @sqrt(ww / n), cos, g32.len });
         try testing.expect(cos > 0.99);
     }
+}
+
+test "minimax_h3 snap encode frames down" {
+    try std.testing.expectEqual(@as(?u32, 22), snapEncodeFrames(38));
+    try std.testing.expectEqual(@as(?u32, null), snapEncodeFrames(4));
 }

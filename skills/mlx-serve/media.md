@@ -221,6 +221,15 @@ when `latent_prefix_frames` is set.
 Same prompt, seed, width, height, `num_frames`, and `steps` across windows.
 `"fast": false` and no turbo when comparing pixel chain vs latent pin.
 
+### MiniMax H3: encode-only (source → latents)
+
+`"encode_only": true` on `POST /v1/video/generations` runs the video (and optional audio) VAE
+encoders only — no DiT, no prompt, no turbo. Required: `video_frames` (base64 JPEG array),
+`latent_out` (absolute `.safetensors`), `width`/`height` (÷32). Frame count snaps **down** to the
+17k+5 ladder; the JSON echoes `num_frames`, `latent_t`, and `path`. Optional `audio` (base64 WAV);
+omit it for a silent sidecar. `steps`, pins, refs, keyframes, and `chain_windows`>1 are refused by
+name. `GET /health` `"encode_only":true`.
+
 ### MiniMax H3 FL2VA: latent sidecar files + keyframes
 
 `latent_out` (absolute path to a `.safetensors` to receive the finished run's
