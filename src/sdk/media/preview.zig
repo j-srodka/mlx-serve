@@ -101,6 +101,9 @@ pub fn jpegFromLatent(
     return jpegFromLatentProfiled(allocator, map, latent, t, h, w, opts, first_frame, null, null);
 }
 
+// Test-only snapshot of the exact native plane passed to resizing and JPEG.
+threadlocal var test_native_plane: ?[]u8 = null;
+
 pub fn jpegFromLatentProfiled(
     allocator: std.mem.Allocator,
     map: Map,
@@ -129,6 +132,10 @@ pub fn jpegFromLatentProfiled(
     defer allocator.free(rgb_native);
     for (idx, 0..) |ti, fi| {
         latentSliceToStrip(map, latent, t, h, w, ti, rgb_native, fi, idx.len);
+    }
+
+    if (@import("builtin").is_test) {
+        if (test_native_plane) |plane| @memcpy(plane, rgb_native);
     }
 
     if (timings) |tm| {
@@ -624,6 +631,31 @@ test "latentSliceToRgb: the temporal index selects its own frame" {
         if (prev) |pv| try std.testing.expect(!std.mem.eql(u8, &pv, rgb[0..3]));
         prev = .{ rgb[0], rgb[1], rgb[2] };
     }
+}
+
+test "jpegFromLatent: production strip has ordered rectangular frames and pixels" {
+    const a = std.testing.allocator;
+    const h = 2;
+    const w = 3;
+    const frames = 3;
+    const map: Map = .{ .name = "fixture", .factors = &.{.{ 1, 1, 1 }}, .bias = .{ 0, 0, 0 } };
+    var lat: [frames * h * w]f32 = undefined;
+    for (0..frames) |f| for (0..h * w) |p| {
+        lat[f * h * w + p] = @as(f32, @floatFromInt(f * 10 + p)) / 40.0 - 0.5;
+    };
+    var plane: [frames * h * w * 3]u8 = undefined;
+    test_native_plane = &plane;
+    defer test_native_plane = null;
+    const enc = try jpegFromLatent(a, map, &lat, frames, h, w, .{ .frames = frames, .max_side = 0 }, false);
+    defer a.free(enc.jpeg);
+    try std.testing.expectEqual(@as(u32, frames * w), enc.w);
+    try std.testing.expectEqual(@as(u32, h), enc.h);
+    for (0..h) |y| for (0..frames) |f| for (0..w) |x| {
+        const value = @as(f32, @floatFromInt(f * 10 + y * w + x)) / 40.0 - 0.5;
+        const expected: u8 = @intFromFloat((value + 1.0) * 0.5 * 255.0);
+        const offset = (y * frames * w + f * w + x) * 3;
+        try std.testing.expectEqualSlices(u8, &.{ expected, expected, expected }, plane[offset..][0..3]);
+    };
 }
 
 test "minimax_h3: assembled preview strip preserves frame order on every row" {
